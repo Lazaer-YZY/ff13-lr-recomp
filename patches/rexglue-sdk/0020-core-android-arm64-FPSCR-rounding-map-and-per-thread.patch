@@ -1,0 +1,65 @@
+From 84b32cb16c44f3567b670a8ed6daae068133470e Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:40:03 +0800
+Subject: [PATCH 020/108] core(android): arm64 FPSCR rounding map and
+ per-thread denormal flush (behaviour informed by lr-ffxiii-port's Android
+ patch, re-implemented)
+
+FPCR.RMode orders up/down opposite to MXCSR.RC, so loadFromHost reported
+round-up as round-down and vice versa on arm64. arm64 now uses its own
+HostToGuest table. On arm64 the per-instruction flush-mode switches become
+no-ops and InitHost enables flush-to-zero once per thread (x86 unchanged).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
+index 0ede542..fd8628d 100644
+--- a/include/rex/ppc/context.h
++++ b/include/rex/ppc/context.h
+@@ -147,7 +147,13 @@ constexpr uint32_t kRoundMask = 0x03;
+ struct FPSCRRegister {
+   uint32_t csr;
+ 
++#if defined(__aarch64__) || defined(_M_ARM64)
++  // FPCR.RMode: 0 = nearest, 1 = toward +inf (up), 2 = toward -inf (down), 3 = toward zero.
++  static constexpr size_t HostToGuest[] = {kRoundNearest, kRoundUp, kRoundDown, kRoundTowardZero};
++#else
++  // MXCSR.RC: 0 = nearest, 1 = down, 2 = up, 3 = toward zero.
+   static constexpr size_t HostToGuest[] = {kRoundNearest, kRoundDown, kRoundUp, kRoundTowardZero};
++#endif
+ 
+   using Platform = platform::FPSCRPlatform;
+   static constexpr size_t RoundShift = Platform::RoundShift;
+@@ -177,6 +183,24 @@ struct FPSCRRegister {
+     setcsr(csr);
+   }
+ 
++#if defined(__aarch64__) || defined(_M_ARM64)
++  // AArch64: denormals are flushed once per thread (InitHost) and the
++  // per-instruction switches are no-ops. Toggling FPCR around every VMX/FPU
++  // transition serialises the FP pipeline, and the compiler does not order FP
++  // arithmetic against the msr, so the per-instruction mode was not reliable
++  // anyway. The guest VMX unit flushes denormals; scalar denormals are rare.
++  inline void enableFlushModeUnconditional() noexcept {}
++  inline void disableFlushModeUnconditional() noexcept {}
++  inline void enableFlushMode() noexcept {}
++  inline void disableFlushMode() noexcept {}
++
++  inline void InitHost() noexcept {
++    csr = getcsr();
++    Platform::InitHostExceptions(csr);
++    csr |= FlushMask;
++    setcsr(csr);
++  }
++#else
+   inline void enableFlushModeUnconditional() noexcept {
+     csr |= FlushMask;
+     setcsr(csr);
+@@ -206,6 +230,7 @@ struct FPSCRRegister {
+     Platform::InitHostExceptions(csr);
+     setcsr(csr);
+   }
++#endif  // __aarch64__
+ };
+ 
+ }  // namespace rex::ppc

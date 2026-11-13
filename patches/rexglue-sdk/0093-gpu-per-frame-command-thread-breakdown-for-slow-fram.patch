@@ -1,0 +1,204 @@
+From bce197e896d8c496764b9dab2bc96f631632934a Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Tue, 10 Nov 2026 19:38:33 +0800
+Subject: [PATCH 093/108] gpu: per-frame command thread breakdown for slow
+ frames (vulkan_slow_frame_ms)
+
+Every frame whose time between swaps exceeds vulkan_slow_frame_ms (default 30)
+logs "GPU slow frame" with the command thread's time in shader translation,
+pipeline configuration, texture loads, render target updates, copies
+(resolves), submits, fence waits and WAIT_REG_MEM waits (the base command
+processor now always totals WAIT_REG_MEM time), plus the draw count.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 419eabe..1477de2 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -190,6 +190,8 @@ class CommandProcessor {
+     uint64_t skipped = 0;
+   };
+   WaitRegMemStats wait_reg_mem_stats_;
++  // Total time WAIT_REG_MEM waited (always counted; the Vulkan slow-frame breakdown reads it).
++  uint64_t wait_reg_mem_us_total_ = 0;
+   std::mutex vblank_wake_mutex_;
+   std::condition_variable vblank_wake_cv_;
+   uint64_t vblank_wake_generation_ = 0;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index ca1a265..40f2d47 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -385,6 +385,14 @@ class VulkanCommandProcessor : public CommandProcessor {
+     std::array<std::pair<void*, uint64_t>, 6> callers{};
+   };
+   FenceWaitStats fence_wait_stats_;
++  // vulkan_slow_frame_ms: the command thread's time between two swaps, split by activity.
++  struct CpFrameStats {
++    uint64_t start_ns = 0, translate_ns = 0, textures_ns = 0, pipeline_ns = 0, rt_update_ns = 0,
++             copy_ns = 0, submit_ns = 0, fence_us = 0, regmem_us_start = 0;
++    uint32_t draws = 0, copies = 0;
++  };
++  CpFrameStats cp_frame_;
++  void CpFrameOnSwap();
+ 
+   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                  uint32_t frontbuffer_height) override;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 87a198a..b88faf7 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1100,6 +1100,12 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+       }
+     }
+   } while (!matched);
++  if (polls) {
++    wait_reg_mem_us_total_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                                           std::chrono::steady_clock::now().time_since_epoch())
++                                           .count()) -
++                              wait_start_us;
++  }
+ 
+   if (REXCVAR_GET(gpu_log_wait_reg_mem)) {
+     const uint64_t now_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 23c434c..8080340 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -137,6 +137,24 @@ REXCVAR_DEFINE_UINT32(vulkan_gpu_trace_frames_window, 4, "GPU",
+ REXCVAR_DEFINE_UINT32(vulkan_gpu_trace_frames, 0, "GPU",
+                       "Trace this many consecutive frames (vulkan_gpu_timing), once, from "
+                       "about 40 s after start.");
++REXCVAR_DEFINE_UINT32(vulkan_slow_frame_ms, 30, "GPU",
++                      "Log the command thread's breakdown (shader translation, pipelines, textures, "
++                      "render target updates, copies, submits, fence and WAIT_REG_MEM waits) of "
++                      "every frame whose time between swaps exceeds this many ms; 0 = off")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++namespace {
++inline uint64_t CpNowNs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++struct CpScopedTimer {
++  uint64_t& acc;
++  uint64_t t0;
++  explicit CpScopedTimer(uint64_t& a) : acc(a), t0(CpNowNs()) {}
++  ~CpScopedTimer() { acc += CpNowNs() - t0; }
++};
++}  // namespace
+ REXCVAR_DEFINE_BOOL(vulkan_gpu_trace_frame, false, "GPU",
+                     "With vulkan_gpu_timing, log the GPU command sequence of one frame (render "
+                     "passes with their draw counts and end reasons, resolves, texture loads, "
+@@ -2519,6 +2537,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+                                        uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
+   lr_crossfade_this_frame_ = false;
++  CpFrameOnSwap();
+   if (gpu_timing_enabled_) {
+     GpuTimingOnSwap();
+   }
+@@ -4639,7 +4658,29 @@ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
+   }
+ }
+ 
++void VulkanCommandProcessor::CpFrameOnSwap() {
++  const uint64_t now = CpNowNs();
++  auto& f = cp_frame_;
++  const uint32_t threshold_ms = REXCVAR_GET(vulkan_slow_frame_ms);
++  if (f.start_ns && threshold_ms && now - f.start_ns > uint64_t(threshold_ms) * 1000000) {
++    const double total = (now - f.start_ns) / 1e6;
++    const double regmem = (wait_reg_mem_us_total_ - f.regmem_us_start) / 1e3;
++    const double known = (f.translate_ns + f.textures_ns + f.pipeline_ns + f.rt_update_ns +
++                          f.copy_ns + f.submit_ns) / 1e6 + f.fence_us / 1e3 + regmem;
++    REXGPU_INFO("GPU slow frame: {:.1f} ms between swaps = shader translation {:.1f} + pipelines "
++                "{:.1f} + textures {:.1f} + render targets {:.1f} + copies {:.1f} ({}) + submits "
++                "{:.1f} + fence waits {:.1f} + WAIT_REG_MEM {:.1f} + other {:.1f}; {} draws",
++                total, f.translate_ns / 1e6, f.pipeline_ns / 1e6, f.textures_ns / 1e6,
++                f.rt_update_ns / 1e6, f.copy_ns / 1e6, f.copies, f.submit_ns / 1e6, f.fence_us / 1e3,
++                regmem, total - known, f.draws);
++  }
++  f = CpFrameStats();
++  f.start_ns = now;
++  f.regmem_us_start = wait_reg_mem_us_total_;
++}
++
+ void VulkanCommandProcessor::NoteFenceWait(void* caller, uint64_t us) {
++  cp_frame_.fence_us += us;
+   auto& f = fence_wait_stats_;
+   ++f.waits;
+   f.us += us;
+@@ -4974,6 +5015,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         return draw_fail("shader_translation");
+       }
+     } else {
++      CpScopedTimer translate_timer(cp_frame_.translate_ns);
+       if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
+                                                     pixel_shader_translation)) {
+         return draw_fail("shader_translation");
+@@ -5065,13 +5107,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   uint32_t used_texture_mask =
+       (vertex_shader_translated ? vertex_shader->GetUsedTextureMaskAfterTranslation() : 0) |
+       (pixel_shader_translated ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+-  texture_cache_->RequestTextures(used_texture_mask);
++  {
++    CpScopedTimer textures_timer(cp_frame_.textures_ns);
++    texture_cache_->RequestTextures(used_texture_mask);
++  }
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
+   render_target_cache_->SetUpdatePixelShader(pixel_shader);
+-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+-                                    normalized_color_mask, *vertex_shader)) {
++  ++cp_frame_.draws;
++  bool rt_updated;
++  {
++    CpScopedTimer rt_timer(cp_frame_.rt_update_ns);
++    rt_updated = render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
++                                              normalized_color_mask, *vertex_shader);
++  }
++  if (!rt_updated) {
+     return draw_fail("render_target_update");
+   }
+ 
+@@ -5090,12 +5141,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+           return texture_cache_->GetActiveTextureSwizzledSigns(fetch_constant_index);
+         });
+   }
+-  if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+-                                          primitive_processing_result, normalized_depth_control,
+-                                          normalized_color_mask,
+-                                          render_target_cache_->last_update_render_pass_key(),
+-                                          pipeline, pipeline_layout_provider, &pipeline_handle,
+-                                          texture_sign_classes)) {
++  bool pipeline_configured;
++  {
++    CpScopedTimer pipeline_timer(cp_frame_.pipeline_ns);
++    pipeline_configured = pipeline_cache_->ConfigurePipeline(
++        vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
++        normalized_depth_control, normalized_color_mask,
++        render_target_cache_->last_update_render_pass_key(), pipeline, pipeline_layout_provider,
++        &pipeline_handle, texture_sign_classes);
++  }
++  if (!pipeline_configured) {
+     return draw_fail("configure_pipeline");
+   }
+   bool pipeline_is_placeholder = false;
+@@ -5667,6 +5722,8 @@ bool VulkanCommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
++  ++cp_frame_.copies;
++  CpScopedTimer copy_timer(cp_frame_.copy_ns);
+ 
+   if (!BeginSubmission(true)) {
+     return false;
+@@ -6771,6 +6828,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     {
+       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
++      CpScopedTimer submit_timer(cp_frame_.submit_ns);
+       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+     }
+     if (submit_result != VK_SUCCESS) {

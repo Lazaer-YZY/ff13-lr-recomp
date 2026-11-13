@@ -1,0 +1,31 @@
+From a0e62656e1b22f32318832ebf52cc1fdfe02d7d3 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 21:36:06 +0800
+Subject: [PATCH 038/108] ui: vulkan: remember the swapchain format of the
+ guest output pipeline
+
+VulkanPresenter compared the cached final-effect pipeline's swapchain_format
+with the render pass format but never stored it, so every paint waited for the
+previous paint on the GPU, destroyed the pipeline and compiled it again
+(upstream v0.10.1 has the same omission). On the Thor this was 97% of the UI
+thread's remaining time: UI thread 26% -> 5% of a core, process 170% -> 147%.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index e20179c..c1f55b5 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1846,6 +1846,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+                 swapchain_effect, paint_context_.swapchain_render_pass);
+             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+               guest_output_flow.effect_count = 0;
++            } else {
++              // Without this the format check above always failed, so every
++              // paint waited for the previous one on the GPU, destroyed the
++              // pipeline and compiled it again (most of the UI thread's time).
++              swapchain_effect_pipeline.swapchain_format =
++                  paint_context_.swapchain_render_pass_format;
+             }
+           }
+         }

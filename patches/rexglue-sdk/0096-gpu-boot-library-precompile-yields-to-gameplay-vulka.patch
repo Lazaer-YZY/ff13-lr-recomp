@@ -1,0 +1,133 @@
+From d53c402cddeeb39b32439b1cef19f03531c50825 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Wed, 11 Nov 2026 08:31:11 +0800
+Subject: [PATCH 096/108] gpu: boot library precompile yields to gameplay
+ (vulkan_precompile_in_game), progress for the app
+
+Playing before the boot pixel shader library precompile finished (first launch after an update
+or a driver change) put 4 compile threads on the game's cores: 48% of the warp bench's frames
+over 45 ms instead of 2%. Once the game library sets rex_game_interactive, the precompile stops
+(default, resumes at the next launch) or moves to the slowest cluster. rex_precompile_permille
+publishes the progress for the app's title notice.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 2c91df8..daa4b14 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -115,6 +115,13 @@ REXCVAR_DEFINE_BOOL(vulkan_pipeline_creation_little_cores, false, "GPU/Vulkan",
+                     "game's threads on the fast cores (the boot precompile keeps the fast cores)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_INT32(vulkan_precompile_in_game, 2, "GPU/Vulkan",
++                     "Android: when gameplay starts before the boot pipeline library precompile "
++                     "has finished: 0 = keep compiling on the fast cores, 1 = finish on the "
++                     "slowest CPU cluster, 2 = stop (it resumes at the title on the next launch)")
++    .range(0, 2)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -5177,6 +5184,11 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+ }
+ 
+ #if defined(__ANDROID__)
++// 1 once gameplay started (set by the game library); the boot precompile's progress in permille
++// while it runs, else -1 (for the app's on-screen notice). Defined in the runtime
++// (xboxkrnl_threading.cpp) so that both libraries link them.
++extern "C" volatile int rex_game_interactive;
++extern "C" volatile int rex_precompile_permille;
+ namespace {
+ // Pipeline creation (the driver's shader compiler) runs in bursts when the game reaches new
+ // areas or battles. The Android app pins every thread to the middle cluster so that the game's
+@@ -5267,7 +5279,23 @@ void VulkanPipelineCache::PrecompileThread() {
+       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+   std::atomic<size_t> next_index(0);
+   std::atomic<uint32_t> compiled(0), skipped(0), failed(0), already(0);
++  std::atomic<bool> moved_logged(false), stopped_in_game(false);
++  const size_t precompile_total = precompile_pixel_shaders_.size();
++#if defined(__ANDROID__)
++  rex_precompile_permille = 0;
++  const int in_game_mode = REXCVAR_GET(vulkan_precompile_in_game);
++#endif
+   auto worker = [&]() {
++#if defined(__ANDROID__)
++    // Gameplay started before the precompile finished (the first launch after an update or a
++    // driver change, when the player does not wait at the title): the 4 compile threads on the
++    // middle and prime cores competed with the game's main, GPU and worker threads there (48% of
++    // the warp bench's frames over 45 ms instead of 2%). Mode 1 finishes on the slowest cluster
++    // only (7.0%), mode 2 (default) stops (4.1-5.6%; the next launch resumes at the title, where
++    // the app shows the progress; finished libraries are kept). What remains is the on-demand
++    // compiles of the libraries the area needs on the creation threads (~20% of all CPU samples).
++    bool moved_to_little = false;
++#endif
+     SpirvShaderTranslator translator(
+         SpirvShaderTranslator::Features(vulkan_device),
+         render_target_cache_.msaa_2x_attachments_supported(),
+@@ -5279,10 +5307,33 @@ void VulkanPipelineCache::PrecompileThread() {
+         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+     while (!precompile_shutdown_) {
++#if defined(__ANDROID__)
++      if (!moved_to_little && rex_game_interactive && in_game_mode) {
++        moved_to_little = true;
++        if (in_game_mode == 1) {
++          LowerPipelineCreationThreadPriority(true);
++        } else {
++          stopped_in_game = true;
++        }
++        if (!moved_logged.exchange(true)) {
++          REXGPU_INFO("VulkanPipelineCache: gameplay started during the library precompile ({} of "
++                      "{} done): {}",
++                      next_index.load(), precompile_total,
++                      in_game_mode == 1 ? "the compile threads move to the slowest cores"
++                                        : "stopped until the next launch");
++        }
++      }
++      if (stopped_in_game) {
++        break;
++      }
++#endif
+       size_t index = next_index.fetch_add(1);
+-      if (index >= precompile_pixel_shaders_.size()) {
++      if (index >= precompile_total) {
+         break;
+       }
++#if defined(__ANDROID__)
++      rex_precompile_permille = int(index * 1000 / precompile_total);
++#endif
+       if (index && index % 1000 == 0) {
+         REXGPU_INFO("VulkanPipelineCache: precompiling pixel shader libraries, {} of {} ({} new)",
+                     index, precompile_pixel_shaders_.size(), compiled.load());
+@@ -5378,7 +5429,10 @@ void VulkanPipelineCache::PrecompileThread() {
+   for (const auto& thread : threads) {
+     rex::thread::Wait(thread.get(), false);
+   }
+-  bool finished = !precompile_shutdown_;
++  bool finished = !precompile_shutdown_ && !stopped_in_game;
++#if defined(__ANDROID__)
++  rex_precompile_permille = -1;
++#endif
+   REXGPU_INFO("VulkanPipelineCache: pixel shader library precompile {}: {} libraries compiled, "
+               "{} shader variants already done, {} shaders skipped (no metadata / dynamic "
+               "registers), {} failed, {:.1f} s on {} threads",
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index d1f5405..6a94600 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -482,6 +482,13 @@ extern "C" __attribute__((visibility("default"))) void (*rex_set_event_observer)
+ extern "C" __attribute__((visibility("default"))) void (*rex_gpu_timeline_observer)(uint32_t kind,
+                                                                                    uint32_t value) =
+     nullptr;
++// Set to 1 by the game library once gameplay starts (it left the title screen): background work
++// that ran at full speed while the game idled at the title (the pipeline library precompile in
++// graphics/vulkan/pipeline_cache.cpp) then moves off the cores the game's threads run on.
++extern "C" __attribute__((visibility("default"))) volatile int rex_game_interactive = 0;
++// The boot pipeline library precompile's progress in permille while it runs, else -1 (set in
++// graphics/vulkan/pipeline_cache.cpp, shown by the app at the title).
++extern "C" __attribute__((visibility("default"))) volatile int rex_precompile_permille = -1;
+ 
+ u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+   if (auto observer = rex_set_event_observer) observer(0, event_ptr.guest_address());

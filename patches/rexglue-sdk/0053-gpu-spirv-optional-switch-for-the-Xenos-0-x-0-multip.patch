@@ -1,0 +1,39 @@
+From 2b3b0447bd0a8800567d4874795b46d6adc0fe0a Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 09:27:30 +0800
+Subject: [PATCH 053/108] gpu: spirv: optional switch for the Xenos 0 * x = 0
+ multiplication emulation
+
+vulkan_shader_xenos_multiply (default on, unchanged behaviour). Off saves the
+compare / select per multiplication; measured in Lightning Returns battles on
+an Adreno 740 at about 0.5 ms of ~25 ms, so it stays on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/pipeline/shader/spirv_translator_alu.cpp b/src/graphics/pipeline/shader/spirv_translator_alu.cpp
+index 706ac7e..efc2365 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_alu.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_alu.cpp
+@@ -19,12 +19,22 @@
+ #include <rex/assert.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/math.h>
++#include <rex/cvar.h>
++
++REXCVAR_DEFINE_BOOL(vulkan_shader_xenos_multiply, true, "GPU/Vulkan",
++                    "Emulate the Xenos multiplication rule (0 * anything = 0, including infinity "
++                    "and NaN) in translated shaders. Turning it off saves ALU work but may "
++                    "produce NaN / infinity where the guest got zero. Experimental; takes effect "
++                    "for shaders translated afterwards.");
+ 
+ namespace rex::graphics {
+ 
+ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
+                                                       spv::Id operand_1_abs) {
+   EnsureBuildPointAvailable();
++  if (!REXCVAR_GET(vulkan_shader_xenos_multiply)) {
++    return value;
++  }
+   int num_components = builder_->getNumComponents(value);
+   assert_true(builder_->getNumComponents(operand_0_abs) == num_components);
+   assert_true(builder_->getNumComponents(operand_1_abs) == num_components);

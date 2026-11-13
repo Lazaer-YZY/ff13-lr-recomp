@@ -1,0 +1,49 @@
+From 7d34e334e4f22c026c51c1a291843da0c6af4822 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:35:30 +0800
+Subject: [PATCH 014/108] templates: cross-build codegen notice and
+ find_package root-path hint
+
+- Without rex::rexglue, print a STATUS note that codegen is skipped and
+  generated sources must already exist (WARNING if none are found) instead of
+  failing; <name>_codegen stays a no-op target.
+- When CMAKE_CROSSCOMPILING, set CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH before
+  find_package(rexglue) so CMAKE_PREFIX_PATH can point at the cross SDK
+  install (the NDK toolchain re-roots package searches under the sysroot).
+  Opt out with REXGLUE_KEEP_FIND_ROOT_PATH_MODE.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/resources/templates/init/rexglue_cmake.inja b/resources/templates/init/rexglue_cmake.inja
+index fd96b59..5b3f524 100644
+--- a/resources/templates/init/rexglue_cmake.inja
++++ b/resources/templates/init/rexglue_cmake.inja
+@@ -11,6 +11,13 @@ if(REXSDK_DIR)
+     add_subdirectory("{{ cmake_var("REXSDK_DIR") }}" rexglue-sdk)
+     message(STATUS "Using ReXGlue SDK from source tree: {{ cmake_var("REXSDK_DIR") }}")
+ else()
++    # The NDK toolchain (and other cross toolchains) set
++    # CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY, which re-roots every search under
++    # the sysroot; allow host paths so CMAKE_PREFIX_PATH can point at the
++    # cross SDK install (e.g. C:/dev/rexglue-android).
++    if(CMAKE_CROSSCOMPILING AND NOT DEFINED REXGLUE_KEEP_FIND_ROOT_PATH_MODE)
++        set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
++    endif()
+     if(REXSDK_VERSION)
+         find_package(rexglue {{ cmake_var("REXSDK_VERSION") }} EXACT QUIET CONFIG)
+     else()
+@@ -126,10 +133,11 @@ endmacro()
+ # Cross builds (e.g. Android) have no rexglue CLI in the SDK install: codegen
+ # must have been run beforehand with the host SDK, and the target is a no-op.
+ if(NOT TARGET rex::rexglue)
++    message(STATUS "rexglue CLI not available in this SDK (cross build): codegen is skipped, "
++        "generated sources are expected to be present already (run codegen with the host SDK)")
+     if(NOT REXGLUE_ENTRYPOINT_GENERATED_SOURCES)
+-        message(FATAL_ERROR
+-            "No rexglue CLI in this SDK (cross build) and no generated sources found. "
+-            "Run codegen with the host SDK first.")
++        message(WARNING "No generated sources found in {{ entrypoint_out_dir }}; "
++            "run 'rexglue codegen' with the host SDK before building.")
+     endif()
+     add_custom_target({{ names.original }}_codegen)
+ else()

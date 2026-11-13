@@ -1,0 +1,35 @@
+From e68424edd60080339984bf31edc55c28a1515ba1 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 09:41:23 +0800
+Subject: [PATCH 078/108] gpu: a never-passing depth test without stencil
+ writes nothing - no rasterization
+
+Lightning Returns draws a full-screen triangle with depth test NEVER, no depth
+write, no stencil and colour mask 0 when it binds its depth buffer. The draw
+can't read or write anything, but it made the render target cache claim the
+depth buffer's tiles and convert the colour previously there into depth before
+it. IsRasterizationPotentiallyDone now returns false for it (the following
+depth-tested draws still get the transfer when they need the data).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 305380e..8b911a6 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -62,6 +62,15 @@ bool IsRasterizationPotentiallyDone(const RegisterFile& regs, bool primitive_pol
+       return false;
+     }
+   }
++  // ReXGlue: a depth test that never passes, with no stencil, writes nothing
++  // (no color, depth or stencil) - Lightning Returns draws a full-screen
++  // triangle like this when binding its depth buffer, which otherwise makes the
++  // render target cache convert the color previously there into depth.
++  auto depthcontrol = regs.Get<reg::RB_DEPTHCONTROL>();
++  if (depthcontrol.z_enable && depthcontrol.zfunc == xenos::CompareFunction::kNever &&
++      !depthcontrol.stencil_enable) {
++    return false;
++  }
+   return true;
+ }
+ 

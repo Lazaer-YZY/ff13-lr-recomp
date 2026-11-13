@@ -1,0 +1,35 @@
+From d700bd78afcbde62122a11b146751168a8fd8f59 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 11:55:55 +0800
+Subject: [PATCH 061/108] gpu: estimate unclipped draw extents on the CPU by
+ default, as Xenia does
+
+execute_unclipped_draw_vs_on_cpu defaulted to false in ReXGlue (Xenia's
+default is true): unclipped screen-space draws such as clears then count as
+using the EDRAM down to the end of the render target, and the following
+ownership transfers copy far more than is drawn. Lightning Returns battle on
+the Thor: transfers 55 -> 47 per frame, the shadow-map 1x<->4x depth copies
+(1365 + 960 tiles) gone, GPU work 16.5-17.1 -> 15.0-15.8 Mcycles per frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/util/draw_extent_estimator.cpp b/src/graphics/util/draw_extent_estimator.cpp
+index 3027dc8..b321b49 100644
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -24,8 +24,13 @@
+ #include <rex/memory.h>
+ #include <rex/ui/graphics_util.h>
+ 
+-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
+-                    "Execute unclipped draw vertex shader on CPU");
++// Default true as in Xenia (the original DEFINE below): otherwise unclipped
++// screen-space draws such as clears count as using the EDRAM down to the end of
++// the render target, causing oversized ownership transfers. Lightning Returns on
++// an Adreno 740: transfers 55 -> 47 per battle frame, GPU work -8-10%.
++REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
++                    "Execute the vertex shader of unclipped draws (such as clears) on the CPU "
++                    "to estimate how much of the EDRAM they use");
+ 
+ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
+                     "Execute unclipped draw VS on CPU with scissor");

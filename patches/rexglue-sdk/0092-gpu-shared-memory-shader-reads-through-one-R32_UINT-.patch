@@ -1,0 +1,393 @@
+From dea13a14e7394be6060bbf490d2089bfd91499cd Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Tue, 10 Nov 2026 06:37:58 +0800
+Subject: [PATCH 092/108] gpu: shared memory shader reads through one R32_UINT
+ texel buffer; pipeline IR dump
+
+On Adreno/Turnip maxStorageBufferRange is 128 MB, so the 512 MB shared memory
+was four storage buffers and every 32-bit vertex fetch word compiled to a
+four-way switch (4 predicated isam + compares + nops). maxTexelBufferElements
+is 2^27, so one R32_UINT uniform texel buffer view covers all of it: loads
+become one texelFetch (binding 2 of the shared memory set). Writes
+(memexport) keep the storage buffers. Cvar vulkan_shared_memory_texel_buffer
+(default on, init-only; part of the precompile marker). Yusnaan view GPU
+16.8 -> 16.0 ms per frame, Ark 15.8 -> 15.0 ms.
+
+Diagnostics: vulkan_pipeline_ir_dump_ps=<PS hashes> with
+vulkan_pipeline_statistics and monolithic pipelines logs the driver's
+internal representations (NIR, IR3 assembly) of those pipelines.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index 1d8726d..dfe2a7a 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -416,6 +416,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     unsigned int spirv_version;
+ 
+     uint32_t max_storage_buffer_range;
++    // Shared memory reads through one R32_UINT uniform texel buffer covering all 512 MB
++    // (binding kSharedMemoryTexelBufferBinding) instead of a switch over 128/256 MB storage
++    // buffers (see UseSharedMemoryTexelBuffer).
++    bool shared_memory_texel_buffer = false;
+ 
+     bool full_draw_index_uint32;
+ 
+@@ -476,6 +480,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     }
+     return 2;
+   }
++  // Binding in kDescriptorSetSharedMemoryAndEdram of the shared memory R32_UINT texel buffer.
++  static constexpr uint32_t kSharedMemoryTexelBufferBinding = 2;
++  // Whether shared memory reads should use one texel buffer: only when storage buffers can't
++  // cover the 512 MB in one binding and texel buffers can (2^27 dwords), and the cvar allows it.
++  static bool UseSharedMemoryTexelBuffer(uint32_t max_storage_buffer_range,
++                                         uint32_t max_texel_buffer_elements);
+   uint32_t GetSharedMemoryStorageBufferCountLog2() const {
+     return GetSharedMemoryStorageBufferCountLog2(features_.max_storage_buffer_range);
+   }
+@@ -938,6 +948,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
+   spv::Id uniform_fetch_constants_;
+ 
+   spv::Id buffers_shared_memory_;
++  spv::Id texel_buffer_shared_memory_ = spv::NoResult;
+   spv::Id buffer_edram_;
+ 
+   // Not using combined images and samplers because
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 362f9dd..ca1a265 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -785,6 +785,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::unique_ptr<VulkanTextureCache> texture_cache_;
+ 
+   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
++  // R32_UINT view of the whole shared memory for shader reads (vulkan_shared_memory_texel_buffer).
++  VkBufferView shared_memory_texel_buffer_view_ = VK_NULL_HANDLE;
+   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
+ 
+   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 160ff6a..9cdb5b2 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -61,6 +61,7 @@ class VulkanDevice {
+     uint32_t maxImageDimensionCube = 4096;
+     uint32_t maxImageArrayLayers = 256;
+     uint32_t maxStorageBufferRange = uint32_t(1) << 27;
++    uint32_t maxTexelBufferElements = 65536;
+     uint32_t maxSamplerAllocationCount = 4000;
+     uint32_t maxPerStageDescriptorSamplers = 16;
+     uint32_t maxPerStageDescriptorStorageBuffers = 4;
+diff --git a/include/rex/ui/vulkan/functions/device_khr_pipeline_executable_properties.inc b/include/rex/ui/vulkan/functions/device_khr_pipeline_executable_properties.inc
+index 0d61f9a..6cebee4 100644
+--- a/include/rex/ui/vulkan/functions/device_khr_pipeline_executable_properties.inc
++++ b/include/rex/ui/vulkan/functions/device_khr_pipeline_executable_properties.inc
+@@ -2,3 +2,4 @@
+ // (vulkan_pipeline_statistics).
+ XE_UI_VULKAN_FUNCTION(vkGetPipelineExecutablePropertiesKHR)
+ XE_UI_VULKAN_FUNCTION(vkGetPipelineExecutableStatisticsKHR)
++XE_UI_VULKAN_FUNCTION(vkGetPipelineExecutableInternalRepresentationsKHR)
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 592e54d..8bbf2c7 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -25,9 +25,24 @@
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/math.h>
+ #include <rex/string/buffer.h>
++#include <rex/cvar.h>
++
++REXCVAR_DEFINE_BOOL(vulkan_shared_memory_texel_buffer, true, "GPU/Vulkan",
++                    "Read guest memory in shaders (vertex fetch) through one R32_UINT uniform "
++                    "texel buffer covering all 512 MB when storage buffers are limited to "
++                    "128/256 MB (Adreno/Turnip), instead of selecting one of several storage "
++                    "buffers per load")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex::graphics {
+ 
++bool SpirvShaderTranslator::UseSharedMemoryTexelBuffer(uint32_t max_storage_buffer_range,
++                                                       uint32_t max_texel_buffer_elements) {
++  return REXCVAR_GET(vulkan_shared_memory_texel_buffer) &&
++         GetSharedMemoryStorageBufferCountLog2(max_storage_buffer_range) != 0 &&
++         max_texel_buffer_elements >= (uint32_t(1) << 27);
++}
++
+ SpirvShaderTranslator::Features::Features(bool all)
+     : spirv_version(all ? spv::Spv_1_5 : spv::Spv_1_0),
+       max_storage_buffer_range(all ? UINT32_MAX : (128 * 1024 * 1024)),
+@@ -60,6 +75,9 @@ SpirvShaderTranslator::Features::Features(const ui::vulkan::VulkanDevice* const
+       fragment_shader_sample_interlock(vulkan_device->properties().fragmentShaderSampleInterlock),
+       demote_to_helper_invocation(vulkan_device->properties().shaderDemoteToHelperInvocation),
+       sample_rate_shading(vulkan_device->properties().sampleRateShading) {
++  shared_memory_texel_buffer =
++      UseSharedMemoryTexelBuffer(vulkan_device->properties().maxStorageBufferRange,
++                                 vulkan_device->properties().maxTexelBufferElements);
+   const uint32_t vulkan_api_version = vulkan_device->properties().apiVersion;
+   if (vulkan_api_version >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+     spirv_version = spv::Spv_1_5;
+@@ -213,6 +231,7 @@ void SpirvShaderTranslator::StartTranslation() {
+   }
+   const_int4_0_ = builder_->makeCompositeConstant(type_int4_, id_vector_temp_);
+   const_uint_0_ = builder_->makeUintConstant(0);
++  texel_buffer_shared_memory_ = spv::NoResult;
+   for (spv::Id& spec : texture_sign_class_spec_) {
+     spec = spv::NoResult;
+   }
+@@ -457,6 +476,21 @@ void SpirvShaderTranslator::StartTranslation() {
+     if (features_.spirv_version >= spv::Spv_1_4) {
+       main_interface_.push_back(buffers_shared_memory_);
+     }
++    if (features_.shared_memory_texel_buffer) {
++      builder_->addCapability(spv::CapabilitySampledBuffer);
++      spv::Id type_texel_buffer = builder_->makeImageType(type_uint_, spv::DimBuffer, false, false,
++                                                          false, 1, spv::ImageFormatUnknown);
++      texel_buffer_shared_memory_ =
++          builder_->createVariable(spv::NoPrecision, spv::StorageClassUniformConstant,
++                                   type_texel_buffer, "xe_shared_memory_texels");
++      builder_->addDecoration(texel_buffer_shared_memory_, spv::DecorationDescriptorSet,
++                              int(kDescriptorSetSharedMemoryAndEdram));
++      builder_->addDecoration(texel_buffer_shared_memory_, spv::DecorationBinding,
++                              int(kSharedMemoryTexelBufferBinding));
++      if (features_.spirv_version >= spv::Spv_1_4) {
++        main_interface_.push_back(texel_buffer_shared_memory_);
++      }
++    }
+   }
+ 
+   if (is_vertex_shader()) {
+@@ -4068,6 +4102,15 @@ spv::Id SpirvShaderTranslator::LoadUint32FromSharedMemory(spv::Id address_dwords
+ 
+   uint32_t binding_count_log2 = GetSharedMemoryStorageBufferCountLog2();
+ 
++  if (texel_buffer_shared_memory_ != spv::NoResult) {
++    // One texel buffer view of the whole 512 MB (2^27 dwords): no per-load binding switch.
++    spv::Id address = builder_->createBinOp(spv::OpBitwiseAnd, type_int_, address_dwords_int,
++                                            builder_->makeIntConstant((1 << 27) - 1));
++    spv::Id texels = builder_->createLoad(texel_buffer_shared_memory_, spv::NoPrecision);
++    spv::Id fetch = builder_->createOp(spv::OpImageFetch, type_uint4_, std::vector<spv::Id>{texels, address});
++    return builder_->createCompositeExtract(fetch, type_uint_, 0);
++  }
++
+   if (!binding_count_log2) {
+     // Single binding - load directly.
+     id_vector_temp_.clear();
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 5658725..23c434c 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -1149,7 +1149,13 @@ bool VulkanCommandProcessor::SetupContext() {
+   // Shared memory and EDRAM descriptor set layout.
+   bool edram_fragment_shader_interlock =
+       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[2];
++  const bool shared_memory_texel_buffer = SpirvShaderTranslator::UseSharedMemoryTexelBuffer(
++      device_properties.maxStorageBufferRange, device_properties.maxTexelBufferElements);
++  REXGPU_INFO("Shared memory shader reads: {}",
++              shared_memory_texel_buffer
++                  ? "one R32_UINT texel buffer (512 MB)"
++                  : fmt::format("{} storage buffer(s)", shared_memory_binding_count));
++  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[3];
+   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
+   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
+       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+@@ -1177,6 +1183,16 @@ bool VulkanCommandProcessor::SetupContext() {
+   } else {
+     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
+   }
++  if (shared_memory_texel_buffer) {
++    VkDescriptorSetLayoutBinding& texel_binding =
++        shared_memory_and_edram_descriptor_set_layout_bindings
++            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
++    texel_binding.binding = SpirvShaderTranslator::kSharedMemoryTexelBufferBinding;
++    texel_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
++    texel_binding.descriptorCount = 1;
++    texel_binding.stageFlags = guest_shader_stages;
++    texel_binding.pImmutableSamplers = nullptr;
++  }
+   if (dfn.vkCreateDescriptorSetLayout(
+           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
+           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
+@@ -1205,16 +1221,18 @@ bool VulkanCommandProcessor::SetupContext() {
+   }
+ 
+   // Shared memory and EDRAM common bindings.
+-  VkDescriptorPoolSize descriptor_pool_sizes[1];
++  VkDescriptorPoolSize descriptor_pool_sizes[2];
+   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+   descriptor_pool_sizes[0].descriptorCount =
+       shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
++  descriptor_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
++  descriptor_pool_sizes[1].descriptorCount = 1;
+   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
+   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+   descriptor_pool_create_info.pNext = nullptr;
+   descriptor_pool_create_info.flags = 0;
+   descriptor_pool_create_info.maxSets = 1;
+-  descriptor_pool_create_info.poolSizeCount = 1;
++  descriptor_pool_create_info.poolSizeCount = shared_memory_texel_buffer ? 2 : 1;
+   descriptor_pool_create_info.pPoolSizes = descriptor_pool_sizes;
+   if (dfn.vkCreateDescriptorPool(device, &descriptor_pool_create_info, nullptr,
+                                  &shared_memory_and_edram_descriptor_pool_) != VK_SUCCESS) {
+@@ -1247,7 +1265,8 @@ bool VulkanCommandProcessor::SetupContext() {
+     shared_memory_descriptor_buffer_info.offset = shared_memory_binding_range * i;
+     shared_memory_descriptor_buffer_info.range = shared_memory_binding_range;
+   }
+-  VkWriteDescriptorSet write_descriptor_sets[2];
++  VkWriteDescriptorSet write_descriptor_sets[3];
++  uint32_t write_descriptor_set_count = 1 + uint32_t(edram_fragment_shader_interlock);
+   VkWriteDescriptorSet& write_descriptor_set_shared_memory = write_descriptor_sets[0];
+   write_descriptor_set_shared_memory.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+   write_descriptor_set_shared_memory.pNext = nullptr;
+@@ -1276,8 +1295,31 @@ bool VulkanCommandProcessor::SetupContext() {
+     write_descriptor_set_edram.pBufferInfo = &edram_descriptor_buffer_info;
+     write_descriptor_set_edram.pTexelBufferView = nullptr;
+   }
+-  dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
+-                             write_descriptor_sets, 0, nullptr);
++  if (shared_memory_texel_buffer) {
++    VkBufferViewCreateInfo view_create_info = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
++    view_create_info.buffer = shared_memory_->buffer();
++    view_create_info.format = VK_FORMAT_R32_UINT;
++    view_create_info.offset = 0;
++    view_create_info.range = SharedMemory::kBufferSize;
++    if (dfn.vkCreateBufferView(device, &view_create_info, nullptr,
++                               &shared_memory_texel_buffer_view_) != VK_SUCCESS) {
++      REXGPU_ERROR("Failed to create the shared memory texel buffer view");
++      return false;
++    }
++    VkWriteDescriptorSet& write_texel = write_descriptor_sets[write_descriptor_set_count++];
++    write_texel.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++    write_texel.pNext = nullptr;
++    write_texel.dstSet = shared_memory_and_edram_descriptor_set_;
++    write_texel.dstBinding = SpirvShaderTranslator::kSharedMemoryTexelBufferBinding;
++    write_texel.dstArrayElement = 0;
++    write_texel.descriptorCount = 1;
++    write_texel.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
++    write_texel.pImageInfo = nullptr;
++    write_texel.pBufferInfo = nullptr;
++    write_texel.pTexelBufferView = &shared_memory_texel_buffer_view_;
++  }
++  dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets, 0,
++                             nullptr);
+ 
+   // Swap objects.
+ 
+@@ -2207,6 +2249,8 @@ void VulkanCommandProcessor::ShutdownContext() {
+ 
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyDescriptorPool, device,
+                                          shared_memory_and_edram_descriptor_pool_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBufferView, device,
++                                         shared_memory_texel_buffer_view_);
+ 
+   if (shared_memory_) {
+     shared_memory_->SetRangeRequestListener(nullptr);
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 5ab101f..dc2a8e1 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -69,6 +69,7 @@ REXCVAR_DECLARE(bool, spirv_texture_sign_branch);
+ REXCVAR_DECLARE(bool, vulkan_shader_xenos_multiply);
+ REXCVAR_DECLARE(bool, vulkan_shader_xenos_multiply_vertex);
+ REXCVAR_DECLARE(bool, vulkan_texture_fetch_implicit_lod);
++REXCVAR_DECLARE(bool, vulkan_shared_memory_texel_buffer);
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_pipeline_libraries, true, "GPU/Vulkan",
+                     "Link guest pipelines from per-stage libraries (VK_EXT_graphics_pipeline_"
+@@ -112,6 +113,13 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_STRING(vulkan_pipeline_ir_dump_ps, "", "GPU/Vulkan",
++                      "Diagnostics (with vulkan_pipeline_statistics and monolithic pipelines): "
++                      "comma-separated pixel shader ucode hashes (16 hex digits) whose pipelines are "
++                      "created with the driver's internal representations (e.g. ir3 disassembly) "
++                      "captured and logged")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+@@ -5020,6 +5028,16 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   if (capture_statistics) {
+     pipeline_create_info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+   }
++  bool capture_ir = false;
++  if (capture_statistics && creation_arguments.pixel_shader &&
++      !REXCVAR_GET(vulkan_pipeline_ir_dump_ps).empty()) {
++    const std::string ps_hash =
++        fmt::format("{:016X}", creation_arguments.pixel_shader->shader().ucode_data_hash());
++    capture_ir = REXCVAR_GET(vulkan_pipeline_ir_dump_ps).find(ps_hash) != std::string::npos;
++    if (capture_ir) {
++      pipeline_create_info.flags |= VK_PIPELINE_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
++    }
++  }
+   pipeline_create_info.stageCount = shader_stage_count;
+   pipeline_create_info.pStages = shader_stages.data();
+   pipeline_create_info.pVertexInputState = &vertex_input_state;
+@@ -5085,6 +5103,27 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+       dfn.vkGetPipelineExecutableStatisticsKHR(device, &executable_info, &statistic_count,
+                                                statistics.data());
+       statistics_info += fmt::format(" | {}:", executables[i].name);
++      if (capture_ir) {
++        uint32_t ir_count = 0;
++        dfn.vkGetPipelineExecutableInternalRepresentationsKHR(device, &executable_info, &ir_count,
++                                                              nullptr);
++        std::vector<VkPipelineExecutableInternalRepresentationKHR> irs(
++            ir_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR});
++        dfn.vkGetPipelineExecutableInternalRepresentationsKHR(device, &executable_info, &ir_count,
++                                                              irs.data());
++        std::vector<std::vector<char>> ir_text(ir_count);
++        for (uint32_t j = 0; j < ir_count; ++j) {
++          ir_text[j].resize(irs[j].dataSize + 1, '\0');
++          irs[j].pData = ir_text[j].data();
++        }
++        dfn.vkGetPipelineExecutableInternalRepresentationsKHR(device, &executable_info, &ir_count,
++                                                              irs.data());
++        for (uint32_t j = 0; j < ir_count; ++j) {
++          REXGPU_INFO("Pipeline IR PS {:016X} executable '{}' representation '{}':\n{}",
++                      creation_arguments.pixel_shader->shader().ucode_data_hash(),
++                      executables[i].name, irs[j].name, ir_text[j].data());
++        }
++      }
+       for (const VkPipelineExecutableStatisticKHR& statistic : statistics) {
+         switch (statistic.format) {
+           case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
+@@ -5198,7 +5237,8 @@ void VulkanPipelineCache::PrecompileThread() {
+                                  << 12) |
+                                 (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply)) << 9) |
+                                 (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply_vertex)) << 10) |
+-                                (uint32_t(REXCVAR_GET(vulkan_texture_fetch_implicit_lod)) << 11);
++                                (uint32_t(REXCVAR_GET(vulkan_texture_fetch_implicit_lod)) << 11) |
++                                (uint32_t(REXCVAR_GET(vulkan_shared_memory_texel_buffer)) << 13);
+   std::memcpy(marker + 24, &precompile_version, 4);
+   if (FILE* file = rex::filesystem::OpenFile(precompile_marker_path_, "rb")) {
+     uint8_t existing[28];
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 9ca3281..f3fc44a 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -57,7 +57,8 @@ bool VulkanSharedMemory::Initialize() {
+   buffer_create_info.flags = sparse_flags;
+   buffer_create_info.size = kBufferSize;
+   buffer_create_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+-                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
++                             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
++                             VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+   buffer_create_info.queueFamilyIndexCount = 0;
+   buffer_create_info.pQueueFamilyIndices = nullptr;
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index db86745..6126c3b 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -660,6 +660,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   XE_UI_VULKAN_LIMIT(maxImageDimensionCube)
+   XE_UI_VULKAN_LIMIT(maxImageArrayLayers)
+   XE_UI_VULKAN_LIMIT(maxStorageBufferRange)
++  XE_UI_VULKAN_LIMIT(maxTexelBufferElements)
+   XE_UI_VULKAN_LIMIT(maxSamplerAllocationCount)
+   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorSamplers)
+   XE_UI_VULKAN_LIMIT(maxPerStageDescriptorStorageBuffers)

@@ -1,0 +1,863 @@
+From 83f1ef157a19a1c69218b579386354d74a9f7110 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 10:47:15 +0800
+Subject: [PATCH 079/108] gpu: vulkan: shader translation on the creation
+ threads; ui: FSR 1.0 / CAS without the FidelityFX SDK
+
+Pipeline creation was asynchronous (vulkan_pipeline_compile_never_blocks) but
+the SPIR-V translation of a new shader still ran on the GPU thread, 14-24 ms
+each on the Thor: 25 of them in one 10-second window at a battle entry. With
+vulkan_async_shader_translation (default on) the GPU thread only runs the
+ucode analysis, which is all the pipeline description needs, and queues the
+pipeline; the creation thread translates (one translator shared under a
+mutex) and computes the pipeline layout, which depends on the bindings known
+after translation (the command processor's layout getters already lock). The
+translation's translated/valid flags are atomics with "translated" stored
+last; the command processor skips a draw whose shader was untranslated when
+its textures were requested and whose pipeline got published meanwhile. A
+creation-thread failure no longer leaves a pending entry pending forever.
+
+The presenter's in-tree AMD FSR 1.0 (EASU + RCAS) and CAS paint effects were
+gated behind the optional FidelityFX SDK together with FSR2/3; they are now
+under an always-on REX_HAS_FIDELITYFX_SPATIAL, so present_effect = bilinear |
+cas | fsr and the CAS/FSR sharpness cvars work without the SDK.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/pipeline/shader/shader.h b/include/rex/graphics/pipeline/shader/shader.h
+index 4cf3854..27ce2ba 100644
+--- a/include/rex/graphics/pipeline/shader/shader.h
++++ b/include/rex/graphics/pipeline/shader/shader.h
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <filesystem>
+ #include <set>
+@@ -768,10 +769,12 @@ class Shader {
+     uint64_t modification() const { return modification_; }
+ 
+     // True if the shader was translated and prepared without error.
+-    bool is_valid() const { return is_valid_; }
++    bool is_valid() const { return is_valid_.load(std::memory_order_acquire); }
+ 
+-    // True if the shader has already been translated.
+-    bool is_translated() const { return is_translated_; }
++    // True if the shader has already been translated. ReXGlue: may be read by
++    // the GPU thread while a pipeline creation thread translates; the translator
++    // sets it last, so a reader seeing it also sees the final is_valid().
++    bool is_translated() const { return is_translated_.load(std::memory_order_acquire); }
+ 
+     // Errors that occurred during translation.
+     const std::vector<Error>& errors() const { return errors_; }
+@@ -804,7 +807,7 @@ class Shader {
+         : shader_(shader), modification_(modification) {}
+ 
+     // If there was some failure during preparation on the implementation side.
+-    void MakeInvalid() { is_valid_ = false; }
++    void MakeInvalid() { is_valid_.store(false, std::memory_order_release); }
+ 
+    private:
+     friend class Shader;
+@@ -813,8 +816,8 @@ class Shader {
+     Shader& shader_;
+     uint64_t modification_;
+ 
+-    bool is_valid_ = false;
+-    bool is_translated_ = false;
++    std::atomic<bool> is_valid_{false};
++    std::atomic<bool> is_translated_{false};
+     std::vector<Error> errors_;
+     std::vector<uint8_t> translated_binary_;
+     std::string host_disassembly_;
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index ef192b4..72c1177 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -405,7 +405,12 @@ class VulkanPipelineCache {
+   bool TryGetPipelineCreationArgumentsForDescription(
+       const PipelineDescription& description,
+       std::pair<const PipelineDescription, Pipeline>* pipeline,
+-      PipelineCreationArguments& creation_arguments, bool for_placeholder = false);
++      PipelineCreationArguments& creation_arguments, bool for_placeholder = false,
++      bool allow_untranslated = false);
++  // Translates the shaders of queued creation arguments that aren't translated yet (on a
++  // creation thread, vulkan_async_shader_translation) and fills in the pipeline layout,
++  // which depends on the texture bindings known after translation.
++  bool TranslateShadersForCreation(PipelineCreationArguments& creation_arguments);
+ 
+   // Can be called from creation threads - all needed data must be fully set up
+   // at the point of the call: shaders must be translated, and the pipeline
+@@ -426,6 +431,11 @@ class VulkanPipelineCache {
+   string::StringBuffer ucode_disasm_buffer_;
+   // Reusable shader translator on the command processor thread.
+   std::unique_ptr<SpirvShaderTranslator> shader_translator_;
++  // Shader translation on the pipeline creation threads (vulkan_async_shader_translation):
++  // one translator shared under async_translation_mutex_ (translations are serialized, the
++  // point is keeping them off the GPU thread).
++  std::unique_ptr<SpirvShaderTranslator> async_shader_translator_;
++  std::mutex async_translation_mutex_;
+   // Guards the texture binding layout map in TranslateAnalyzedShader, which the shader storage
+   // loading calls from several threads.
+   std::mutex texture_binding_layouts_mutex_;
+@@ -441,6 +451,8 @@ class VulkanPipelineCache {
+     uint64_t pipelines_sync_us = 0;
+     uint32_t translations = 0;
+     uint64_t translations_us = 0;
++    uint32_t translations_async = 0;
++    uint64_t translations_async_us = 0;
+     uint32_t libraries_created = 0;
+     uint64_t libraries_created_us = 0;
+     uint32_t pipelines_linked = 0;
+@@ -508,6 +520,8 @@ class VulkanPipelineCache {
+   std::atomic<uint64_t> counter_pipelines_sync_us_{0};
+   std::atomic<uint32_t> counter_translations_{0};
+   std::atomic<uint64_t> counter_translations_us_{0};
++  std::atomic<uint32_t> counter_translations_async_{0};
++  std::atomic<uint64_t> counter_translations_async_us_{0};
+ 
+   struct LayoutUID {
+     size_t uid;
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index afb4a30..58f0630 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -210,13 +210,18 @@ class Presenter {
+ 
+   class GuestOutputPaintConfig {
+    public:
++    // AMD FidelityFX FSR 1.0 (EASU + RCAS) and CAS are in-tree shaders, always
++    // available; FSR2/FSR3 need the FidelityFX SDK (REX_HAS_FIDELITYFX_SDK).
++#define REX_HAS_FIDELITYFX_SPATIAL 1
+     enum class Effect {
+       kBilinear,
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+       kCas,
+       // AMD FidelityFX Super Resolution upsampling, Contrast Adaptive
+       // Sharpening otherwise.
+       kFsr,
++#endif
++#if defined(REX_HAS_FIDELITYFX_SDK)
+       // FidelityFX FSR2 selection. Uses the runtime temporal upscaler path
+       // where available; currently still experimental due to limited temporal
+       // inputs in the presenter path.
+@@ -238,6 +243,8 @@ class Presenter {
+       kPerformance,
+       kUltraPerformance,
+     };
++#endif  // defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+ 
+     // This value is used as a lerp factor.
+     static constexpr float kCasAdditionalSharpnessMin = 0.0f;
+@@ -260,7 +267,7 @@ class Presenter {
+     static constexpr float kFsrSharpnessReductionDefault = 0.2f;
+     static_assert(kFsrSharpnessReductionDefault >= kFsrSharpnessReductionMin &&
+                   kFsrSharpnessReductionDefault <= kFsrSharpnessReductionMax);
+-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
++#endif  // defined(REX_HAS_FIDELITYFX_SPATIAL)
+ 
+     // In the sharpness setters, min / max with a constant as the first argument
+     // also drops NaNs.
+@@ -273,7 +280,7 @@ class Presenter {
+     Effect GetEffect() const { return effect_; }
+     void SetEffect(Effect new_effect) { effect_ = new_effect; }
+ 
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+     float GetCasAdditionalSharpness() const { return cas_additional_sharpness_; }
+     void SetCasAdditionalSharpness(float new_cas_additional_sharpness) {
+       cas_additional_sharpness_ =
+@@ -295,6 +302,8 @@ class Presenter {
+                    std::max(kFsrSharpnessReductionMin, new_fsr_sharpness_reduction));
+     }
+ 
++#endif  // defined(REX_HAS_FIDELITYFX_SPATIAL)
++#if defined(REX_HAS_FIDELITYFX_SDK)
+     FsrQualityMode GetFsrQualityMode() const { return fsr_quality_mode_; }
+     void SetFsrQualityMode(FsrQualityMode new_fsr_quality_mode) {
+       fsr_quality_mode_ = new_fsr_quality_mode;
+@@ -314,10 +323,12 @@ class Presenter {
+     // original front buffer as possible.
+     bool allow_overscan_cutoff_ = false;
+     Effect effect_ = Effect::kBilinear;
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+     float cas_additional_sharpness_ = kCasAdditionalSharpnessDefault;
+     uint32_t fsr_max_upsampling_passes_ = kFsrMaxUpscalingPassesMax;
+     float fsr_sharpness_reduction_ = kFsrSharpnessReductionDefault;
++#endif
++#if defined(REX_HAS_FIDELITYFX_SDK)
+     FsrQualityMode fsr_quality_mode_ = FsrQualityMode::kAuto;
+ #endif
+     bool dither_ = false;
+@@ -427,7 +438,7 @@ class Presenter {
+   enum class GuestOutputPaintEffect {
+     kBilinear,
+     kBilinearDither,
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+     kCasSharpen,
+     kCasSharpenDither,
+     kCasResample,
+@@ -446,7 +457,7 @@ class Presenter {
+       // Dithering is never performed in intermediate passes because it may be
+       // interpreted as features by the subsequent passes.
+       case GuestOutputPaintEffect::kBilinearDither:
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+       case GuestOutputPaintEffect::kCasSharpenDither:
+       case GuestOutputPaintEffect::kCasResampleDither:
+       case GuestOutputPaintEffect::kFsrRcasDither:
+@@ -461,7 +472,7 @@ class Presenter {
+ 
+   static constexpr bool CanGuestOutputPaintEffectBeFinal(GuestOutputPaintEffect effect) {
+     switch (effect) {
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+       case GuestOutputPaintEffect::kFsrEasu:
+         return false;
+ #endif
+@@ -470,7 +481,7 @@ class Presenter {
+     };
+   }
+ 
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+   // The longest path is kFsrMaxUpscalingPassesMax + optionally RCAS +
+   // optionally bilinear, when upscaling by more than
+   // 2^kFsrMaxUpscalingPassesMax along any direction.
+@@ -548,7 +559,7 @@ class Presenter {
+     }
+   };
+ 
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+   static constexpr float CalculateCasPostSetupSharpness(float sharpness) {
+     // CasSetup const1.x.
+     return -1.0f / (8.0f - 3.0f * sharpness);
+@@ -615,7 +626,7 @@ class Presenter {
+       sharpness_post_setup = CalculatePostSetupSharpness(config.GetFsrSharpnessReduction());
+     }
+   };
+-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
++#endif  // defined(REX_HAS_FIDELITYFX_SPATIAL)
+ 
+   explicit Presenter(HostGpuLossCallback host_gpu_loss_callback)
+       : host_gpu_loss_callback_(host_gpu_loss_callback) {}
+diff --git a/include/rex/ui/vulkan/presenter.h b/include/rex/ui/vulkan/presenter.h
+index c168da8..02db121 100644
+--- a/include/rex/ui/vulkan/presenter.h
++++ b/include/rex/ui/vulkan/presenter.h
+@@ -242,7 +242,7 @@ class VulkanPresenter final : public Presenter {
+ 
+   enum GuestOutputPaintPipelineLayoutIndex : size_t {
+     kGuestOutputPaintPipelineLayoutIndexBilinear,
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+     kGuestOutputPaintPipelineLayoutIndexCasSharpen,
+     kGuestOutputPaintPipelineLayoutIndexCasResample,
+     kGuestOutputPaintPipelineLayoutIndexFsrEasu,
+@@ -258,7 +258,7 @@ class VulkanPresenter final : public Presenter {
+       case GuestOutputPaintEffect::kBilinear:
+       case GuestOutputPaintEffect::kBilinearDither:
+         return kGuestOutputPaintPipelineLayoutIndexBilinear;
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+       case GuestOutputPaintEffect::kCasSharpen:
+       case GuestOutputPaintEffect::kCasSharpenDither:
+         return kGuestOutputPaintPipelineLayoutIndexCasSharpen;
+diff --git a/src/graphics/pipeline/shader/translator.cpp b/src/graphics/pipeline/shader/translator.cpp
+index e472251..e3c1b0e 100644
+--- a/src/graphics/pipeline/shader/translator.cpp
++++ b/src/graphics/pipeline/shader/translator.cpp
+@@ -654,7 +654,6 @@ bool ShaderTranslator::TranslateAnalyzedShader(Shader::Translation& translation)
+ 
+   translation.errors_ = std::move(errors_);
+   translation.translated_binary_ = CompleteTranslation();
+-  translation.is_translated_ = true;
+ 
+   bool is_valid = true;
+   for (const auto& error : translation.errors_) {
+@@ -663,12 +662,16 @@ bool ShaderTranslator::TranslateAnalyzedShader(Shader::Translation& translation)
+       break;
+     }
+   }
+-  translation.is_valid_ = is_valid;
++  translation.is_valid_.store(is_valid, std::memory_order_release);
+ 
+   PostTranslation();
+ 
++  // Translated is set last (release): another thread that sees is_translated() also sees
++  // the final validity (ReXGlue: translation on pipeline creation threads).
++  translation.is_translated_.store(true, std::memory_order_release);
++
+   // In case is_valid_ is modified by PostTranslation, reload.
+-  return translation.is_valid_;
++  return translation.is_valid();
+ }
+ 
+ void ShaderTranslator::EmitTranslationError(const char* message, bool is_fatal) {
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 59ace14..cc3ce1c 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -706,18 +706,21 @@ void VulkanCommandProcessor::LogPipelineCountersIfDue() {
+   pipeline_counters_last_log_ns_ = now_ns;
+   VulkanPipelineCache::DrawTimeCounters counters = pipeline_cache_->TakeDrawTimeCounters();
+   if (counters.pipelines_queued || counters.pipelines_sync || counters.translations ||
+-      counters.libraries_created || counters.pipelines_linked || counters.pipelines_linked_sync ||
++      counters.translations_async || counters.libraries_created || counters.pipelines_linked ||
++      counters.pipelines_linked_sync ||
+       counter_draws_skipped_pending_ ||
+       counter_frames_held_) {
+     REXGPU_INFO(
+         "Pipelines (10 s): {} queued for the creation threads, {} created synchronously on the "
+-        "GPU thread ({:.1f} ms), {} shader translations on the GPU thread ({:.1f} ms), {} draws "
++        "GPU thread ({:.1f} ms), {} shader translations on the GPU thread ({:.1f} ms) and {} on "
++        "the creation threads ({:.1f} ms), {} draws "
+         "skipped while pending, {} of {} frames held; {} libraries compiled ({:.0f} ms), {} "
+         "pipelines linked ({:.0f} ms incl. library compiles), {} linked on the GPU thread from "
+         "cached libraries ({:.1f} ms)",
+         counters.pipelines_queued, counters.pipelines_sync,
+         double(counters.pipelines_sync_us) / 1000.0, counters.translations,
+-        double(counters.translations_us) / 1000.0, counter_draws_skipped_pending_,
++        double(counters.translations_us) / 1000.0, counters.translations_async,
++        double(counters.translations_async_us) / 1000.0, counter_draws_skipped_pending_,
+         counter_frames_held_, counter_frames_held_ + counter_frames_presented_,
+         counters.libraries_created, double(counters.libraries_created_us) / 1000.0,
+         counters.pipelines_linked, double(counters.pipelines_linked_us) / 1000.0,
+@@ -4856,6 +4859,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // Update the textures before most other work in the submission because
+   // samplers depend on this (and in case of sampler overflow in a submission,
+   // submissions must be split) - may perform dispatches and copying.
++  // With shader translation on the pipeline creation threads
++  // (vulkan_async_shader_translation) the texture mask and the sampler bindings of a shader
++  // not translated yet are empty; if its pipeline gets published before this draw binds, the
++  // draw is skipped below like a pending one.
++  const bool shaders_pending_translation =
++      !vertex_shader_translation->is_translated() ||
++      (pixel_shader_translation != nullptr && !pixel_shader_translation->is_translated());
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+@@ -4891,6 +4901,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     ++counter_draws_skipped_pending_;
+     return true;
+   }
++  if (shaders_pending_translation && pipeline != VK_NULL_HANDLE) {
++    // Translated and published by a creation thread between the texture setup and here.
++    ++counter_draws_skipped_pending_;
++    return true;
++  }
+   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+     return draw_fail("pipeline_lookup");
+   }
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index e8458e3..c3cb4ed 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -72,6 +72,12 @@ REXCVAR_DEFINE_BOOL(vulkan_pipeline_libraries, true, "GPU/Vulkan",
+                     "and new state combinations only need a fast link.")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_async_shader_translation, true, "GPU/Vulkan",
++                    "Translate guest shaders to SPIR-V on the pipeline creation threads instead "
++                    "of the GPU thread when the pipeline is created asynchronously (a "
++                    "translation takes 10-25 ms on a phone; the draws wait for the pipeline "
++                    "either way).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(vulkan_pipeline_compile_never_blocks, true, "GPU/Vulkan",
+                     "With async_shader_compilation, a pipeline missing at draw time is only "
+                     "created by the background creation threads: its draws are skipped until it "
+@@ -423,6 +429,12 @@ bool VulkanPipelineCache::Initialize() {
+       render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
+       render_target_cache_.draw_resolution_scale_x(),
+       render_target_cache_.draw_resolution_scale_y());
++  async_shader_translator_ = std::make_unique<SpirvShaderTranslator>(
++      SpirvShaderTranslator::Features(vulkan_device),
++      render_target_cache_.msaa_2x_attachments_supported(),
++      render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
++      render_target_cache_.draw_resolution_scale_x(),
++      render_target_cache_.draw_resolution_scale_y());
+ 
+   if (edram_fragment_shader_interlock) {
+     std::vector<uint8_t> depth_only_fragment_shader_code =
+@@ -1481,6 +1493,7 @@ void VulkanPipelineCache::Shutdown() {
+ 
+   // Shut down shader translation.
+   shader_translator_.reset();
++  async_shader_translator_.reset();
+ }
+ 
+ VulkanShader* VulkanPipelineCache::LoadShader(xenos::ShaderType shader_type,
+@@ -1678,8 +1691,30 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
+-  // Ensure shaders are translated - needed now for GetCurrentStateDescription.
+-  if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
++  // Shader translation takes 10-25 ms each on a phone: when the pipeline is created
++  // asynchronously anyway, translate on the creation threads (vulkan_async_shader_translation);
++  // the state description only needs the ucode analysis. Otherwise translate here as before.
++  const bool never_block = REXCVAR_GET(vulkan_pipeline_compile_never_blocks);
++  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
++                   (never_block || (pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE));
++  bool translate_async = false;
++  if (use_async && never_block && async_shader_translator_ &&
++      REXCVAR_GET(vulkan_async_shader_translation) &&
++      (!vertex_shader->is_translated() || (pixel_shader && !pixel_shader->is_translated()))) {
++    translate_async = true;
++    for (VulkanShader::VulkanTranslation* translation : {vertex_shader, pixel_shader}) {
++      if (!translation) {
++        continue;
++      }
++      if (translation->is_translated() && !translation->is_valid()) {
++        // Translation attempted previously, but not valid.
++        return false;
++      }
++      if (!translation->shader().is_ucode_analyzed()) {
++        translation->shader().AnalyzeUcode(ucode_disasm_buffer_);
++      }
++    }
++  } else if (!EnsureShadersTranslated(vertex_shader, pixel_shader)) {
+     return false;
+   }
+   if (shader_storage_file_ &&
+@@ -1734,9 +1769,6 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     }
+   }
+ 
+-  const bool never_block = REXCVAR_GET(vulkan_pipeline_compile_never_blocks);
+-  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
+-                   (never_block || (pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE));
+   auto count_sync_creation = [this](std::chrono::steady_clock::time_point start) {
+     counter_pipelines_sync_.fetch_add(1, std::memory_order_relaxed);
+     counter_pipelines_sync_us_.fetch_add(
+@@ -1794,14 +1826,15 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   auto& pipeline = *pipelines_.emplace(description, Pipeline()).first;
+   PipelineCreationArguments creation_arguments_real;
+   if (!TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
+-                                                     creation_arguments_real)) {
++                                                     creation_arguments_real, false,
++                                                     translate_async)) {
+     pipelines_.erase(description);
+     return false;
+   }
+ 
+   bool queued_async_creation = false;
+   bool linked_from_cached_libraries = false;
+-  if (uses_pipeline_libraries_) {
++  if (uses_pipeline_libraries_ && !translate_async) {
+     // Every library already exists or is a driver cache hit: a fast link right here, no pending
+     // draws and no held frame.
+     auto link_start = std::chrono::steady_clock::now();
+@@ -1892,6 +1925,9 @@ VulkanPipelineCache::DrawTimeCounters VulkanPipelineCache::TakeDrawTimeCounters(
+   counters.pipelines_sync_us = counter_pipelines_sync_us_.exchange(0, std::memory_order_relaxed);
+   counters.translations = counter_translations_.exchange(0, std::memory_order_relaxed);
+   counters.translations_us = counter_translations_us_.exchange(0, std::memory_order_relaxed);
++  counters.translations_async = counter_translations_async_.exchange(0, std::memory_order_relaxed);
++  counters.translations_async_us =
++      counter_translations_async_us_.exchange(0, std::memory_order_relaxed);
+   counters.libraries_created = counter_libraries_created_.exchange(0, std::memory_order_relaxed);
+   counters.libraries_created_us =
+       counter_libraries_created_us_.exchange(0, std::memory_order_relaxed);
+@@ -3617,7 +3653,8 @@ VkShaderModule VulkanPipelineCache::GetGeometryShader(GeometryShaderKey key) {
+ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
+     const PipelineDescription& description,
+     std::pair<const PipelineDescription, Pipeline>* pipeline,
+-    PipelineCreationArguments& creation_arguments, bool for_placeholder) {
++    PipelineCreationArguments& creation_arguments, bool for_placeholder,
++    bool allow_untranslated) {
+   auto fail = [&](const char* reason) {
+     REXGPU_ERROR(
+         "VulkanPipelineCache: TryGetPipelineCreationArgumentsForDescription "
+@@ -3643,7 +3680,11 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
+   }
+   auto* vertex_shader = static_cast<VulkanShader::VulkanTranslation*>(
+       vertex_shader_it->second->GetTranslation(description.vertex_shader_modification));
+-  if (!vertex_shader || !vertex_shader->is_translated() || !vertex_shader->is_valid()) {
++  // allow_untranslated: a shader not translated yet is translated on the creation thread
++  // (TranslateShadersForCreation); one attempted before and invalid is still rejected.
++  if (!vertex_shader ||
++      (allow_untranslated ? (vertex_shader->is_translated() && !vertex_shader->is_valid())
++                          : (!vertex_shader->is_translated() || !vertex_shader->is_valid()))) {
+     return fail("vertex_shader_translation_missing_or_invalid");
+   }
+   SpirvShaderTranslator::Modification vertex_shader_modification(
+@@ -3660,7 +3701,9 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
+     }
+     pixel_shader = static_cast<VulkanShader::VulkanTranslation*>(
+         pixel_shader_it->second->GetTranslation(description.pixel_shader_modification));
+-    if (!pixel_shader || !pixel_shader->is_translated() || !pixel_shader->is_valid()) {
++    if (!pixel_shader ||
++        (allow_untranslated ? (pixel_shader->is_translated() && !pixel_shader->is_valid())
++                            : (!pixel_shader->is_translated() || !pixel_shader->is_valid()))) {
+       return fail("pixel_shader_translation_missing_or_invalid");
+     }
+   }
+@@ -3713,7 +3756,13 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
+     }
+   }
+ 
+-  const PipelineLayoutProvider* pipeline_layout = command_processor_.GetPipelineLayout(
++  // The layout depends on the texture bindings known after translation: with a shader still
++  // to be translated it is filled in by TranslateShadersForCreation on the creation thread.
++  const bool layout_later =
++      allow_untranslated &&
++      (!vertex_shader->is_translated() ||
++       (pixel_shader && !for_placeholder && !pixel_shader->is_translated()));
++  const PipelineLayoutProvider* pipeline_layout = layout_later ? nullptr : command_processor_.GetPipelineLayout(
+       (!for_placeholder && pixel_shader) ? static_cast<const VulkanShader&>(pixel_shader->shader())
+                                                .GetTextureBindingsAfterTranslation()
+                                                .size()
+@@ -3728,7 +3777,7 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
+       static_cast<const VulkanShader&>(vertex_shader->shader())
+           .GetSamplerBindingsAfterTranslation()
+           .size());
+-  if (!pipeline_layout) {
++  if (!pipeline_layout && !layout_later) {
+     return fail("pipeline_layout_unavailable");
+   }
+ 
+@@ -5131,6 +5180,61 @@ void VulkanPipelineCache::PrecompileThread() {
+   precompile_pixel_shaders_.shrink_to_fit();
+ }
+ 
++bool VulkanPipelineCache::TranslateShadersForCreation(
++    PipelineCreationArguments& creation_arguments) {
++  VulkanShader::VulkanTranslation* translations[2] = {
++      const_cast<VulkanShader::VulkanTranslation*>(creation_arguments.vertex_shader),
++      const_cast<VulkanShader::VulkanTranslation*>(creation_arguments.pixel_shader)};
++  for (VulkanShader::VulkanTranslation* translation : translations) {
++    if (!translation) {
++      continue;
++    }
++    if (!translation->is_translated()) {
++      if (!async_shader_translator_) {
++        return false;
++      }
++      std::lock_guard<std::mutex> lock(async_translation_mutex_);
++      if (!translation->is_translated()) {
++        assert_true(translation->shader().is_ucode_analyzed());
++        auto start = std::chrono::steady_clock::now();
++        bool translated = TranslateAnalyzedShader(*async_shader_translator_, *translation);
++        counter_translations_async_.fetch_add(1, std::memory_order_relaxed);
++        counter_translations_async_us_.fetch_add(
++            uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                         std::chrono::steady_clock::now() - start)
++                         .count()),
++            std::memory_order_relaxed);
++        if (!translated) {
++          return false;
++        }
++      }
++    }
++    if (!translation->is_valid()) {
++      return false;
++    }
++  }
++  if (!creation_arguments.pipeline_layout) {
++    const auto& vertex_shader =
++        static_cast<const VulkanShader&>(creation_arguments.vertex_shader->shader());
++    const VulkanShader* pixel_shader =
++        creation_arguments.pixel_shader
++            ? &static_cast<const VulkanShader&>(creation_arguments.pixel_shader->shader())
++            : nullptr;
++    creation_arguments.pipeline_layout = command_processor_.GetPipelineLayout(
++        pixel_shader ? pixel_shader->GetTextureBindingsAfterTranslation().size() : 0,
++        pixel_shader ? pixel_shader->GetSamplerBindingsAfterTranslation().size() : 0,
++        vertex_shader.GetTextureBindingsAfterTranslation().size(),
++        vertex_shader.GetSamplerBindingsAfterTranslation().size());
++    if (!creation_arguments.pipeline_layout) {
++      REXGPU_ERROR("VulkanPipelineCache: no pipeline layout for an asynchronously translated "
++                   "pipeline (VS {:016X})",
++                   vertex_shader.ucode_data_hash());
++      return false;
++    }
++  }
++  return true;
++}
++
+ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+ #if defined(__ANDROID__)
+   LowerPipelineCreationThreadPriority();
+@@ -5155,7 +5259,8 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+       ++creation_threads_busy_;
+     }
+ 
+-    bool created = EnsurePipelineCreated(creation_arguments);
++    bool created = TranslateShadersForCreation(creation_arguments) &&
++                   EnsurePipelineCreated(creation_arguments);
+     if (!created) {
+       bool has_placeholder =
+           creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+@@ -5167,6 +5272,8 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+       } else {
+         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
+                                                            std::memory_order_release);
++        // A pending entry (no placeholder pipeline) must not keep its draws skipped forever.
++        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
+       }
+     }
+ 
+@@ -5189,7 +5296,8 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
+       creation_arguments = creation_queue_.top();
+       creation_queue_.pop();
+     }
+-    bool created = EnsurePipelineCreated(creation_arguments);
++    bool created = TranslateShadersForCreation(creation_arguments) &&
++                   EnsurePipelineCreated(creation_arguments);
+     if (!created) {
+       bool has_placeholder =
+           creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 7360ed9..32c8a10 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -45,7 +45,19 @@ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
+                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
+     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#elif defined(REX_HAS_FIDELITYFX_SPATIAL)
++REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
++                      "Guest output effect: bilinear, cas (AMD FidelityFX Contrast Adaptive "
++                      "Sharpening), fsr (AMD FidelityFX Super Resolution 1.0 upscaling)")
++    .allowed({"bilinear", "cas", "fsr"})
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#else
++REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
++    .allowed({"bilinear"})
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#endif
+ 
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+ REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
+                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
+                       "UI/Presenter", "Additional CAS sharpness in [0, 1]")
+@@ -65,17 +77,15 @@ REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
+     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
+            rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++#endif  // defined(REX_HAS_FIDELITYFX_SPATIAL)
+ 
++#if defined(REX_HAS_FIDELITYFX_SDK)
+ REXCVAR_DEFINE_STRING(
+     present_fsr_quality_mode, "auto", "UI/Presenter",
+     "Temporal FSR quality mode: auto, nativeaa, quality, balanced, performance, ultra_performance")
+     .allowed({"auto", "nativeaa", "quality", "balanced", "performance", "ultra_performance"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+-#else
+-REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output effect: bilinear")
+-    .allowed({"bilinear"})
+-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+-#endif
++#endif  // defined(REX_HAS_FIDELITYFX_SDK)
+ 
+ REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
+                     "Enable output dithering in the final present pass")
+@@ -92,13 +102,15 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
+   std::string lowered = effect_name;
+   std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                  [](unsigned char c) { return char(std::tolower(c)); });
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+   if (lowered == "cas") {
+     return GuestOutputPaintConfig::Effect::kCas;
+   }
+   if (lowered == "fsr") {
+     return GuestOutputPaintConfig::Effect::kFsr;
+   }
++#endif
++#if defined(REX_HAS_FIDELITYFX_SDK)
+   if (lowered == "fsr2") {
+     return GuestOutputPaintConfig::Effect::kFsr2;
+   }
+@@ -109,6 +121,17 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
+   return GuestOutputPaintConfig::Effect::kBilinear;
+ }
+ 
++// FSR2 / FSR3 (the temporal upscalers of the FidelityFX SDK runtime); never without the SDK.
++bool IsTemporalFsrEffect(GuestOutputPaintConfig::Effect effect) {
++#if defined(REX_HAS_FIDELITYFX_SDK)
++  return effect == GuestOutputPaintConfig::Effect::kFsr2 ||
++         effect == GuestOutputPaintConfig::Effect::kFsr3;
++#else
++  (void)effect;
++  return false;
++#endif
++}
++
+ #if defined(REX_HAS_FIDELITYFX_SDK)
+ bool IsTemporalFsrCompatibilityEffect(GuestOutputPaintConfig::Effect effect) {
+   return effect == GuestOutputPaintConfig::Effect::kFsr2 ||
+@@ -261,11 +284,13 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
+ #endif
+   config.SetAllowOverscanCutoff(REXCVAR_GET(present_allow_overscan_cutoff));
+   config.SetEffect(parsed_effect);
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+   config.SetCasAdditionalSharpness(float(REXCVAR_GET(present_cas_additional_sharpness)));
+   config.SetFsrMaxUpsamplingPasses(
+       uint32_t(std::max(int32_t(1), REXCVAR_GET(present_fsr_max_upsampling_passes))));
+   config.SetFsrSharpnessReduction(float(REXCVAR_GET(present_fsr_sharpness_reduction)));
++#endif
++#if defined(REX_HAS_FIDELITYFX_SDK)
+   config.SetFsrQualityMode(ParsePresentFsrQualityMode(REXCVAR_GET(present_fsr_quality_mode)));
+ #endif
+   config.SetDither(REXCVAR_GET(present_dither));
+@@ -659,13 +684,12 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
+     modified = true;
+     request_repaint = true;
+   }
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+   if (guest_output_paint_config_.GetFsrSharpnessReduction() !=
+       new_config.GetFsrSharpnessReduction()) {
+     modified = true;
+     if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
+-        new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
+-        new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
++        IsTemporalFsrEffect(new_config.GetEffect())) {
+       request_repaint = true;
+     }
+   }
+@@ -674,8 +698,7 @@ void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConf
+     modified = true;
+     if (new_config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
+         new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
+-        new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
+-        new_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
++        IsTemporalFsrEffect(new_config.GetEffect())) {
+       request_repaint = true;
+     }
+   }
+@@ -1030,11 +1053,10 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+   uint32_t output_width_clamped = std::min(output_width, max_rt_width);
+   uint32_t output_height_clamped = std::min(output_height, max_rt_height);
+ 
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+   if (config.GetEffect() == GuestOutputPaintConfig::Effect::kCas ||
+       config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr ||
+-      config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
+-      config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3) {
++      IsTemporalFsrEffect(config.GetEffect())) {
+     // FidelityFX Super Resolution and Contrast Adaptive Sharpening only work
+     // good for up to 2x2 upscaling due to the way they fetch texels.
+     // CAS is primarily a sharpening filter, not an upscaling one (its upscaling
+@@ -1056,11 +1078,14 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+       ffx_last_size.first = properties.frontbuffer_width;
+       ffx_last_size.second = properties.frontbuffer_height;
+     }
+-    bool is_temporal_effect = config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr2 ||
+-                              config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
++    bool is_temporal_effect = IsTemporalFsrEffect(config.GetEffect());
++#if defined(REX_HAS_FIDELITYFX_SDK)
+     bool temporal_quality_mode_forced =
+         is_temporal_effect &&
+         config.GetFsrQualityMode() != GuestOutputPaintConfig::FsrQualityMode::kAuto;
++#else
++    bool temporal_quality_mode_forced = false;
++#endif
+     if ((config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr || is_temporal_effect) &&
+         ((ffx_last_size.first < output_width_clamped ||
+           ffx_last_size.second < output_height_clamped) ||
+@@ -1069,6 +1094,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+       // Using the output size clamped to the maximum render target size here as
+       // EASU will always write to intermediate images, and RCAS supports only
+       // 1:1.
++#if defined(REX_HAS_FIDELITYFX_SDK)
+       if (is_temporal_effect) {
+         uint32_t temporal_input_width = ffx_last_size.first;
+         uint32_t temporal_input_height = ffx_last_size.second;
+@@ -1110,7 +1136,9 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+         assert_true(flow.effect_count < flow.effects.size());
+         flow.effect_output_sizes[flow.effect_count] = ffx_last_size;
+         flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kFsrEasu;
+-      } else {
++      } else
++#endif  // defined(REX_HAS_FIDELITYFX_SDK)
++      {
+         uint32_t easu_max_passes = config.GetFsrMaxUpsamplingPasses();
+         uint32_t easu_pass_count = 0;
+         while (easu_pass_count < easu_max_passes &&
+@@ -1145,7 +1173,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+                                               : GuestOutputPaintEffect::kCasResample;
+     }
+   }
+-#endif  // defined(REX_HAS_FIDELITYFX_SDK)
++#endif  // defined(REX_HAS_FIDELITYFX_SPATIAL)
+ 
+   std::pair<uint32_t, uint32_t>* last_pre_bilinear_effect_size =
+       flow.effect_count ? &flow.effect_output_sizes[flow.effect_count - 1] : nullptr;
+@@ -1156,7 +1184,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+     // Clamp the output size of the last effect to the maximum render target
+     // size because it will go to an intermediate image now.
+     if (last_pre_bilinear_effect_size) {
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+       // RCAS only works for 1:1, clamping must be done explicitly for FSR.
+       assert_false(flow.effects[flow.effect_count - 1] == GuestOutputPaintEffect::kFsrRcas &&
+                    (last_pre_bilinear_effect_size->first > max_rt_width ||
+@@ -1188,7 +1216,7 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
+           last_effect = GuestOutputPaintEffect::kBilinearDither;
+         }
+         break;
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+       case GuestOutputPaintEffect::kCasSharpen:
+         last_effect = GuestOutputPaintEffect::kCasSharpenDither;
+         break;
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index fe9fdc6..f42b880 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -115,7 +115,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FfxVkGetDeviceProcAddrCompat(VkDevice d
+ namespace shaders {
+ #include "../shaders/vulkan_spirv/guest_output_bilinear_dither_ps.h"
+ #include "../shaders/vulkan_spirv/guest_output_bilinear_ps.h"
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+ #include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_dither_ps.h"
+ #include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_ps.h"
+ #include "../shaders/vulkan_spirv/guest_output_ffx_cas_sharpen_dither_ps.h"
+@@ -2070,7 +2070,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+           uint32_t effect_constants_size = 0;
+           union {
+             BilinearConstants bilinear;
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+             CasSharpenConstants cas_sharpen;
+             CasResampleConstants cas_resample;
+             FsrEasuConstants fsr_easu;
+@@ -2082,7 +2082,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+               effect_constants_size = sizeof(effect_constants.bilinear);
+               effect_constants.bilinear.Initialize(guest_output_flow, i);
+             } break;
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+             case kGuestOutputPaintPipelineLayoutIndexCasSharpen: {
+               effect_constants_size = sizeof(effect_constants.cas_sharpen);
+               effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
+@@ -2422,7 +2422,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+       case kGuestOutputPaintPipelineLayoutIndexBilinear:
+         guest_output_paint_push_constant_range_ffx.size = sizeof(BilinearConstants);
+         break;
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+       case kGuestOutputPaintPipelineLayoutIndexCasSharpen:
+         guest_output_paint_push_constant_range_ffx.size = sizeof(CasSharpenConstants);
+         break;
+@@ -2477,7 +2477,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
+         shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_dither_ps);
+         shader_module_create_info.pCode = shaders::guest_output_bilinear_dither_ps;
+         break;
+-#if defined(REX_HAS_FIDELITYFX_SDK)
++#if defined(REX_HAS_FIDELITYFX_SPATIAL)
+       case GuestOutputPaintEffect::kCasSharpen:
+         shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_cas_sharpen_ps);
+         shader_module_create_info.pCode = shaders::guest_output_ffx_cas_sharpen_ps;

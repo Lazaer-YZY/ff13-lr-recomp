@@ -1,0 +1,62 @@
+From 780619b39a49fe2d8f313a13e32344d166a2fb48 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:47:23 +0800
+Subject: [PATCH 026/108] core(android): executable path is librexruntime.so;
+ REX_ANDROID_APP_DIR (behaviour informed by lr-ffxiii-port's Android patch,
+ re-implemented)
+
+On Android /proc/self/exe is /system/bin/app_process64. GetExecutablePath now
+returns librexruntime.so's path (dladdr), and GetExecutableFolder returns the
+env var REX_ANDROID_APP_DIR when set (a writable folder for <name>.toml and
+the default log folder), else the native library directory.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index ef5bdf4..6c518cf 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -34,6 +34,11 @@
+ #include <ftw.h>
+ #include <libgen.h>
+ #include <pwd.h>
++#if REX_PLATFORM_ANDROID
++#include <dlfcn.h>
++
++#include <cstdlib>
++#endif
+ 
+ // macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
+ // explicit *64 forms for legacy 32-bit off_t distributions.
+@@ -70,7 +75,15 @@ std::filesystem::path to_path(const std::u16string_view source) {
+ namespace filesystem {
+ 
+ std::filesystem::path GetExecutablePath() {
+-#if defined(__APPLE__)
++#if REX_PLATFORM_ANDROID
++  // The process image is /system/bin/app_process64; the meaningful
++  // "executable" is librexruntime.so in the APK's native library directory.
++  Dl_info info{};
++  if (dladdr(reinterpret_cast<const void*>(&GetExecutablePath), &info) && info.dli_fname) {
++    return std::filesystem::path(info.dli_fname);
++  }
++  return {};
++#elif defined(__APPLE__)
+   // Darwin has no /proc; query the executable path via the dyld API. The first
+   // call reports the required buffer size.
+   uint32_t executable_path_size = 0;
+@@ -100,6 +113,14 @@ std::filesystem::path GetExecutablePath() {
+ }
+ 
+ std::filesystem::path GetExecutableFolder() {
++#if REX_PLATFORM_ANDROID
++  // The native library directory is read-only, but the runtime keeps its
++  // config (<name>.toml) and default log folder next to the executable. The
++  // app points REX_ANDROID_APP_DIR at a writable folder for them.
++  if (const char* dir = std::getenv("REX_ANDROID_APP_DIR"); dir && *dir) {
++    return std::filesystem::path(dir);
++  }
++#endif
+   return GetExecutablePath().parent_path();
+ }
+ 

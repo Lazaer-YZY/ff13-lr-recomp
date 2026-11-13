@@ -1,0 +1,181 @@
+From 22b0dd563c7aebebe0294838f6ebee406133640e Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:42:53 +0800
+Subject: [PATCH 023/108] core(posix): multi-object waits sleep on a shared
+ condition variable; optional Android spin (behaviour informed by
+ lr-ffxiii-port's Android patch, re-implemented)
+
+WaitMultiple polled every 1 ms. Every place that can make a handle signaled
+(event set, semaphore release, mutant release, thread exit) now bumps a
+generation counter and wakes multi-object waiters through one process-wide
+condition variable; waiters re-check on a change, with a 50 ms safety-net
+cap. Windows is unaffected (threading_win.cpp).
+
+Android only: Wait() can spin briefly before sleeping, set by the env var
+REX_WAIT_SPIN_US (microseconds; default 0 = off).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index aa2a136..4c35d9b 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -13,7 +13,9 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ 
+ #include <signal.h>
+ 
++#include <algorithm>
+ #include <atomic>
++#include <cstdlib>
+ #include <array>
+ #include <cerrno>
+ #include <cstddef>
+@@ -267,6 +269,22 @@ static sem_t* RexCreateAnonymousSemaphore() {
+ }
+ #endif  // __APPLE__
+ 
++// Multi-object waits sleep on one process-wide condition variable instead of
++// polling every millisecond. Anything that may make a handle signaled bumps the
++// generation and wakes them (taking the mutex only while such a wait exists).
++static std::mutex g_multi_wait_mutex;
++static std::condition_variable g_multi_wait_cv;
++static std::atomic<uint64_t> g_multi_wait_generation{0};
++static std::atomic<int> g_multi_waiters{0};
++
++inline void NotifyMultiWaiters() {
++  g_multi_wait_generation.fetch_add(1);
++  if (g_multi_waiters.load() > 0) {
++    std::lock_guard<std::mutex> lock(g_multi_wait_mutex);
++    g_multi_wait_cv.notify_all();
++  }
++}
++
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+@@ -300,6 +318,38 @@ class PosixConditionBase {
+     }
+     std::unique_lock<std::mutex> lock(mutex_, std::adopt_lock);
+ #else
++#if REX_PLATFORM_ANDROID
++    // Optional short spin before sleeping (env REX_WAIT_SPIN_US, default 0 =
++    // off): a sleep/wake-up on a phone's idle low-clocked cores costs a large
++    // fraction of a millisecond, and job systems hand work between threads
++    // many times per frame. A signal arriving within the spin skips it.
++    if (timeout.count() != 0) {
++      static const int64_t spin_us = [] {
++        const char* value = std::getenv("REX_WAIT_SPIN_US");
++        return value ? std::max<int64_t>(0, std::atoll(value)) : int64_t(0);
++      }();
++      if (spin_us > 0) {
++        const auto spin_end = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
++        for (uint32_t i = 0;; ++i) {
++          if (mutex_.try_lock()) {
++            const bool ready = predicate();
++            mutex_.unlock();
++            if (ready) {
++              break;
++            }
++          }
++          if ((i & 15) == 15 && std::chrono::steady_clock::now() >= spin_end) {
++            break;
++          }
++#if defined(__aarch64__)
++          for (int k = 0; k < 32; ++k) {
++            __asm__ __volatile__("yield");
++          }
++#endif
++        }
++      }
++    }
++#endif
+     std::unique_lock<std::mutex> lock(mutex_);
+ #endif
+     if (predicate()) {
+@@ -335,7 +385,15 @@ class PosixConditionBase {
+                         ? std::chrono::steady_clock::time_point::max()
+                         : start_time + timeout;
+ 
++    g_multi_waiters.fetch_add(1);
++    struct MultiWaiterScope {
++      ~MultiWaiterScope() { g_multi_waiters.fetch_sub(1); }
++    } multi_waiter_scope;
++
+     while (true) {
++      // Read before checking the handles: a signal after the check changes it,
++      // so the sleep below returns immediately.
++      const uint64_t generation = g_multi_wait_generation.load();
+       size_t first_signaled = std::numeric_limits<size_t>::max();
+       bool condition_met = false;
+       bool all_locked = true;
+@@ -411,13 +469,16 @@ class PosixConditionBase {
+         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
+       }
+ 
+-      if (timeout == std::chrono::milliseconds::max()) {
+-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+-      } else {
+-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
+-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
+-        std::this_thread::sleep_for(sleep_time);
++      // Sleep until a handle may have changed. The 50 ms cap is only a safety
++      // net in case a state change somewhere does not notify.
++      auto wake_time = now + std::chrono::milliseconds(50);
++      if (end_time < wake_time) {
++        wake_time = end_time;
+       }
++      std::unique_lock<std::mutex> wait_lock(g_multi_wait_mutex);
++      g_multi_wait_cv.wait_until(wait_lock, wake_time, [generation] {
++        return g_multi_wait_generation.load() != generation;
++      });
+     }
+   }
+ 
+@@ -450,6 +511,7 @@ class PosixCondition<Event> : public PosixConditionBase {
+     auto lock = std::unique_lock<std::mutex>(mutex_);
+     signal_ = true;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -487,6 +549,7 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
+     }
+     count_ += release_count;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -519,6 +582,7 @@ class PosixCondition<Mutant> : public PosixConditionBase {
+       // Free to be acquired by another thread
+       if (count_ == 0) {
+         cond_.notify_all();
++        NotifyMultiWaiters();
+       }
+       return true;
+     }
+@@ -551,6 +615,7 @@ class PosixCondition<Timer> : public PosixConditionBase {
+     std::lock_guard<std::mutex> lock(mutex_);
+     signal_ = true;
+     cond_.notify_all();
++    NotifyMultiWaiters();
+     return true;
+   }
+ 
+@@ -979,6 +1044,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       exit_code_ = exit_code;
+       signaled_ = true;
+       cond_.notify_all();
++      NotifyMultiWaiters();
+     }
+     if (is_current_thread) {
+       pthread_exit(reinterpret_cast<void*>(exit_code));
+@@ -1468,6 +1534,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+     thread->handle_.exit_code_ = 0;
+     thread->handle_.signaled_ = true;
+     thread->handle_.cond_.notify_all();
++    NotifyMultiWaiters();
+   }
+ 
+   current_thread_ = nullptr;

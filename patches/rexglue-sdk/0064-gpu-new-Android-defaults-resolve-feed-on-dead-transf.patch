@@ -1,0 +1,60 @@
+From e4892ca4f8faf9c4d4512e826cf50e126db032e9 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 14:04:20 +0800
+Subject: [PATCH 064/108] gpu: new Android defaults: resolve feed on,
+ dead-transfer skip mode 2, no mid-frame submits
+
+- vulkan_resolve_feed_textures = true.
+- gpu_skip_overwritten_transfers = 2 (the stale stencil can't reach k_24_8
+  sampling, which Xenia loads depth-only).
+- vulkan_submit_on_primary_buffer_end = false: with mid-frame submissions,
+  Lightning Returns' title shows a mostly black frame every 8-16 frames on the
+  Adreno 740 (0/72 with it off; GPU barriers at submission starts don't help,
+  cause not found yet).
+- Removed the temporary rectangle-coverage vertex log.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index c4a7bb7..3878398 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -28,7 +28,7 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ 
+-REXCVAR_DEFINE_UINT32(gpu_skip_overwritten_transfers, 0, "GPU",
++REXCVAR_DEFINE_UINT32(gpu_skip_overwritten_transfers, 2, "GPU",
+                       "Skip ownership transfers into the part of a depth render target that "
+                       "the draw needing them overwrites completely (a single screen-space "
+                       "rectangle with depth test ALWAYS and depth write). 1 = only if the "
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 52fa7db..60cb656 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -61,8 +61,10 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
+                     "used placeholder pipelines to avoid visible flashing")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+-REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+-                    "Submit command buffer when PM4 primary buffer ends")
++REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, false, "GPU/Vulkan",
++                    "Submit command buffer when PM4 primary buffer ends. Off by default on "
++                    "Android: with it on, Lightning Returns' title shows a mostly black frame "
++                    "every 8-16 frames on the Adreno 740 (cause not found yet).")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_submission_start_full_barrier, false, "GPU/Vulkan",
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 623e687..01420b3 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -56,7 +56,7 @@ REXCVAR_DEFINE_UINT32(vulkan_resolve_feed_debug, 0, "GPU/Vulkan",
+                       "Diagnostic: resolve feeding writes solid magenta instead of the render "
+                       "target contents: 1 = every fed resolve, other values = only resolves "
+                       "to that guest address (decimal).");
+-REXCVAR_DEFINE_BOOL(vulkan_resolve_feed_textures, false, "GPU/Vulkan",
++REXCVAR_DEFINE_BOOL(vulkan_resolve_feed_textures, true, "GPU/Vulkan",
+                     "Experimental: draw 1x k_8_8_8_8 resolves straight from the render target "
+                     "into the cached texture that samples the resolved memory (same format, "
+                     "endianness and pitch, single level, red/blue swap applied), keeping it "

@@ -1,0 +1,42 @@
+From a49a1c334e1cbfbf6d92818990eb6971f7a14a22 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Wed, 11 Nov 2026 11:56:05 +0800
+Subject: [PATCH 099/108] gpu: command-thread timers only with
+ vulkan_slow_frame_ms (the app's debug logging switch)
+
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index fb959fe..97e1dab 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -148,11 +148,16 @@ inline uint64_t CpNowNs() {
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count());
+ }
++// Feeds only the "GPU slow frame" breakdown: with vulkan_slow_frame_ms 0 (the Android app's
++// "Debug logging" off) no clock reads (several per draw, one per vertex fetch).
+ struct CpScopedTimer {
+   uint64_t& acc;
+   uint64_t t0;
+-  explicit CpScopedTimer(uint64_t& a) : acc(a), t0(CpNowNs()) {}
+-  ~CpScopedTimer() { acc += CpNowNs() - t0; }
++  explicit CpScopedTimer(uint64_t& a)
++      : acc(a), t0(REXCVAR_GET(vulkan_slow_frame_ms) ? CpNowNs() : 0) {}
++  ~CpScopedTimer() {
++    if (t0) acc += CpNowNs() - t0;
++  }
+ };
+ }  // namespace
+ REXCVAR_DEFINE_BOOL(vulkan_gpu_trace_frame, false, "GPU",
+@@ -6362,7 +6367,10 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+   };
+   std::optional<FenceWaitTimer> fence_wait_timer;
+   if (await_submission > submission_completed_) {
+-    fence_wait_timer.emplace(FenceWaitTimer{this, __builtin_return_address(0)});
++    // Statistics only ("GPU fence waits", the slow-frame breakdown): off with vulkan_slow_frame_ms 0.
++    if (REXCVAR_GET(vulkan_slow_frame_ms)) {
++      fence_wait_timer.emplace(FenceWaitTimer{this, __builtin_return_address(0)});
++    }
+     // Await in a blocking way if requested.
+     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
+     // defined by vkQueueSubmit additionally include in the first

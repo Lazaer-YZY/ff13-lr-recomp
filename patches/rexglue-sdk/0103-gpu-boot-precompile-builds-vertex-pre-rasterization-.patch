@@ -1,0 +1,523 @@
+From aecae974f5ffbce971ca7ab927b4cbf73df718f5 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Wed, 11 Nov 2026 17:38:31 +0800
+Subject: [PATCH 103/108] gpu: boot precompile builds vertex
+ (pre-rasterization) libraries too; vertex sign classes out of the stored
+ description (its layout grew a byte)
+
+
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 4d9787b..c5dc021 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -235,9 +235,9 @@ class VulkanPipelineCache {
+     // slot; 0 = all from the system constants at runtime (and the same hash as before this field
+     // existed, as the padding was zero).
+     uint32_t texture_sign_classes : 16;  // 26
+-    // Vertex shader texture sign classes, SpirvShaderTranslator::kVertexTextureSignClassSlots
+-    // slots of 2 bits; 0 = runtime (the same hash as before, as this padding was zero).
+-    uint32_t vertex_texture_sign_classes : 6;  // 32
++    // NO more fields here: the struct is packed, its bit-fields are contiguous (35 + 26 = 61 bits
++    // in 8 bytes), so 6 more bits made every stored description a byte longer and the whole
++    // pipeline storage "corrupted" (2026-11-11). Changing the layout needs a kVersion bump.
+ 
+     // Filled only for the attachments present in the render pass object.
+     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
+@@ -533,6 +533,18 @@ class VulkanPipelineCache {
+   // (.xpso: used in play on this device or on the one its shader cache came from), in first-use
+   // order; the app's notice covers only them.
+   size_t precompile_priority_count_ = 0;
++  // Ahead-of-time pre-rasterization (vertex) libraries (vulkan_precompile_vertex_libraries):
++  // every stored vertex shader with the modification its draws request - from the stored
++  // pipelines when used in play (those first, in first-use order; precompile_vertex_used_count_),
++  // else the canonical one (host vertex shader type kVertex, every written interpolator exported).
++  struct PrecompileVertexVariant {
++    size_t shader_index;  // In precompile_vertex_shaders_.
++    uint64_t modification;
++    bool from_storage;
++  };
++  std::vector<PrecompileShader> precompile_vertex_shaders_;
++  std::vector<PrecompileVertexVariant> precompile_vertex_variants_;
++  size_t precompile_vertex_used_count_ = 0;
+   std::unordered_map<uint64_t, uint32_t> pixel_shader_meta_;
+   std::unique_ptr<rex::thread::Thread> precompile_thread_;
+   std::atomic<bool> precompile_shutdown_{false};
+@@ -542,6 +554,16 @@ class VulkanPipelineCache {
+                                         VkPipelineLayout layout,
+                                         const VkPipelineMultisampleStateCreateInfo& multisample,
+                                         const VkSpecializationInfo* specialization = nullptr);
++  static uint64_t PreRasterizationLibraryKeyHash(uint64_t vertex_shader_hash,
++                                                 uint64_t vertex_shader_modification,
++                                                 uint32_t vertex_texture_sign_classes,
++                                                 uint32_t geometry_shader_key);
++  // The pre-rasterization library (vertex shader, optional geometry shader, rasterization state
++  // dynamic) - shared by the draws and the boot precompile.
++  VkPipeline GetOrCreatePreRasterizationLibrary(
++      const VulkanShader::VulkanTranslation* vertex_shader, uint64_t vertex_shader_modification,
++      uint32_t vertex_texture_sign_classes, uint32_t geometry_shader_key,
++      VkShaderModule geometry_shader, VkPipelineLayout layout, bool only_if_cached);
+   // Returns the library for the key (creating it with create_info on a miss), VK_NULL_HANDLE on
+   // failure.
+   VkPipeline GetOrCreatePipelineLibrary(const void* key, size_t key_size,
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 0f79601..44e0986 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -61,8 +61,9 @@ bool SpirvShaderTranslator::IsTextureSignSpecializationEnabled() {
+ }
+ 
+ bool SpirvShaderTranslator::IsVertexTextureSignSpecializationEnabled() {
+-  return REXCVAR_GET(spirv_texture_sign_specialization) &&
+-         REXCVAR_GET(spirv_vertex_texture_sign_specialization);
++  // Unavailable: the pipeline description has no room for the vertex classes without a storage
++  // layout change (see VulkanPipelineCache::PipelineDescription); measured no gain anyway.
++  return false;
+ }
+ 
+ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 6d9fb18..8508466 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -123,6 +123,14 @@ REXCVAR_DEFINE_INT32(vulkan_precompile_in_game, 2, "GPU/Vulkan",
+     .range(0, 2)
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_precompile_vertex_libraries, true, "GPU/Vulkan",
++                    "The boot precompile also builds the pre-rasterization (vertex shader) "
++                    "libraries: the variants used in play (from the stored pipelines) after the "
++                    "used pixel shaders, the canonical variant of every other stored vertex "
++                    "shader at the end. A pipeline state seen for the first time then links in "
++                    "~1-3 ms instead of compiling its vertex library on the spot (~130 ms)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_INT32(vulkan_precompile_threads, 0, "GPU/Vulkan",
+                      "Threads for the boot pipeline library precompile (on Android: on the faster "
+                      "CPU clusters); 0 = min(4, logical processors / 2)")
+@@ -745,6 +753,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+                                         shader_header.ucode_dword_count, ucode_data_hash);
+       if (uses_pipeline_libraries_ && shader_header.type == xenos::ShaderType::kPixel) {
+         precompile_pixel_shaders_.push_back({ucode_data_hash, ucode_dwords});
++      } else if (uses_pipeline_libraries_ && shader_header.type == xenos::ShaderType::kVertex &&
++                 REXCVAR_GET(vulkan_precompile_vertex_libraries)) {
++        precompile_vertex_shaders_.push_back({ucode_data_hash, ucode_dwords});
+       }
+       if (shader->ucode_storage_index() == shader_storage_index_) {
+         // Appeared twice in this file for some reason - skip.
+@@ -1132,6 +1143,41 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       }
+       ++precompile_priority_count_;
+     }
++    // Vertex libraries: the variants of the stored pipelines (plain vertex shaders, no geometry
++    // shader) first, in first-use order, then a canonical one (computed on the precompile thread,
++    // modification 0 here) for every other stored vertex shader.
++    precompile_vertex_variants_.clear();
++    precompile_vertex_used_count_ = 0;
++    if (!precompile_vertex_shaders_.empty()) {
++      std::unordered_map<uint64_t, size_t> vertex_index;
++      for (size_t i = 0; i < precompile_vertex_shaders_.size(); ++i) {
++        vertex_index.emplace(precompile_vertex_shaders_[i].hash, i);
++      }
++      std::unordered_set<uint64_t> variant_seen;
++      std::vector<bool> vertex_has_variant(precompile_vertex_shaders_.size(), false);
++      for (const PipelineStoredDescription& stored : pipeline_stored_descriptions) {
++        const PipelineDescription& d = stored.description;
++        SpirvShaderTranslator::Modification modification(d.vertex_shader_modification);
++        if (d.geometry_shader != PipelineGeometryShader::kNone ||
++            d.primitive_topology == PipelinePrimitiveTopology::kPatchList ||
++            modification.vertex.host_vertex_shader_type != Shader::HostVertexShaderType::kVertex) {
++          continue;
++        }
++        auto it = vertex_index.find(d.vertex_shader_hash);
++        if (it == vertex_index.end() ||
++            !variant_seen.insert(d.vertex_shader_hash ^ (d.vertex_shader_modification * 31)).second) {
++          continue;
++        }
++        precompile_vertex_variants_.push_back({it->second, d.vertex_shader_modification, true});
++        vertex_has_variant[it->second] = true;
++      }
++      precompile_vertex_used_count_ = precompile_vertex_variants_.size();
++      for (size_t i = 0; i < precompile_vertex_shaders_.size(); ++i) {
++        if (!vertex_has_variant[i]) {
++          precompile_vertex_variants_.push_back({i, 0, false});
++        }
++      }
++    }
+     precompile_shutdown_ = false;
+     precompile_thread_ = rex::thread::Thread::Create({}, [this]() { PrecompileThread(); });
+     if (precompile_thread_) {
+@@ -1821,18 +1867,17 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   if (!pixel_shader || !SpirvShaderTranslator::IsTextureSignSpecializationEnabled()) {
+     texture_sign_classes = 0;
+   }
+-  if (!SpirvShaderTranslator::IsVertexTextureSignSpecializationEnabled()) {
+-    vertex_texture_sign_classes = 0;
+-  }
++  // Vertex sign classes have no place in the stored description (see PipelineDescription), so
++  // vertex shaders always use the runtime signs (spirv_vertex_texture_sign_specialization measured
++  // no gain anyway).
++  (void)vertex_texture_sign_classes;
+   const bool try_sign_specialization =
+-      (texture_sign_classes || vertex_texture_sign_classes) && !translate_async && use_async &&
+-      never_block;
++      texture_sign_classes && !translate_async && use_async && never_block;
+   // The fast path only for the variant that is preferred (with sign classes: the specialized one;
+   // while it's pending, the lookups below run and fall back to the runtime variant).
+   PipelineDescription preferred_description = description;
+   if (try_sign_specialization) {
+     preferred_description.texture_sign_classes = texture_sign_classes;
+-    preferred_description.vertex_texture_sign_classes = vertex_texture_sign_classes;
+   }
+   if (last_pipeline_ && last_pipeline_->first == preferred_description) {
+     VkPipeline last_pipeline = last_pipeline_->second.pipeline.load(std::memory_order_acquire);
+@@ -4172,6 +4217,95 @@ VkPipeline VulkanPipelineCache::GetOrCreateFragmentLibrary(
+                                           false);
+ }
+ 
++uint64_t VulkanPipelineCache::PreRasterizationLibraryKeyHash(uint64_t vertex_shader_hash,
++                                                             uint64_t vertex_shader_modification,
++                                                             uint32_t vertex_texture_sign_classes,
++                                                             uint32_t geometry_shader_key) {
++  // Stable across runs: the shader's ucode hash + modification determine its translation (and its
++  // texture set), the geometry shader key the expansion shader.
++  struct {
++    uint32_t kind = 2;
++    uint32_t geometry_shader_key = 0;
++    uint64_t vertex_shader_hash;
++    uint64_t vertex_shader_modification;
++  } key;
++  key.vertex_shader_hash = vertex_shader_hash;
++  key.vertex_shader_modification = vertex_shader_modification;
++  // Vertex texture sign classes above the kind (0 = runtime: the same key as before).
++  key.kind |= vertex_texture_sign_classes << 8;
++  key.geometry_shader_key = geometry_shader_key;
++  return XXH3_64bits(&key, sizeof(key));
++}
++
++VkPipeline VulkanPipelineCache::GetOrCreatePreRasterizationLibrary(
++    const VulkanShader::VulkanTranslation* vertex_shader, uint64_t vertex_shader_modification,
++    uint32_t vertex_texture_sign_classes, uint32_t geometry_shader_key,
++    VkShaderModule geometry_shader, VkPipelineLayout layout, bool only_if_cached) {
++  // Shared by the draws (EnsurePipelineCreatedFromLibraries) and the boot precompile, so both
++  // produce the same key and the same library.
++  uint64_t key_hash = PreRasterizationLibraryKeyHash(vertex_shader->shader().ucode_data_hash(),
++                                                     vertex_shader_modification,
++                                                     vertex_texture_sign_classes,
++                                                     geometry_shader_key);
++  TextureSignSpecialization vertex_sign_specialization;
++  VkPipelineShaderStageCreateInfo stages[2] = {};
++  uint32_t stage_count = 0;
++  stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++  stages[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
++  stages[stage_count].module = vertex_shader->shader_module();
++  stages[stage_count].pName = "main";
++  stages[stage_count].pSpecializationInfo = vertex_sign_specialization.Build(
++      vertex_texture_sign_classes, GetPixelShaderUsedTextureMask(vertex_shader),
++      SpirvShaderTranslator::kVertexTextureSignClassSlots);
++  ++stage_count;
++  if (geometry_shader != VK_NULL_HANDLE) {
++    stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
++    stages[stage_count].module = geometry_shader;
++    stages[stage_count].pName = "main";
++    ++stage_count;
++  }
++  VkPipelineRenderingCreateInfo view_mask_rendering = {
++      VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++  view_mask_rendering.viewMask = 0;
++  VkPipelineViewportStateCreateInfo viewport_state = {
++      VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++  viewport_state.viewportCount = 1;
++  viewport_state.scissorCount = 1;
++  VkPipelineRasterizationStateCreateInfo rasterization_state = {
++      VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++  rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
++  rasterization_state.cullMode = VK_CULL_MODE_NONE;
++  rasterization_state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++  rasterization_state.lineWidth = 1.0f;
++  static const VkDynamicState kDynamicStates[] = {
++      VK_DYNAMIC_STATE_VIEWPORT,
++      VK_DYNAMIC_STATE_SCISSOR,
++      VK_DYNAMIC_STATE_DEPTH_BIAS,
++      VK_DYNAMIC_STATE_CULL_MODE,
++      VK_DYNAMIC_STATE_FRONT_FACE,
++      VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
++      VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
++      VK_DYNAMIC_STATE_POLYGON_MODE_EXT,
++      VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT,
++  };
++  VkPipelineDynamicStateCreateInfo dynamic_state = {
++      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++  dynamic_state.dynamicStateCount = uint32_t(rex::countof(kDynamicStates));
++  dynamic_state.pDynamicStates = kDynamicStates;
++  VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++  info.pNext = &view_mask_rendering;
++  info.stageCount = stage_count;
++  info.pStages = stages;
++  info.pViewportState = &viewport_state;
++  info.pRasterizationState = &rasterization_state;
++  info.pDynamicState = &dynamic_state;
++  info.layout = layout;
++  return GetOrCreatePipelineLibraryByHash(
++      key_hash, info, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
++      only_if_cached);
++}
++
+ bool VulkanPipelineCache::EnsurePipelineCreatedFromLibraries(
+     const PipelineCreationArguments& creation_arguments, bool only_if_cached) {
+   const PipelineDescription& description = creation_arguments.pipeline->first;
+@@ -4286,83 +4420,19 @@ bool VulkanPipelineCache::EnsurePipelineCreatedFromLibraries(
+   // rasterization state dynamic.
+   VkPipeline pre_rasterization_library;
+   {
+-    // Stable across runs: the shader's ucode hash + modification determine its translation
+-    // (and its texture set), the geometry shader key the expansion shader.
+-    struct {
+-      uint32_t kind = 2;
+-      uint32_t geometry_shader_key = 0;
+-      uint64_t vertex_shader_hash;
+-      uint64_t vertex_shader_modification;
+-    } key;
+-    key.vertex_shader_hash = creation_arguments.vertex_shader->shader().ucode_data_hash();
+-    key.vertex_shader_modification = description.vertex_shader_modification;
+-    // Vertex texture sign classes above the kind (0 = runtime: the same key as before).
+-    key.kind |= uint32_t(description.vertex_texture_sign_classes) << 8;
+-    TextureSignSpecialization vertex_sign_specialization;
+-    {
+-      GeometryShaderKey geometry_shader_key;
+-      if (GetGeometryShaderKey(
+-              description.geometry_shader,
+-              SpirvShaderTranslator::Modification(description.vertex_shader_modification),
+-              SpirvShaderTranslator::Modification(description.pixel_shader_modification),
+-              geometry_shader_key)) {
+-        key.geometry_shader_key = geometry_shader_key.key;
+-      }
+-    }
+-    VkPipelineShaderStageCreateInfo stages[2] = {};
+-    uint32_t stage_count = 0;
+-    stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+-    stages[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
+-    stages[stage_count].module = creation_arguments.vertex_shader->shader_module();
+-    stages[stage_count].pName = "main";
+-    stages[stage_count].pSpecializationInfo = vertex_sign_specialization.Build(
+-        description.vertex_texture_sign_classes,
+-        GetPixelShaderUsedTextureMask(creation_arguments.vertex_shader),
+-        SpirvShaderTranslator::kVertexTextureSignClassSlots);
+-    ++stage_count;
+-    if (creation_arguments.geometry_shader != VK_NULL_HANDLE) {
+-      stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+-      stages[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+-      stages[stage_count].module = creation_arguments.geometry_shader;
+-      stages[stage_count].pName = "main";
+-      ++stage_count;
+-    }
+-    VkPipelineViewportStateCreateInfo viewport_state = {
+-        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+-    viewport_state.viewportCount = 1;
+-    viewport_state.scissorCount = 1;
+-    VkPipelineRasterizationStateCreateInfo rasterization_state = {
+-        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+-    rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
+-    rasterization_state.cullMode = VK_CULL_MODE_NONE;
+-    rasterization_state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+-    rasterization_state.lineWidth = 1.0f;
+-    static const VkDynamicState kDynamicStates[] = {
+-        VK_DYNAMIC_STATE_VIEWPORT,
+-        VK_DYNAMIC_STATE_SCISSOR,
+-        VK_DYNAMIC_STATE_DEPTH_BIAS,
+-        VK_DYNAMIC_STATE_CULL_MODE,
+-        VK_DYNAMIC_STATE_FRONT_FACE,
+-        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+-        VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
+-        VK_DYNAMIC_STATE_POLYGON_MODE_EXT,
+-        VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT,
+-    };
+-    VkPipelineDynamicStateCreateInfo dynamic_state = {
+-        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+-    dynamic_state.dynamicStateCount = uint32_t(rex::countof(kDynamicStates));
+-    dynamic_state.pDynamicStates = kDynamicStates;
+-    VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+-    info.pNext = &view_mask_rendering;
+-    info.stageCount = stage_count;
+-    info.pStages = stages;
+-    info.pViewportState = &viewport_state;
+-    info.pRasterizationState = &rasterization_state;
+-    info.pDynamicState = &dynamic_state;
+-    info.layout = pre_rasterization_layout;
+-    pre_rasterization_library = GetOrCreatePipelineLibrary(
+-        &key, sizeof(key), info, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
+-        only_if_cached);
++    uint32_t geometry_shader_key_value = 0;
++    GeometryShaderKey geometry_shader_key;
++    if (GetGeometryShaderKey(
++            description.geometry_shader,
++            SpirvShaderTranslator::Modification(description.vertex_shader_modification),
++            SpirvShaderTranslator::Modification(description.pixel_shader_modification),
++            geometry_shader_key)) {
++      geometry_shader_key_value = geometry_shader_key.key;
++    }
++    pre_rasterization_library = GetOrCreatePreRasterizationLibrary(
++        creation_arguments.vertex_shader, description.vertex_shader_modification,
++        0, geometry_shader_key_value,
++        creation_arguments.geometry_shader, pre_rasterization_layout, only_if_cached);
+     if (pre_rasterization_library == VK_NULL_HANDLE) {
+       return false;
+     }
+@@ -4713,8 +4783,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     assert_true(shader_stage_vertex.module != VK_NULL_HANDLE);
+     shader_stage_vertex.pName = "main";
+     shader_stage_vertex.pSpecializationInfo = vertex_sign_specialization.Build(
+-        description.vertex_texture_sign_classes,
+-        GetPixelShaderUsedTextureMask(creation_arguments.vertex_shader),
++        0, GetPixelShaderUsedTextureMask(creation_arguments.vertex_shader),
+         SpirvShaderTranslator::kVertexTextureSignClassSlots);
+   }
+   // Geometry shader.
+@@ -5311,6 +5380,9 @@ void VulkanPipelineCache::PrecompileThread() {
+   for (const PrecompileShader& entry : precompile_pixel_shaders_) {
+     shader_count += pixel_shader_meta_.count(entry.hash);
+   }
++  // Stored vertex shaders (vulkan_precompile_vertex_libraries) in the high half: new ones are rare
++  // after the offline scan, and a rerun with everything built only checks the library keys.
++  shader_count |= uint64_t(precompile_vertex_shaders_.size()) << 32;
+   std::memcpy(marker + 16, &shader_count, 8);
+   // 2: 1x only (the game draws its pixel shaders at 1x). 3+: the translation switches are part of
+   // the marker - a change rebuilds the libraries here, in the background, instead of compiling
+@@ -5332,8 +5404,8 @@ void VulkanPipelineCache::PrecompileThread() {
+     fclose(file);
+     if (done) {
+       REXGPU_INFO("VulkanPipelineCache: pipeline libraries for {} pixel shaders already "
+-                  "precompiled for this driver",
+-                  shader_count);
++                  "precompiled for this driver ({} vertex shaders)",
++                  uint32_t(shader_count), uint32_t(shader_count >> 32));
+       precompile_pixel_shaders_.clear();
+       return;
+     }
+@@ -5343,8 +5415,15 @@ void VulkanPipelineCache::PrecompileThread() {
+       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+   std::atomic<size_t> next_index(0);
+   std::atomic<uint32_t> compiled(0), skipped(0), failed(0), already(0);
++  std::atomic<uint32_t> vertex_compiled(0), vertex_skipped(0), vertex_failed(0),
++      vertex_already(0);
+   std::atomic<bool> moved_logged(false), stopped_in_game(false);
+   const size_t precompile_total = precompile_pixel_shaders_.size();
++  // Work order: the pixel shaders used in play, the vertex variants used in play, the other pixel
++  // shaders, the other vertex shaders (canonical variants).
++  const size_t vertex_total = precompile_vertex_variants_.size();
++  const size_t vertex_used_total = std::min(precompile_vertex_used_count_, vertex_total);
++  const size_t work_total = precompile_total + vertex_total;
+   // The shaders used in play (sorted first): progress and "ready" for the app cover only them,
+   // the rest continues in the background (or after an interruption, at later launches).
+   const size_t priority_total =
+@@ -5431,15 +5510,94 @@ void VulkanPipelineCache::PrecompileThread() {
+       }
+ #endif
+       size_t index = next_index.fetch_add(1);
+-      if (index >= precompile_total) {
++      if (index >= work_total) {
+         break;
+       }
+       // Counts this entry towards the used-in-play set when the iteration ends (any path).
+       PriorityGuard priority_guard{index < priority_total ? &priority_item_done : nullptr};
+       if (index && index % 1000 == 0) {
+-        REXGPU_INFO("VulkanPipelineCache: precompiling pixel shader libraries, {} of {} ({} new)",
+-                    index, precompile_pixel_shaders_.size(), compiled.load());
++        REXGPU_INFO("VulkanPipelineCache: precompiling shader libraries, {} of {} ({} pixel, {} "
++                    "vertex new)",
++                    index, work_total, compiled.load(), vertex_compiled.load());
+       }
++      // Map the work index (see the work order above).
++      bool vertex_item = false;
++      size_t item = index;
++      if (item >= priority_total) {
++        item -= priority_total;
++        if (item < vertex_used_total) {
++          vertex_item = true;
++        } else {
++          item -= vertex_used_total;
++          if (item < precompile_total - priority_total) {
++            item += priority_total;
++          } else {
++            item = item - (precompile_total - priority_total) + vertex_used_total;
++            vertex_item = true;
++          }
++        }
++      }
++      if (vertex_item) {
++        const PrecompileVertexVariant& variant = precompile_vertex_variants_[item];
++        const PrecompileShader& vertex_entry = precompile_vertex_shaders_[variant.shader_index];
++        uint64_t modification = variant.modification;
++        if (variant.from_storage &&
++            IsLibraryAvailable(
++                PreRasterizationLibraryKeyHash(vertex_entry.hash, modification, 0, 0))) {
++          ++vertex_already;
++          continue;
++        }
++        VulkanShader vertex_shader(vulkan_device, xenos::ShaderType::kVertex, vertex_entry.hash,
++                                   vertex_entry.ucode.data(),
++                                   uint32_t(vertex_entry.ucode.size()));
++        vertex_shader.AnalyzeUcode(ucode_disasm_buffer);
++        if (!variant.from_storage) {
++          if (vertex_shader.uses_register_dynamic_addressing()) {
++            // The register count comes from SQ_PROGRAM_CNTL at draw time.
++            ++vertex_skipped;
++            continue;
++          }
++          // The canonical modification the draws request (GetCurrentVertexShaderModification
++          // with the canonical interpolator mask): plain vertex shader, every written interpolator,
++          // no user clip planes, no point parameters, vertex kill "or" (the register default).
++          SpirvShaderTranslator::Modification canonical(translator.GetDefaultVertexShaderModification(
++              0, Shader::HostVertexShaderType::kVertex));
++          canonical.vertex.interpolator_mask = vertex_shader.writes_interpolators();
++          canonical.vertex.vertex_kill_and =
++              uint32_t(vulkan_device->properties().shaderCullDistance &&
++                       (vertex_shader.writes_point_size_edge_flag_kill_vertex() & 0b100));
++          modification = canonical.value;
++          if (IsLibraryAvailable(
++                  PreRasterizationLibraryKeyHash(vertex_entry.hash, modification, 0, 0))) {
++            ++vertex_already;
++            continue;
++          }
++        }
++        auto* vertex_translation = static_cast<VulkanShader::VulkanTranslation*>(
++            vertex_shader.GetOrCreateTranslation(modification));
++        if (!vertex_translation->is_translated() &&
++            !TranslateAnalyzedShader(translator, *vertex_translation)) {
++          ++vertex_failed;
++          continue;
++        }
++        VkPipelineLayout vertex_layout = command_processor_.GetLibraryLayoutForTextures(
++            true, vertex_shader.GetTextureBindingsAfterTranslation().size(),
++            vertex_shader.GetSamplerBindingsAfterTranslation().size());
++        if (vertex_layout == VK_NULL_HANDLE ||
++            vertex_translation->shader_module() == VK_NULL_HANDLE) {
++          ++vertex_failed;
++          continue;
++        }
++        if (GetOrCreatePreRasterizationLibrary(vertex_translation, modification, 0, 0,
++                                               VK_NULL_HANDLE, vertex_layout,
++                                               false) != VK_NULL_HANDLE) {
++          ++vertex_compiled;
++        } else {
++          ++vertex_failed;
++        }
++        continue;
++      }
++      index = item;
+       const PrecompileShader& entry = precompile_pixel_shaders_[index];
+       auto meta_it = pixel_shader_meta_.find(entry.hash);
+       if (meta_it == pixel_shader_meta_.end()) {
+@@ -5554,6 +5712,12 @@ void VulkanPipelineCache::PrecompileThread() {
+                          .count()) /
+                   1000.0,
+               thread_count);
++  if (vertex_total) {
++    REXGPU_INFO("VulkanPipelineCache: vertex library precompile: {} compiled, {} already done, {} "
++                "skipped (dynamic registers), {} failed of {} variants ({} used in play)",
++                vertex_compiled.load(), vertex_already.load(), vertex_skipped.load(),
++                vertex_failed.load(), vertex_total, vertex_used_total);
++  }
+   if (finished) {
+     if (FILE* file = rex::filesystem::OpenFile(precompile_marker_path_, "wb")) {
+       fwrite(marker, sizeof(marker), 1, file);

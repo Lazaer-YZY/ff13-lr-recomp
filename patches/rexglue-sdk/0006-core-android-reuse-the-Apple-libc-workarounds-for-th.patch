@@ -1,0 +1,76 @@
+From 605017b084db1c98af09f88fde5d04c3b69d4049 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:22:43 +0800
+Subject: [PATCH 006/108] core(android): reuse the Apple libc++ workarounds for
+ the NDK libc++
+
+NDK r28 libc++ (LLVM 19) lacks floating-point std::from_chars and
+std::chrono::clock_time_conversion/clock_cast, like Apple's libc++, so
+portable_float_from_chars and the clock_cast shim now apply to Android too.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index d876846..34e8e68 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -116,8 +116,8 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
+-// Apple libc++ does not expose clock_time_conversion or clock_cast.
++#if defined(__APPLE__) || defined(__ANDROID__)
++// Apple and Android NDK libc++ do not expose clock_time_conversion or clock_cast.
+ template <class, class>
+ struct clock_time_conversion {};
+ 
+diff --git a/include/rex/string/numeric.h b/include/rex/string/numeric.h
+index 85994c7..9f6bc10 100644
+--- a/include/rex/string/numeric.h
++++ b/include/rex/string/numeric.h
+@@ -26,7 +26,7 @@
+ #include <rex/string/utf8.h>
+ #include <rex/vec128.h>
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+ #include <locale.h>
+ #endif
+ 
+@@ -114,14 +114,14 @@ inline T ifs(const std::string_view value, bool force_hex) {
+   return result;
+ }
+ 
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+ template <typename T>
+ inline std::from_chars_result portable_float_from_chars(const char* first, const char* last,
+                                                         T& value) {
+   static_assert(std::is_same_v<T, float> || std::is_same_v<T, double>);
+ 
+-  // AppleClang's libc++ does not provide floating-point std::from_chars on all
+-  // supported SDK versions. Match from_chars semantics with a C-locale parser:
++  // AppleClang's libc++ (and the Android NDK's libc++) does not provide
++  // floating-point std::from_chars on all supported SDK versions. Match from_chars semantics with a C-locale parser:
+   // no leading whitespace or '+', no global locale dependency, and distinct
+   // invalid-input and range errors.
+   if (first == last || *first == '+' || *first == ' ' || *first == '\f' || *first == '\n' ||
+@@ -189,7 +189,7 @@ inline T fpfs(const std::string_view value, bool force_hex) {
+     }
+     std::memcpy(&result, &pun, sizeof(PUN));
+   } else {
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+     auto [p, error] = portable_float_from_chars(range.data(), range.data() + range.size(), result);
+ #else
+     auto [p, error] = std::from_chars(range.data(), range.data() + range.size(), result,
+@@ -316,7 +316,7 @@ inline vec128_t from_string<vec128_t>(const std::string_view value, bool force_h
+         assert_always();
+         return vec128_t();
+       }
+-#if REX_PLATFORM_MAC
++#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
+       auto result = detail::portable_float_from_chars(p, end, v.f32[i]);
+ #else
+       auto result = std::from_chars(p, end, v.f32[i], std::chars_format::general);

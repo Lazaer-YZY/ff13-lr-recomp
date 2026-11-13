@@ -1,0 +1,3 @@
+# Functions found by our Windows harness boot loop (unregistered-function fatals) that are not in the
+# lr-ffxiii-port analysis set. Bare entries: discovery sizes them.
+[functions]

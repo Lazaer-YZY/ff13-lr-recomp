@@ -1,0 +1,100 @@
+From a5a66ce710986cf77571daeca08f97f76714744b Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 21:45:53 +0800
+Subject: [PATCH 039/108] gpu: vblank thread sleeps to the next vertical blank;
+ optional timing stats
+
+The vertical blank thread woke every millisecond to check the time (~1000
+wakeups a second). It now sleeps until the next vertical blank
+(vsync_sleep_to_deadline, default on; off restores the poll).
+vsync_log_stats logs late/bunched vertical blanks, the longest gap and the
+slowest guest interrupt handler every 10 s. On the Thor both loops deliver
+600 vertical blanks per 10 s with none late or bunched (longest gap < 20 ms).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 8f2fcb0..d0b1d37 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -17,6 +17,7 @@
+ #include <functional>
+ #include <memory>
+ #include <mutex>
++#include <thread>
+ #include <utility>
+ 
+ #include <rex/cvar.h>
+@@ -39,6 +40,13 @@ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
+                     "Store shaders persistently and load them when loading games to avoid "
+                     "runtime spikes and freezes when playing the game not for the first time.");
+ 
++REXCVAR_DEFINE_BOOL(vsync_sleep_to_deadline, true, "GPU",
++                    "The vertical blank thread sleeps until the next vertical blank instead of "
++                    "waking every millisecond to check (fewer wakeups, steadier vertical blanks)");
++REXCVAR_DEFINE_BOOL(vsync_log_stats, false, "GPU",
++                    "Log vertical blank timing every 10 s (late and bunched vertical blanks, "
++                    "slowest guest interrupt handler)");
++
+ namespace {
+ 
+ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+@@ -158,15 +166,57 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        // vsync_log_stats: vertical blanks more than 1.25 intervals after the previous one
++        // (late) or less than 0.25 after it (bunched: the catch-up loop below), the longest gap
++        // and the slowest guest interrupt handler, every 10 s.
++        uint64_t stats_start = last_frame_time, stats_prev_mark = 0;
++        uint64_t stats_max_gap = 0, stats_max_handler = 0;
++        uint32_t stats_count = 0, stats_late = 0, stats_bunched = 0;
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           uint64_t interval_ticks =
+               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
++          const bool log_stats = REXCVAR_GET(vsync_log_stats);
+           while (current_time - last_frame_time >= interval_ticks) {
++            uint64_t mark_start = log_stats ? chrono::Clock::QueryGuestTickCount() : 0;
+             MarkVblank();
+             last_frame_time += interval_ticks;
++            if (log_stats) {
++              uint64_t mark_end = chrono::Clock::QueryGuestTickCount();
++              stats_max_handler = std::max(stats_max_handler, mark_end - mark_start);
++              if (stats_prev_mark) {
++                uint64_t gap = mark_start - stats_prev_mark;
++                stats_max_gap = std::max(stats_max_gap, gap);
++                stats_late += gap > interval_ticks + interval_ticks / 4;
++                stats_bunched += gap < interval_ticks / 4;
++              }
++              stats_prev_mark = mark_start;
++              ++stats_count;
++            }
++          }
++          if (log_stats && current_time - stats_start >= guest_tick_frequency * 10) {
++            const double ms_per_tick = 1000.0 / double(guest_tick_frequency);
++            REXLOG_INFO(
++                "GPU vblank (10 s): {} vertical blanks, {} late (>1.25 intervals), {} bunched "
++                "(<0.25), longest gap {:.1f} ms, slowest interrupt handler {:.1f} ms",
++                stats_count, stats_late, stats_bunched, double(stats_max_gap) * ms_per_tick,
++                double(stats_max_handler) * ms_per_tick);
++            stats_start = current_time;
++            stats_max_gap = stats_max_handler = 0;
++            stats_count = stats_late = stats_bunched = 0;
++          }
++          if (REXCVAR_GET(vsync_sleep_to_deadline) && REXCVAR_GET(vsync)) {
++            // One wakeup per vertical blank instead of a 1 ms poll (60 instead of ~1000
++            // wakeups a second, and no up-to-1-ms lateness from the poll granularity).
++            uint64_t now = chrono::Clock::QueryGuestTickCount();
++            uint64_t next = last_frame_time + interval_ticks;
++            if (next > now) {
++              std::this_thread::sleep_for(std::chrono::microseconds(
++                  (next - now) * 1000000 / std::max<uint64_t>(guest_tick_frequency, 1)));
++            }
++          } else {
++            rex::thread::Sleep(std::chrono::milliseconds(1));
+           }
+-          rex::thread::Sleep(std::chrono::milliseconds(1));
+         }
+         return 0;
+       }));

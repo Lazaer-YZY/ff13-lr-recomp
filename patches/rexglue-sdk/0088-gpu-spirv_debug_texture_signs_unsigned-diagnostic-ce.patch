@@ -1,0 +1,39 @@
+From 55ad2724680b9dc206049d4c948c7d52d3266140 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 18:28:27 +0800
+Subject: [PATCH 088/108] gpu: spirv_debug_texture_signs_unsigned (diagnostic
+ ceiling for texture sign specialization)
+
+Every texture fetch translated as unsigned (no sign or gamma handling; wrong colours).
+Thor, 60 fps mode, Ark screen view: 12.08 -> 9.97 Mcycles per frame (-17.5%),
+18.6 -> 16.9 ms per frame - the upper bound for sign specialization constants.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 4cf7e4d..5872a45 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -23,6 +23,9 @@
+ #include <rex/math.h>
+ #include <rex/cvar.h>
+ 
++REXCVAR_DEFINE_BOOL(spirv_debug_texture_signs_unsigned, false, "GPU/Vulkan",
++                    "Diagnostic: translate every texture fetch as unsigned (no sign or gamma "
++                    "handling; wrong colours) to measure what sign specialization could save.");
+ REXCVAR_DEFINE_BOOL(spirv_texture_sign_branch, true, "GPU/Vulkan",
+                     "Texture fetch results: signed and biased components by selects, and the "
+                     "piecewise-linear gamma conversion only inside one uniform branch taken when "
+@@ -1321,6 +1324,12 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+           builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+                                       id_vector_temp_),
+           spv::NoPrecision);
++      if (REXCVAR_GET(spirv_debug_texture_signs_unsigned)) {
++        // Diagnostic upper bound for texture sign specialization: every texture taken as
++        // unsigned, so the host compiler drops all sign and gamma handling (wrong colours for
++        // signed and gamma textures).
++        swizzled_signs_word = const_uint_0_;
++      }
+       uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
+ 
+       spv::Builder::TextureParameters texture_parameters = {};

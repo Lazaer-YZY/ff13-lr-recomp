@@ -1,0 +1,284 @@
+From d1fd5fa848edbfaff527469d7de78a396aab353b Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 15:46:02 +0800
+Subject: [PATCH 016/108] codegen: --dump-image and --dump-functions developer
+ options
+
+--dump-image <path>: after the entrypoint XEX is loaded, write the guest image
+as mapped (image_base .. image_base+image_size, big-endian, untouched) to
+<path>, plus <path>.json with image_base, image_size, entry_point,
+code_start/code_end (executable-section range, = REX_CODE_BASE/SIZE) and
+sections (name, address, size, flags "x" when executable).
+
+--dump-functions <path>: after the entrypoint analysis (before returning any
+validation error) write '0xADDR 0xSIZE name AUTHORITY' per function, sorted
+by address; names follow CodegenWriter (rexcrt_*, xstart, sub_XXXXXXXX).
+With this flag the entrypoint is analysed even when its stamp is current.
+
+Both are no-ops when absent and do not change generated output.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/codegen/project_recompiler.h b/include/rex/codegen/project_recompiler.h
+index 5418312..2e44185 100644
+--- a/include/rex/codegen/project_recompiler.h
++++ b/include/rex/codegen/project_recompiler.h
+@@ -32,6 +32,14 @@ struct ProjectRecompilerOptions {
+   /// Folded into the input fingerprint. Must be stable across commits
+   /// ("0.10.0-dev") or every SDK rebuild forces a full re-analysis.
+   std::string sdkVersion;
++
++  /// Developer dumps (empty = off; never affect generated output).
++  /// dumpImagePath: raw entrypoint guest image (big-endian, as mapped) plus
++  /// <path>.json metadata, written right after the XEX is loaded.
++  std::string dumpImagePath;
++  /// dumpFunctionsPath: "0xADDR 0xSIZE name AUTHORITY" per entrypoint function,
++  /// sorted by address, written after analysis even if validation fails.
++  std::string dumpFunctionsPath;
+ };
+ 
+ class ProjectRecompiler {
+diff --git a/src/codegen/project_recompiler.cpp b/src/codegen/project_recompiler.cpp
+index 240bcb0..45d6e6e 100644
+--- a/src/codegen/project_recompiler.cpp
++++ b/src/codegen/project_recompiler.cpp
+@@ -12,6 +12,7 @@
+ #include <rex/codegen/project_recompiler.h>
+ 
+ #include <algorithm>
++#include <cctype>
+ #include <filesystem>
+ #include <span>
+ #include <unordered_map>
+@@ -119,6 +120,104 @@ void ReportBinaryInfo(ProgressReporter* reporter, std::string_view display_name,
+   reporter->binaryInfo(info);
+ }
+ 
++// Same range the writer emits as REX_CODE_BASE/REX_CODE_SIZE (and the runtime
++// logs as "Function table initialized for module: code=...").
++std::pair<uint32_t, uint32_t> ExecutableRange(const BinaryView& binary) {
++  uint32_t code_min = ~uint32_t(0);
++  uint32_t code_max = 0;
++  for (const auto& section : binary.sections()) {
++    if (section.executable) {
++      code_min = std::min(code_min, section.baseAddress);
++      code_max = std::max(code_max, section.baseAddress + section.size);
++    }
++  }
++  return {code_min, code_max};
++}
++
++bool DumpGuestImage(const std::filesystem::path& path, const rex::runtime::XexModule& xex,
++                    const BinaryView& binary) {
++  const uint32_t base = xex.base_address();
++  const uint32_t size = xex.image_size();
++  const uint8_t* bytes = xex.memory()->TranslateVirtual<const uint8_t*>(base);
++  if (!bytes || !size) {
++    REXLOG_ERROR("--dump-image: entrypoint image is not mapped");
++    return false;
++  }
++  if (!WriteFileBytes(path, std::string_view(reinterpret_cast<const char*>(bytes), size))) {
++    REXLOG_ERROR("--dump-image: failed to write {}", path.string());
++    return false;
++  }
++
++  auto hex = [](uint32_t v) { return fmt::format("0x{:08X}", v); };
++  auto [code_start, code_end] = ExecutableRange(binary);
++  nlohmann::ordered_json sections = nlohmann::ordered_json::array();
++  for (const auto& section : binary.sections()) {
++    sections.push_back({
++        {"name", std::string(section.name)},
++        {"address", hex(section.baseAddress)},
++        {"size", hex(section.size)},
++        {"flags", section.executable ? "x" : ""},
++    });
++  }
++  nlohmann::ordered_json meta = {
++      {"image_base", hex(base)},
++      {"image_size", hex(size)},
++      {"entry_point", hex(binary.entryPoint())},
++      {"code_start", hex(code_start)},
++      {"code_end", hex(code_end)},
++      {"sections", std::move(sections)},
++  };
++  std::filesystem::path json_path = path;
++  json_path += ".json";
++  if (!WriteFileBytes(json_path, meta.dump(2) + "\n")) {
++    REXLOG_ERROR("--dump-image: failed to write {}", json_path.string());
++    return false;
++  }
++  REXLOG_INFO("Dumped guest image {:08X}+{:X} to {}", base, size, path.string());
++  return true;
++}
++
++bool DumpFunctions(const std::filesystem::path& path, const CodegenContext& ctx) {
++  std::vector<const FunctionNode*> functions;
++  functions.reserve(ctx.graph.functionCount());
++  for (const auto& [addr, node] : ctx.graph.functions()) {
++    functions.push_back(node.get());
++  }
++  std::sort(functions.begin(), functions.end(),
++            [](const auto* a, const auto* b) { return a->base() < b->base(); });
++
++  std::unordered_map<uint32_t, std::string> rexcrt_by_addr;
++  for (const auto& [name, addr] : ctx.Config().rexcrtFunctions) {
++    rexcrt_by_addr[addr] = fmt::format("rexcrt_{}", name);
++  }
++
++  std::string out;
++  out.reserve(functions.size() * 48);
++  for (const auto* fn : functions) {
++    // Naming mirrors CodegenWriter (buildTemplateData).
++    std::string name;
++    if (auto it = rexcrt_by_addr.find(fn->base()); it != rexcrt_by_addr.end()) {
++      name = it->second;
++    } else if (fn->base() == ctx.analysisState().entryPoint) {
++      name = "xstart";
++    } else if (!fn->name().empty()) {
++      name = fn->name();
++    } else {
++      name = fmt::format("sub_{:08X}", fn->base());
++    }
++    std::string authority = AuthorityName(fn->authority());
++    std::transform(authority.begin(), authority.end(), authority.begin(),
++                   [](unsigned char c) { return char(std::toupper(c)); });
++    out += fmt::format("0x{:08X} 0x{:X} {} {}\n", fn->base(), fn->size(), name, authority);
++  }
++  if (!WriteFileBytes(path, out)) {
++    REXLOG_ERROR("--dump-functions: failed to write {}", path.string());
++    return false;
++  }
++  REXLOG_INFO("Dumped {} function(s) to {}", functions.size(), path.string());
++  return true;
++}
++
+ }  // namespace
+ 
+ ProjectRecompiler::ProjectRecompiler(ManifestConfig manifest) : manifest_(std::move(manifest)) {}
+@@ -326,6 +425,10 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
+       ctx.setDllModule(*ctx.Config().isDll);
+ 
+     contexts.push_back({std::move(ctx), &targeted[0], std::move(entry_display)});
++
++    if (!opts.dumpImagePath.empty()) {
++      DumpGuestImage(opts.dumpImagePath, *execMod->xex_module(), contexts.back().ctx.binary());
++    }
+   }
+ 
+   for (size_t i = 0; i < dllModules.size(); ++i) {
+@@ -365,6 +468,9 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
+ 
+     if (opts.ignoreStamp || opts.force)
+       continue;
++    // The function dump needs the entrypoint analysed even when up to date.
++    if (i == 0 && !opts.dumpFunctionsPath.empty())
++      continue;
+ 
+     auto stamp = OutputStamp::Load(outDir / kStampFileName);
+     if (stamp && OutputsAreUpToDate(*stamp, fingerprints[i], outDir)) {
+@@ -385,6 +491,9 @@ Result<void> ProjectRecompiler::Run(const ProjectRecompilerOptions& opts) {
+     module_started_at[i] = std::chrono::steady_clock::now();
+     REXCODEGEN_TRACE("Analyzing '{}'...", entry.module->targetName);
+     auto result = Analyze(entry.ctx, opts.reporter);
++    if (i == 0 && !opts.dumpFunctionsPath.empty()) {
++      DumpFunctions(opts.dumpFunctionsPath, entry.ctx);
++    }
+     if (!result) {
+       if (opts.force && result.error().category == ErrorCategory::Validation) {
+         REXLOG_WARN("Analysis errors for '{}' (continuing due to --force): {}",
+diff --git a/src/rexglue/commands/codegen_command.cpp b/src/rexglue/commands/codegen_command.cpp
+index df7a2e8..7a454cd 100644
+--- a/src/rexglue/commands/codegen_command.cpp
++++ b/src/rexglue/commands/codegen_command.cpp
+@@ -65,7 +65,8 @@ void ReportStaleIncludes(const fs::path& manifest_path,
+ }
+ 
+ Result<void> RecompileProject(const fs::path& manifest_path, const CliContext& ctx,
+-                              const std::vector<std::string>& targets, bool ignore_stamp) {
++                              const std::vector<std::string>& targets, bool ignore_stamp,
++                              const CodegenDumpOptions& dumps) {
+   auto manifest = rex::codegen::ManifestConfig::Load(manifest_path);
+   if (!manifest) {
+     return Err<void>(rex::ErrorCategory::Config, "Failed to load manifest");
+@@ -79,6 +80,8 @@ Result<void> RecompileProject(const fs::path& manifest_path, const CliContext& c
+       .reporter = &progress,
+       .ignoreStamp = ignore_stamp,
+       .sdkVersion = REXGLUE_VERSION_FLOOR "-" REXGLUE_VERSION_CHANNEL,
++      .dumpImagePath = dumps.image_path,
++      .dumpFunctionsPath = dumps.functions_path,
+   };
+   auto result = recompiler.Run(opts);
+   if (!result)
+@@ -134,6 +137,7 @@ struct CodegenArgs {
+   std::string config_path;
+   std::vector<std::string> targets;
+   bool ignore_stamp = false;
++  CodegenDumpOptions dumps;
+ };
+ 
+ }  // namespace
+@@ -182,7 +186,8 @@ Result<std::string> DiscoverManifestInCwd() {
+ }
+ 
+ Result<void> CodegenFromConfig(const std::string& config_path, const CliContext& ctx,
+-                               const std::vector<std::string>& targets, bool ignore_stamp) {
++                               const std::vector<std::string>& targets, bool ignore_stamp,
++                               const CodegenDumpOptions& dumps) {
+   REXLOG_TRACE("Generating code with config: {}", config_path);
+ 
+   fs::path manifest_path = config_path;
+@@ -207,7 +212,8 @@ Result<void> CodegenFromConfig(const std::string& config_path, const CliContext&
+     REXLOG_INFO("Regenerated generated/rexglue.cmake for SDK v{}", current_version);
+   }
+ 
+-  if (auto run_result = RecompileProject(manifest_path, ctx, targets, ignore_stamp); !run_result) {
++  if (auto run_result = RecompileProject(manifest_path, ctx, targets, ignore_stamp, dumps);
++      !run_result) {
+     return run_result;
+   }
+ 
+@@ -229,6 +235,14 @@ void RegisterCodegen(CLI::App& parent, const CliContext& ctx, DeferredAction& pe
+       ->take_all();
+   sub->add_flag("--ignore-stamp", args->ignore_stamp,
+                 "Regenerate even when inputs match the recorded stamp");
++  sub->add_option("--dump-image", args->dumps.image_path,
++                  "Developer: write the loaded entrypoint guest image (big-endian, as mapped) "
++                  "to PATH and its metadata to PATH.json")
++      ->type_name("PATH");
++  sub->add_option("--dump-functions", args->dumps.functions_path,
++                  "Developer: after analysis (even on validation errors) write "
++                  "'0xADDR 0xSIZE name AUTHORITY' per entrypoint function to PATH")
++      ->type_name("PATH");
+ 
+   sub->callback([args, &ctx, &pending]() {
+     pending = [args, &ctx]() -> Result<void> {
+@@ -239,7 +253,7 @@ void RegisterCodegen(CLI::App& parent, const CliContext& ctx, DeferredAction& pe
+           return Err<void>(discovered.error());
+         path = *discovered;
+       }
+-      return CodegenFromConfig(path, ctx, args->targets, args->ignore_stamp);
++      return CodegenFromConfig(path, ctx, args->targets, args->ignore_stamp, args->dumps);
+     };
+   });
+ }
+diff --git a/src/rexglue/commands/codegen_command.h b/src/rexglue/commands/codegen_command.h
+index dda4e82..0381545 100644
+--- a/src/rexglue/commands/codegen_command.h
++++ b/src/rexglue/commands/codegen_command.h
+@@ -23,8 +23,15 @@ namespace rexglue::cli {
+ 
+ using rex::Result;
+ 
++/// Developer dumps for offline analysis (empty path = off).
++struct CodegenDumpOptions {
++  std::string image_path;      ///< --dump-image
++  std::string functions_path;  ///< --dump-functions
++};
++
+ Result<void> CodegenFromConfig(const std::string& config_path, const CliContext& ctx,
+-                               const std::vector<std::string>& targets, bool ignore_stamp = false);
++                               const std::vector<std::string>& targets, bool ignore_stamp = false,
++                               const CodegenDumpOptions& dumps = {});
+ 
+ Result<std::string> DiscoverManifestInCwd();
+ 

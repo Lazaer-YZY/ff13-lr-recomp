@@ -1,0 +1,71 @@
+From 4ec6d031e98784afc740e72c9b59d3f4029f6e95 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 11:03:57 +0800
+Subject: [PATCH 059/108] gpu: vulkan: diagnostic switches to skip ownership
+ transfers and texture reloads
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 95391b9..e2a3463 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -37,6 +37,11 @@
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_debug_skip_transfers, false, "GPU/Vulkan",
++                    "Diagnostics: skip render target ownership transfer draws (wrong image) to "
++                    "measure what they cost")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(vulkan_resolve_feed_textures, false, "GPU/Vulkan",
+                     "Experimental: copy 1x k_8_8_8_8 resolves straight from the render target "
+                     "into the cached texture that samples the resolved memory (same format, "
+@@ -5002,7 +5007,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+     VkImageView transfer_dest_view = dest_rt_key.is_depth ? dest_vulkan_rt.view_depth_stencil()
+                                                           : dest_vulkan_rt.view_color_transfer();
+ 
+-    if (!current_transfers.empty()) {
++    static const bool debug_skip_transfers = REXCVAR_GET(gpu_debug_skip_transfers);
++    if (!current_transfers.empty() && !debug_skip_transfers) {
+       command_processor_.gpu_timing_counters().transfers += current_transfers.size();
+       auto transfer_descriptor = [](RenderTargetKey k) {
+         return uint32_t(k.is_depth) << 15 | uint32_t(k.msaa_samples) << 13 |
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 7bd0bd5..003fe97 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <unordered_set>
+ #include <array>
+ #include <cstddef>
+ #include <cstring>
+@@ -1213,10 +1214,24 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
+   return EnsureScaledResolveBufferAllocated(start_scaled, length_scaled);
+ }
+ 
++REXCVAR_DEFINE_BOOL(gpu_debug_skip_texture_reloads, false, "GPU/Vulkan",
++                    "Diagnostics: load each texture only once (textures updated by resolves go "
++                    "stale) to measure what texture reloads cost")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
+                                                                bool load_mips) {
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
++  // Diagnostics (gpu_debug_skip_texture_reloads): load each texture only once, so
++  // textures refreshed every frame from resolves keep their first contents.
++  static const bool debug_skip_reloads = REXCVAR_GET(gpu_debug_skip_texture_reloads);
++  if (debug_skip_reloads) {
++    static std::unordered_set<const Texture*> loaded_once;
++    if (!loaded_once.insert(&texture).second) {
++      return true;
++    }
++  }
+ 
+   // Get the pipeline.
+   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);

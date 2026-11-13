@@ -1,0 +1,262 @@
+From b8d91bec753eaf2616ee44d7c23720830e45a344 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 17:32:03 +0800
+Subject: [PATCH 087/108] gpu: vulkan_depth_4x_as_1x (off); library precompile
+ marker covers the translation switches
+
+vulkan_depth_4x_as_1x draws a 4x depth-only draw into a depth surface never drawn
+with color into the 1x surface its samples form (surface info rewritten for the
+draw, viewport/scissor/extent/point size/polygon offset scale doubled). Idea from
+Xendroid+. In Lightning Returns' Ark view the shadow maps' 4x <-> 1x transfers
+disappear, but other depth transfers into the same surfaces take their place:
+12.08 -> 12.22 Mcycles per frame, so it stays off.
+
+The pipeline library precompile marker now includes spirv_texture_sign_branch,
+vulkan_shader_xenos_multiply(_vertex) and vulkan_texture_fetch_implicit_lod (version
+3): changing translation rebuilds the libraries in the first-boot background pass
+instead of compiling them during play.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 77bac3b..7e6027f 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -171,6 +171,10 @@ class RenderTargetCache {
+ 
+   virtual void BeginFrame();
+ 
++  // vulkan_depth_4x_as_1x: the current draw renders a 4x surface's samples as the pixels of the 1x
++  // surface twice as wide and tall (the surface info is already rewritten), so its estimated
++  // extent in guest pixels doubles.
++  void SetDrawSamplesAsPixels(bool samples_as_pixels) { draw_samples_as_pixels_ = samples_as_pixels; }
+   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+                       uint32_t normalized_color_mask, const Shader& vertex_shader);
+   // The pixel shader of the draw for the next Update (whether it may discard).
+@@ -565,6 +569,7 @@ class RenderTargetCache {
+   const RegisterFile& register_file_;
+   uint32_t draw_resolution_scale_x_;
+   uint32_t draw_resolution_scale_y_;
++  bool draw_samples_as_pixels_ = false;
+ 
+   DrawExtentEstimator draw_extent_estimator_;
+   const Shader* update_pixel_shader_ = nullptr;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 2423736..362f9dd 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <unordered_set>
+ #include <array>
+ #include <climits>
+ #include <cstdint>
+@@ -368,6 +369,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+   void OnGammaRampPWLValueWritten() override;
+   void OnPrimaryBufferEnd() override;
+   void PrepareForWait() override;
++  // vulkan_depth_4x_as_1x: rewrites RB_SURFACE_INFO for the current draw (IssueDraw restores it).
++  void RewriteDepth4xAs1x(const VulkanShader* pixel_shader);
++  uint32_t draw_samples_as_pixels_shift_ = 0;
++  std::unordered_set<uint32_t> depth_4x_scene_surfaces_;
++  uint64_t depth_4x_as_1x_draws_ = 0;
+ 
+  public:
+   void NoteFenceWait(void* caller, uint64_t us);
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 64d2665..b9fde10 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -590,13 +590,17 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+ 
+   // Estimate height used by render targets (for color for writes, for depth /
+   // stencil for both reads and writes) from various sources.
+-  uint32_t height_used =
+-      std::min(GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples),
+-               draw_extent_estimator_.EstimateMaxY(
+-                   interlock_barrier_only
+-                       ? REXCVAR_GET(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend)
+-                       : true,
+-                   vertex_shader));
++  uint32_t height_used = draw_extent_estimator_.EstimateMaxY(
++      interlock_barrier_only
++          ? REXCVAR_GET(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend)
++          : true,
++      vertex_shader);
++  if (draw_samples_as_pixels_) {
++    // In the guest's 4x pixels; the surface info is the 1x one - one more row covers the lower
++    // samples of the last.
++    height_used = (height_used + 1) << 1;
++  }
++  height_used = std::min(GetRenderTargetHeight(pitch_tiles_at_32bpp, msaa_samples), height_used);
+ 
+   // Sorted by EDRAM base and then by index in the pipeline - for simplicity,
+   // treat render targets placed closer to the end of the EDRAM as truncating
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 1a06856..3216aa6 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -90,6 +90,15 @@ REXCVAR_DEFINE_BOOL(vulkan_fence_poll, false, "GPU/Vulkan",
+                     "so polling made the command thread wait for the GPU before every new "
+                     "submission: the Thor's Ark screen view went from 42 to 33.3 ms per frame "
+                     "with it off.");
++REXCVAR_DEFINE_BOOL(vulkan_depth_4x_as_1x, false, "GPU/Vulkan",
++                    "Host render targets: draw a 4x MSAA depth-only draw (no pixel shader) into a "
++                    "depth surface never drawn with color into the 1x surface twice as wide and "
++                    "tall that the same EDRAM tiles hold (2x2 samples laid out like 2x2 pixels), "
++                    "with the viewport and scissor doubled, instead of into a 4x render target "
++                    "whose contents must be transferred to and from the 1x one. Lightning Returns "
++                    "clears its shadow maps this way. Depth is taken at the pixel centres of the "
++                    "doubled grid instead of the 4x sample positions. Not with resolution scaling. "
++                    "Idea from Xendroid+ (vulkan_depth_4x_as_1x).");
+ REXCVAR_DEFINE_UINT32(vulkan_fence_wait_sleep_us, 0, "GPU/Vulkan",
+                       "When the GPU thread must wait for a submission, poll the fences with "
+                       "sleeps of this many microseconds instead of a blocking vkWaitForFences "
+@@ -4612,6 +4621,46 @@ void VulkanCommandProcessor::NoteFenceWait(void* caller, uint64_t us) {
+   }
+ }
+ 
++void VulkanCommandProcessor::RewriteDepth4xAs1x(const VulkanShader* pixel_shader) {
++  if (!REXCVAR_GET(vulkan_depth_4x_as_1x) ||
++      render_target_cache_->GetPath() != RenderTargetCache::Path::kHostRenderTargets) {
++    return;
++  }
++  const RegisterFile& regs = *register_file_;
++  uint32_t& surface_info_value = register_file_->values[XE_GPU_REG_RB_SURFACE_INFO];
++  reg::RB_SURFACE_INFO surface_info;
++  surface_info.value = surface_info_value;
++  if (surface_info.msaa_samples != xenos::MsaaSamples::k4X) {
++    return;
++  }
++  // A depth surface drawn with color at least once belongs to a multisampled scene; depth-only
++  // 4x surfaces are a title's trick (Lightning Returns clears its 1x shadow maps with a 4x
++  // depth-only rectangle at half the resolution).
++  const uint32_t depth_surface =
++      regs.Get<reg::RB_DEPTH_INFO>().depth_base | (uint32_t(surface_info.surface_pitch) << 16);
++  const uint32_t color_mask =
++      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
++                   : 0;
++  if (color_mask) {
++    depth_4x_scene_surfaces_.insert(depth_surface);
++    return;
++  }
++  if (pixel_shader || depth_4x_scene_surfaces_.count(depth_surface) ||
++      texture_cache_->draw_resolution_scale_x() != 1 ||
++      texture_cache_->draw_resolution_scale_y() != 1 ||
++      uint32_t(surface_info.surface_pitch) * 2 > xenos::kTexture2DCubeMaxWidthHeight) {
++    return;
++  }
++  // The same EDRAM tiles hold the 2x2 samples of a 4x pixel like 2x2 pixels of a 1x surface
++  // twice as wide: 1x, double pitch, and the draw's viewport, scissor and extent doubled.
++  surface_info.msaa_samples = xenos::MsaaSamples::k1X;
++  surface_info.surface_pitch = surface_info.surface_pitch * 2;
++  surface_info_value = surface_info.value;
++  draw_samples_as_pixels_shift_ = 1;
++  render_target_cache_->SetDrawSamplesAsPixels(true);
++  ++depth_4x_as_1x_draws_;
++}
++
+ void VulkanCommandProcessor::PrepareForWait() {
+   const uint32_t min_draws = REXCVAR_GET(vulkan_submit_before_wait_min_draws);
+   if (min_draws && submission_open_ && submission_draws_ >= min_draws &&
+@@ -4742,6 +4791,18 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       return true;
+     }
+   }
++  // vulkan_depth_4x_as_1x: a 4x depth-only draw into a depth surface never drawn with color is
++  // drawn into the 1x surface its samples form (for this draw only; restored on every exit).
++  struct SurfaceInfoRestore {
++    VulkanCommandProcessor& cp;
++    uint32_t surface_info;
++    ~SurfaceInfoRestore() {
++      cp.register_file_->values[XE_GPU_REG_RB_SURFACE_INFO] = surface_info;
++      cp.draw_samples_as_pixels_shift_ = 0;
++      cp.render_target_cache_->SetDrawSamplesAsPixels(false);
++    }
++  } surface_info_restore{*this, register_file_->values[XE_GPU_REG_RB_SURFACE_INFO]};
++  RewriteDepth4xAs1x(pixel_shader);
+   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
+   if (memexport_used_pixel) {
+     if (!device_properties.fragmentStoresAndAtomics) {
+@@ -5015,8 +5076,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   bool host_render_targets_used =
+       render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets;
+-  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x();
+-  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y();
++  uint32_t draw_resolution_scale_x = texture_cache_->draw_resolution_scale_x()
++                                    << draw_samples_as_pixels_shift_;
++  uint32_t draw_resolution_scale_y = texture_cache_->draw_resolution_scale_y()
++                                    << draw_samples_as_pixels_shift_;
+ 
+   // Get dynamic rasterizer state.
+   draw_util::ViewportInfo viewport_info;
+@@ -6874,8 +6937,10 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
+   const RegisterFile& regs = *register_file_;
+-  uint32_t draw_resolution_scale_x = texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1;
+-  uint32_t draw_resolution_scale_y = texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1;
++  uint32_t draw_resolution_scale_x =
++      (texture_cache_ ? texture_cache_->draw_resolution_scale_x() : 1) << draw_samples_as_pixels_shift_;
++  uint32_t draw_resolution_scale_y =
++      (texture_cache_ ? texture_cache_->draw_resolution_scale_y() : 1) << draw_samples_as_pixels_shift_;
+ 
+   // Window parameters.
+   // http://ftp.tku.edu.tw/NetBSD/NetBSD-current/xsrc/external/mit/xf86-video-ati/dist/src/r600_reg_auto_r6xx.h
+@@ -7364,10 +7429,10 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+     // to radius conversion to avoid multiplying the per-vertex diameter by an
+     // additional constant in the shader.
+     float point_screen_diameter_to_ndc_radius_x =
+-        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_x)) /
++        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_x << draw_samples_as_pixels_shift_)) /
+         std::max(viewport_info.xy_extent[0], uint32_t(1));
+     float point_screen_diameter_to_ndc_radius_y =
+-        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_y)) /
++        (/* 0.5f * 2.0f * */ float(draw_resolution_scale_y << draw_samples_as_pixels_shift_)) /
+         std::max(viewport_info.xy_extent[1], uint32_t(1));
+     dirty |= system_constants_.point_screen_diameter_to_ndc_radius[0] !=
+              point_screen_diameter_to_ndc_radius_x;
+@@ -7518,7 +7583,8 @@ void VulkanCommandProcessor::UpdateSystemConstantValues(
+     // better than less bias, because less bias means Z fighting with the
+     // background is more likely.
+     float poly_offset_scale_factor = xenos::kPolygonOffsetScaleSubpixelUnit *
+-                                     std::max(draw_resolution_scale_x, draw_resolution_scale_y);
++                                     (std::max(draw_resolution_scale_x, draw_resolution_scale_y)
++                                      << draw_samples_as_pixels_shift_);
+     poly_offset_front_scale *= poly_offset_scale_factor;
+     poly_offset_back_scale *= poly_offset_scale_factor;
+     dirty |= system_constants_.edram_poly_offset_front_scale != poly_offset_front_scale;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index c3cb4ed..299cab0 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -65,6 +65,11 @@ REXCVAR_DECLARE(std::string, vulkan_fragment_shading_rate);
+ #endif
+ #endif
+ 
++REXCVAR_DECLARE(bool, spirv_texture_sign_branch);
++REXCVAR_DECLARE(bool, vulkan_shader_xenos_multiply);
++REXCVAR_DECLARE(bool, vulkan_shader_xenos_multiply_vertex);
++REXCVAR_DECLARE(bool, vulkan_texture_fetch_implicit_lod);
++
+ REXCVAR_DEFINE_BOOL(vulkan_pipeline_libraries, true, "GPU/Vulkan",
+                     "Link guest pipelines from per-stage libraries (VK_EXT_graphics_pipeline_"
+                     "library with fast linking, extended dynamic state 1/2/3, dynamic rendering): "
+@@ -5025,7 +5030,13 @@ void VulkanPipelineCache::PrecompileThread() {
+   std::memcpy(marker, properties.pipelineCacheUUID, 16);
+   uint64_t shader_count = precompile_pixel_shaders_.size();
+   std::memcpy(marker + 16, &shader_count, 8);
+-  uint32_t precompile_version = 2;  // 2: 1x only (the game draws its pixel shaders at 1x).
++  // 2: 1x only (the game draws its pixel shaders at 1x). 3+: the translation switches are part of
++  // the marker - a change rebuilds the libraries here, in the background, instead of compiling
++  // them while the game runs (the driver cache is keyed by the SPIR-V).
++  uint32_t precompile_version = 3 | (uint32_t(REXCVAR_GET(spirv_texture_sign_branch)) << 8) |
++                                (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply)) << 9) |
++                                (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply_vertex)) << 10) |
++                                (uint32_t(REXCVAR_GET(vulkan_texture_fetch_implicit_lod)) << 11);
+   std::memcpy(marker + 24, &precompile_version, 4);
+   if (FILE* file = rex::filesystem::OpenFile(precompile_marker_path_, "rb")) {
+     uint8_t existing[28];

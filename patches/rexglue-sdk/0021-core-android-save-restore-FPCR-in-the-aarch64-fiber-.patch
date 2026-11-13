@@ -1,0 +1,71 @@
+From 25c7bdfabfd1799b8a3ea40288f82b5d96c249aa Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:40:27 +0800
+Subject: [PATCH 021/108] core(android): save/restore FPCR in the aarch64 fiber
+ switch (behaviour informed by lr-ffxiii-port's Android patch, re-implemented)
+
+FPCR carries the guest rounding mode (and flush-to-zero), which is per guest
+thread state; it now travels with each fiber. New fibers inherit the creating
+thread's FPCR. Frame grows from 160 to 176 bytes.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 5df0d82..cf28085 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -44,7 +44,8 @@ thread_local Fiber* Fiber::tls_current_ = nullptr;
+ #endif
+ 
+ // Bionic lacks the ucontext functions. rex_fiber_switch(&from->sp_, to->sp_)
+-// saves the AAPCS64 callee-saved state (x19-x30, d8-d15) on the current stack,
++// saves the AAPCS64 callee-saved state (x19-x30, d8-d15) and FPCR (guest
++// rounding/flush mode, per fiber) on the current stack,
+ // stores SP, loads the target SP, restores its state and returns into it.
+ extern "C" void rex_fiber_switch(void** save_sp, void* load_sp);
+ asm(R"(
+@@ -54,7 +55,7 @@ asm(R"(
+   .hidden rex_fiber_switch
+   .type rex_fiber_switch, %function
+ rex_fiber_switch:
+-  sub sp, sp, #160
++  sub sp, sp, #176
+   stp x19, x20, [sp, #0]
+   stp x21, x22, [sp, #16]
+   stp x23, x24, [sp, #32]
+@@ -65,6 +66,8 @@ rex_fiber_switch:
+   stp d10, d11, [sp, #112]
+   stp d12, d13, [sp, #128]
+   stp d14, d15, [sp, #144]
++  mrs x9, fpcr
++  str x9, [sp, #160]
+   mov x2, sp
+   str x2, [x0]
+   mov sp, x1
+@@ -78,7 +81,9 @@ rex_fiber_switch:
+   ldp d10, d11, [sp, #112]
+   ldp d12, d13, [sp, #128]
+   ldp d14, d15, [sp, #144]
+-  add sp, sp, #160
++  ldr x9, [sp, #160]
++  msr fpcr, x9
++  add sp, sp, #176
+   ret
+   .size rex_fiber_switch, .-rex_fiber_switch
+ )");
+@@ -96,10 +101,13 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
+   f->arg_ = arg;
+   f->stack_.resize(stack_size);
+   auto top = reinterpret_cast<uintptr_t>(f->stack_.data() + f->stack_.size()) & ~uintptr_t(15);
+-  auto* frame = reinterpret_cast<uint64_t*>(top - 160);
+-  for (int i = 0; i < 20; ++i) {
++  auto* frame = reinterpret_cast<uint64_t*>(top - 176);
++  for (int i = 0; i < 22; ++i) {
+     frame[i] = 0;
+   }
++  uint64_t fpcr;
++  __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
++  frame[20] = fpcr;  // [sp, #160]: new fibers start with the creator's FPCR.
+   // First switch "returns" into Trampoline (x30 slot, [sp, #88]) with SP at the
+   // 16-byte aligned top of the fiber stack; x29 = 0 terminates frame chains.
+   frame[11] = reinterpret_cast<uint64_t>(&Fiber::Trampoline);

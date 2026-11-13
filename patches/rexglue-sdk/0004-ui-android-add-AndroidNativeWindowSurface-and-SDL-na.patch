@@ -1,0 +1,152 @@
+From 0745fbb0bc4c96e514e43671777998cd3c70a7c0 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:16:53 +0800
+Subject: [PATCH 004/108] ui(android): add AndroidNativeWindowSurface and SDL
+ native window lookup
+
+surface_android.h/.cpp wrap the ANativeWindow from SDL_PROP_WINDOW_ANDROID_
+WINDOW_POINTER; VulkanPresenter already creates the VkSurfaceKHR from it via
+vkCreateAndroidSurfaceKHR. rexui drops the xcb/wayland pkg-config path on
+Android and links libandroid.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
+new file mode 100644
+index 0000000..5693321
+--- /dev/null
++++ b/include/rex/ui/surface_android.h
+@@ -0,0 +1,36 @@
++#pragma once
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2021 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ *
++ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
++ */
++
++#include <rex/ui/surface.h>
++
++struct ANativeWindow;
++
++namespace rex {
++namespace ui {
++
++// Wraps the ANativeWindow owned by SDL's Android backend (SDLActivity). The
++// presenter creates the VkSurfaceKHR itself via vkCreateAndroidSurfaceKHR.
++class AndroidNativeWindowSurface final : public Surface {
++ public:
++  explicit AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {}
++  TypeIndex GetType() const override { return kTypeIndex_AndroidNativeWindow; }
++  ANativeWindow* window() const { return window_; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;
++
++ private:
++  ANativeWindow* window_;
++};
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..ddc3f98 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -72,6 +72,10 @@ elseif(APPLE)
+     set(REXUI_PLATFORM_SOURCES
+         surface_mac.cpp
+     )
++elseif(ANDROID)
++    set(REXUI_PLATFORM_SOURCES
++        surface_android.cpp
++    )
+ else()
+     set(REXUI_PLATFORM_SOURCES
+         surface_gnulinux.cpp
+@@ -146,7 +150,11 @@ if(REXGLUE_USE_VULKAN)
+ endif()
+ 
+ # Platform-specific dependencies
+-if(UNIX AND NOT APPLE)
++if(ANDROID)
++    # ANativeWindow_* (surface_android.cpp); the Vulkan loader is the system
++    # libvulkan.so, loaded at runtime.
++    target_link_libraries(rexui PUBLIC android)
++elseif(UNIX AND NOT APPLE)
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
+diff --git a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
+new file mode 100644
+index 0000000..467d53f
+--- /dev/null
++++ b/src/ui/surface_android.cpp
+@@ -0,0 +1,34 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2021 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ *
++ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
++ */
++
++#include <android/native_window.h>
++
++#include <rex/ui/surface_android.h>
++
++namespace rex {
++namespace ui {
++
++bool AndroidNativeWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
++  if (!window_) {
++    return false;
++  }
++  int32_t width = ANativeWindow_getWidth(window_);
++  int32_t height = ANativeWindow_getHeight(window_);
++  if (width <= 0 || height <= 0) {
++    return false;
++  }
++  width_out = uint32_t(width);
++  height_out = uint32_t(height);
++  return true;
++}
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 6782cce..bbb8422 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -34,6 +34,8 @@
+ #include <SDL3/SDL_metal.h>
+ 
+ #include <rex/ui/surface_mac.h>
++#elif REX_PLATFORM_ANDROID
++#include <rex/ui/surface_android.h>
+ #else
+ #include <X11/Xlib-xcb.h>
+ #include <rex/ui/surface_gnulinux.h>
+@@ -447,6 +449,15 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+       SDL_Metal_DestroyView(metal_view);
+     }
+   }
++#elif REX_PLATFORM_ANDROID
++  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
++    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
++    auto* native_window = static_cast<ANativeWindow*>(
++        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
++    if (native_window) {
++      return std::make_unique<AndroidNativeWindowSurface>(native_window);
++    }
++  }
+ #else
+   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {

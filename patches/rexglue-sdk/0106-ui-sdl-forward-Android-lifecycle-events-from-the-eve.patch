@@ -1,0 +1,32 @@
+From 454afa87afe40ba723c4df29fb2ca6cea81e7249 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Thu, 12 Nov 2026 18:47:16 +0800
+Subject: [PATCH 106/108] ui/sdl: forward Android lifecycle events from the
+ event watcher to the UI thread (SDL3 never queues them; the surface was never
+ released/recreated)
+
+
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index b243e31..3ebc337 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -218,6 +218,19 @@ bool SDLCALL SDLWindowedAppContext::WatchEvent(void* userdata, SDL_Event* event)
+     ++context->synchronously_handled_quit_events_;
+     context->ProcessQuitRequest();
+   }
++#if REX_PLATFORM_ANDROID
++  // SDL3 never queues the app lifecycle events: SDL_SendAppEvent only calls the event watchers,
++  // on the Android thread that pauses or resumes the activity. So ProcessEvent's
++  // WILL_ENTER_BACKGROUND / DID_ENTER_FOREGROUND handler (release / recreate the presentation
++  // surface) never ran: after a sleep/wake the presenter kept the dead window, the screen stayed
++  // black, and a reconnect after a failed swapchain creation crashed (2026-11-12). Hand them to
++  // the UI thread in order.
++  if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND ||
++      event->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
++    SDL_Event copy = *event;
++    context->CallInUIThreadDeferred([context, copy]() mutable { context->ProcessEvent(copy); });
++  }
++#endif
+   return true;
+ }
+ 

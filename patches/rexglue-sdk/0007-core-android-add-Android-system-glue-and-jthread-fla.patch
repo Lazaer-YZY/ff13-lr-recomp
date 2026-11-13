@@ -1,0 +1,169 @@
+From 30912596db946bdce7da5b74b32a60a8ea38053c Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:22:43 +0800
+Subject: [PATCH 007/108] core(android): add Android system glue and jthread
+ flag
+
+- include/rex/main_android.h declares rex::GetAndroidApiLevel() (included by
+  memory_posix.cpp / threading_posix.cpp, previously missing).
+- src/core/android_system.cpp defines GetAndroidApiLevel (cached
+  android_get_device_api_level), InitializeAndroidSystemForApplicationContext /
+  ShutdownAndroidSystem (call the memory/thread/filesystem Android init and
+  shutdown hooks), filesystem::AndroidInitialize/Shutdown (no-op),
+  IsAndroidContentUri and a stub OpenAndroidContentFileDescriptor (-1).
+- timer_queue.cpp gets -fexperimental-library on Android as on Apple
+  (std::jthread/stop_token gated in the NDK libc++).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/main_android.h b/include/rex/main_android.h
+new file mode 100644
+index 0000000..7f898ac
+--- /dev/null
++++ b/include/rex/main_android.h
+@@ -0,0 +1,26 @@
++#pragma once
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2021 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ *
++ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
++ */
++
++#include <cstdint>
++
++#include <rex/platform.h>
++
++#if REX_PLATFORM_ANDROID
++
++namespace rex {
++
++// Device API level (android_get_device_api_level()), cached on first use.
++int32_t GetAndroidApiLevel();
++
++}  // namespace rex
++
++#endif  // REX_PLATFORM_ANDROID
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index c6f117b..8505deb 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -24,8 +24,8 @@ add_library(rexcore OBJECT
+ )
+ add_library(rex::core ALIAS rexcore)
+ 
+-if(APPLE)
+-    # Apple's libc++ still gates std::jthread/std::stop_token behind the
++if(APPLE OR ANDROID)
++    # Apple's (and the NDK's) libc++ still gates std::jthread/std::stop_token behind the
+     # experimental-library feature flag. Only timer_queue.cpp uses them, and
+     # neither type crosses a header boundary.
+     set_source_files_properties(timer_queue.cpp PROPERTIES
+@@ -74,6 +74,9 @@ elseif(UNIX)
+         system_posix.cpp
+         threading_posix.cpp
+     )
++    if(ANDROID)
++        target_sources(rexcore PRIVATE android_system.cpp)
++    endif()
+ endif()
+ 
+ # Xenos data-format layer (stateless; headers under include/rex/graphics/).
+diff --git a/src/core/android_system.cpp b/src/core/android_system.cpp
+new file mode 100644
+index 0000000..db2a448
+--- /dev/null
++++ b/src/core/android_system.cpp
+@@ -0,0 +1,74 @@
++/**
++ * @file        rex/core/android_system.cpp
++ * @brief       Minimal Android platform glue (API level, system init/shutdown)
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#include <rex/platform.h>
++
++#if REX_PLATFORM_ANDROID
++
++#include <android/api-level.h>
++
++#include <atomic>
++#include <string_view>
++
++#include <rex/filesystem.h>
++#include <rex/main_android.h>
++#include <rex/memory/utils.h>
++#include <rex/system.h>
++#include <rex/thread.h>
++
++namespace rex {
++
++int32_t GetAndroidApiLevel() {
++  static const int32_t api_level = android_get_device_api_level();
++  return api_level;
++}
++
++// TODO(android): store the JNI application context (JavaVM*/jobject) once the
++// app shell passes it in; content:// access and LaunchWebBrowser need it.
++static std::atomic<bool> android_system_initialized_{false};
++
++bool InitializeAndroidSystemForApplicationContext() {
++  if (android_system_initialized_.exchange(true)) {
++    return true;
++  }
++  memory::AndroidInitialize();
++  thread::AndroidInitialize();
++  filesystem::AndroidInitialize();
++  return true;
++}
++
++void ShutdownAndroidSystem() {
++  if (!android_system_initialized_.exchange(false)) {
++    return;
++  }
++  filesystem::AndroidShutdown();
++  thread::AndroidShutdown();
++  memory::AndroidShutdown();
++}
++
++namespace filesystem {
++
++void AndroidInitialize() {}
++void AndroidShutdown() {}
++
++bool IsAndroidContentUri(const std::string_view source) {
++  return source.starts_with("content://");
++}
++
++// STUB: content:// URIs need ContentResolver.openFileDescriptor via JNI.
++int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode) {
++  (void)uri;
++  (void)mode;
++  return -1;
++}
++
++}  // namespace filesystem
++
++}  // namespace rex
++
++#endif  // REX_PLATFORM_ANDROID
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..2cdcd55 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -53,8 +53,7 @@
+ 
+ #include <linux/ashmem.h>
+ 
+-// TODO(tomc): Android or maybe na. idk
+-// #include "xenia/base/main_android.h"
++#include <rex/main_android.h>
+ #endif
+ 
+ namespace rex {

@@ -1,0 +1,1529 @@
+From 8ea145a63378926a2c3361b0372dea60325711a4 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 00:55:26 +0800
+Subject: [PATCH 074/108] gpu: vulkan: pipelines linked from per-stage
+ libraries, ahead-of-time pixel shader libraries
+
+On devices with VK_EXT_graphics_pipeline_library (fast linking), extended
+dynamic state 1/2/3 and dynamic rendering (Turnip; vulkan_pipeline_libraries):
+- guest pipelines are linked from vertex input / pre-rasterization / fragment
+  shader / fragment output libraries; cull, front face, polygon mode, depth
+  clamp, rasterizer discard, depth bias enable, depth/stencil test/write/compare
+  /ops and blend enable/equation/write mask are dynamic, set after binding from
+  the pipeline's description (tracked, re-sent after static pipelines and at
+  new command buffers);
+- layouts use independent sets; per-stage library layouts are shared by every
+  pair with the same texture set (thread-safe layout lookups);
+- canonical interpolator masks + fixed interpolator locations so a shader's
+  library doesn't depend on its pairing;
+- library keys are stable across runs (ucode hash + modification, geometry
+  shader key, sample state, formats) and listed in <title>.vk.libkeys once a
+  saved driver cache contains them; a miss whose libraries are all known links
+  synchronously (fast link, no held frame);
+- first start: a background precompile builds the canonical fragment library
+  of every stored pixel shader (offline-extracted set + <title>.psmeta from
+  tools/lr_shader_scan.py: parameter generation register), 1x, early-Z hint and
+  alpha-tested variants; marker <title>.vk.libprecompiled per driver build.
+  Thor/Turnip: 8,411 libraries in 312 s (library creation is serialized by the
+  driver; 4 threads = 1), warm boot loads the 334 MB driver cache in 414 ms;
+- big driver caches are saved after 30 s quiet and at most every 3 minutes.
+Qualcomm (no GPL/EDS3) keeps whole pipelines.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 4392f43..a7a5e21 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -442,11 +442,19 @@ class VulkanCommandProcessor : public CommandProcessor {
+    public:
+     explicit PipelineLayout(VkPipelineLayout pipeline_layout,
+                             VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref,
+-                            VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref)
++                            VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref,
++                            VkPipelineLayout pre_rasterization_library_layout = VK_NULL_HANDLE,
++                            VkPipelineLayout fragment_library_layout = VK_NULL_HANDLE)
+         : pipeline_layout_(pipeline_layout),
+           descriptor_set_layout_textures_vertex_ref_(descriptor_set_layout_textures_vertex_ref),
+-          descriptor_set_layout_textures_pixel_ref_(descriptor_set_layout_textures_pixel_ref) {}
++          descriptor_set_layout_textures_pixel_ref_(descriptor_set_layout_textures_pixel_ref),
++          pre_rasterization_library_layout_(pre_rasterization_library_layout),
++          fragment_library_layout_(fragment_library_layout) {}
+     VkPipelineLayout GetPipelineLayout() const override { return pipeline_layout_; }
++    VkPipelineLayout GetPreRasterizationLibraryLayout() const override {
++      return pre_rasterization_library_layout_;
++    }
++    VkPipelineLayout GetFragmentLibraryLayout() const override { return fragment_library_layout_; }
+     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref() const {
+       return descriptor_set_layout_textures_vertex_ref_;
+     }
+@@ -458,6 +466,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+     VkPipelineLayout pipeline_layout_;
+     VkDescriptorSetLayout descriptor_set_layout_textures_vertex_ref_;
+     VkDescriptorSetLayout descriptor_set_layout_textures_pixel_ref_;
++    VkPipelineLayout pre_rasterization_library_layout_;
++    VkPipelineLayout fragment_library_layout_;
+   };
+ 
+   struct UsedSingleTransientDescriptor {
+@@ -648,6 +658,24 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // graphics pipeline and may have produced incomplete output.
+   bool frame_used_async_placeholder_pipeline_ = false;
+   // Pipeline / shader work at draw time, logged every 10 s ("Pipelines (10 s)").
++  // Dynamic state last set for pipelines linked from libraries (unknown after a pipeline with
++  // static state is bound or a new command buffer starts).
++  VulkanPipelineCache::PipelineDynamicState current_library_dynamic_state_;
++  bool current_library_dynamic_state_valid_ = false;
++  void ApplyLibraryPipelineDynamicState(const VulkanPipelineCache::PipelineDynamicState& state);
++  // Pipeline library layouts by the stage's texture set layout (shared by every pair).
++  std::recursive_mutex pipeline_layouts_mutex_;
++  std::unordered_map<VkDescriptorSetLayout, VkPipelineLayout> library_layouts_vertex_;
++  std::unordered_map<VkDescriptorSetLayout, VkPipelineLayout> library_layouts_pixel_;
++  VkPipelineLayout GetLibraryLayout(bool vertex_stage, VkDescriptorSetLayout textures_layout);
++
++ public:
++  // Thread-safe: the layout of a pre-rasterization (vertex_stage) or fragment pipeline library
++  // whose shader uses the given numbers of textures and samplers.
++  VkPipelineLayout GetLibraryLayoutForTextures(bool vertex_stage, size_t texture_count,
++                                               size_t sampler_count);
++
++ private:
+   uint32_t counter_draws_skipped_pending_ = 0;
+   uint32_t counter_frames_held_ = 0;
+   uint32_t counter_frames_presented_ = 0;
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 6afd30c..ef192b4 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -24,6 +24,7 @@
+ #include <set>
+ #include <thread>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -53,6 +54,10 @@ class VulkanPipelineCache {
+    public:
+     virtual ~PipelineLayoutProvider() {}
+     virtual VkPipelineLayout GetPipelineLayout() const = 0;
++    // With pipeline libraries: layouts holding only the sets the pre-rasterization / fragment
++    // shader libraries use (VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT).
++    virtual VkPipelineLayout GetPreRasterizationLibraryLayout() const { return VK_NULL_HANDLE; }
++    virtual VkPipelineLayout GetFragmentLibraryLayout() const { return VK_NULL_HANDLE; }
+ 
+    protected:
+     PipelineLayoutProvider() = default;
+@@ -240,8 +245,37 @@ class VulkanPipelineCache {
+     PipelineDescription description;
+   });
+ 
++ public:
++  // Fixed-function state of a pipeline linked from libraries, set as dynamic state after binding.
++  struct PipelineDynamicState {
++    VkCullModeFlags cull_mode = VK_CULL_MODE_NONE;
++    VkFrontFace front_face = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    VkBool32 depth_test_enable = VK_FALSE;
++    VkBool32 depth_write_enable = VK_FALSE;
++    VkCompareOp depth_compare_op = VK_COMPARE_OP_ALWAYS;
++    VkBool32 stencil_test_enable = VK_FALSE;
++    VkStencilOp stencil_front_ops[3] = {};  // fail, pass, depth fail
++    VkCompareOp stencil_front_compare_op = VK_COMPARE_OP_ALWAYS;
++    VkStencilOp stencil_back_ops[3] = {};
++    VkCompareOp stencil_back_compare_op = VK_COMPARE_OP_ALWAYS;
++    VkBool32 depth_bias_enable = VK_FALSE;
++    VkBool32 rasterizer_discard_enable = VK_FALSE;
++    VkPolygonMode polygon_mode = VK_POLYGON_MODE_FILL;
++    VkBool32 depth_clamp_enable = VK_FALSE;
++    uint32_t color_attachment_count = 0;
++    VkBool32 color_blend_enable[xenos::kMaxColorRenderTargets] = {};
++    VkColorBlendEquationEXT color_blend_equation[xenos::kMaxColorRenderTargets] = {};
++    VkColorComponentFlags color_write_mask[xenos::kMaxColorRenderTargets] = {};
++  };
++  // nullptr if the pipeline behind the handle has all its state baked in.
++  const PipelineDynamicState* GetPipelineDynamicState(void* handle) const;
++
++ private:
+   struct Pipeline {
+     std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};
++    // Valid once uses_dynamic_state is set (before the pipeline is published).
++    PipelineDynamicState dynamic_state;
++    std::atomic<bool> uses_dynamic_state{false};
+     // The layouts are owned by the VulkanCommandProcessor, and must not be
+     // destroyed by it while the pipeline cache is active.
+     std::atomic<const PipelineLayoutProvider*> pipeline_layout{nullptr};
+@@ -251,6 +285,8 @@ class VulkanPipelineCache {
+         : pipeline_layout(pipeline_layout_provider) {}
+     Pipeline(const Pipeline& other)
+         : pipeline(other.pipeline.load(std::memory_order_acquire)),
++          dynamic_state(other.dynamic_state),
++          uses_dynamic_state(other.uses_dynamic_state.load(std::memory_order_acquire)),
+           pipeline_layout(other.pipeline_layout.load(std::memory_order_acquire)),
+           is_placeholder(other.is_placeholder.load(std::memory_order_acquire)) {}
+     Pipeline& operator=(const Pipeline& other) {
+@@ -405,6 +441,12 @@ class VulkanPipelineCache {
+     uint64_t pipelines_sync_us = 0;
+     uint32_t translations = 0;
+     uint64_t translations_us = 0;
++    uint32_t libraries_created = 0;
++    uint64_t libraries_created_us = 0;
++    uint32_t pipelines_linked = 0;
++    uint64_t pipelines_linked_us = 0;
++    uint32_t pipelines_linked_sync = 0;
++    uint64_t pipelines_linked_sync_us = 0;
+   };
+   DrawTimeCounters TakeDrawTimeCounters();
+   // Pipelines are linked from per-stage libraries (VK_EXT_graphics_pipeline_library): shader
+@@ -415,6 +457,52 @@ class VulkanPipelineCache {
+ 
+  private:
+   bool uses_pipeline_libraries_ = false;
++  // Pipeline libraries (VK_EXT_graphics_pipeline_library) by a hash of their key; created by the
++  // creation threads, the storage loading and the GPU thread, so guarded.
++  std::mutex pipeline_libraries_mutex_;
++  std::unordered_map<uint64_t, VkPipeline> pipeline_libraries_;
++  std::atomic<uint32_t> counter_libraries_created_{0};
++  std::atomic<uint64_t> counter_libraries_created_us_{0};
++  std::atomic<uint32_t> counter_pipelines_linked_{0};
++  std::atomic<uint64_t> counter_pipelines_linked_us_{0};
++  // only_if_cached: fail without compiling anything unless every library already exists or is
++  // known to be in the driver's pipeline cache (then creating it is a cache hit).
++  bool EnsurePipelineCreatedFromLibraries(const PipelineCreationArguments& creation_arguments,
++                                          bool only_if_cached = false);
++  // Library keys created on this device + driver build (persisted next to the driver cache), so
++  // a later start knows which libraries the driver cache can produce quickly.
++  std::unordered_set<uint64_t> known_library_keys_;
++  // Created since the last driver cache save (written to the key list after the next save).
++  std::vector<uint64_t> unsaved_library_keys_;
++  FILE* library_keys_file_ = nullptr;
++  bool IsLibraryAvailable(uint64_t key_hash);
++  void LoadLibraryKeys(const std::filesystem::path& path);
++  // Ahead-of-time fragment libraries for every stored pixel shader (offline-extracted set).
++  struct PrecompileShader {
++    uint64_t hash;
++    std::vector<uint32_t> ucode;
++  };
++  std::vector<PrecompileShader> precompile_pixel_shaders_;
++  std::unordered_map<uint64_t, uint32_t> pixel_shader_meta_;
++  std::unique_ptr<rex::thread::Thread> precompile_thread_;
++  std::atomic<bool> precompile_shutdown_{false};
++  std::filesystem::path precompile_marker_path_;
++  void PrecompileThread();
++  VkPipeline GetOrCreateFragmentLibrary(uint64_t key_hash, VkShaderModule fragment_module,
++                                        VkPipelineLayout layout,
++                                        const VkPipelineMultisampleStateCreateInfo& multisample);
++  // Returns the library for the key (creating it with create_info on a miss), VK_NULL_HANDLE on
++  // failure.
++  VkPipeline GetOrCreatePipelineLibrary(const void* key, size_t key_size,
++                                        VkGraphicsPipelineCreateInfo& create_info,
++                                        VkGraphicsPipelineLibraryFlagsEXT library_flags,
++                                        bool only_if_cached = false);
++  VkPipeline GetOrCreatePipelineLibraryByHash(uint64_t key_hash,
++                                              VkGraphicsPipelineCreateInfo& create_info,
++                                              VkGraphicsPipelineLibraryFlagsEXT library_flags,
++                                              bool only_if_cached);
++  std::atomic<uint32_t> counter_pipelines_linked_sync_{0};
++  std::atomic<uint64_t> counter_pipelines_linked_sync_us_{0};
+   std::atomic<uint32_t> counter_pipelines_queued_{0};
+   std::atomic<uint32_t> counter_pipelines_sync_{0};
+   std::atomic<uint64_t> counter_pipelines_sync_us_{0};
+@@ -504,6 +592,8 @@ class VulkanPipelineCache {
+   std::atomic<uint64_t> driver_pipeline_cache_last_use_ms_{0};
+   // 0 when there are no pipeline creations since the last save.
+   std::atomic<uint64_t> driver_pipeline_cache_first_unsaved_use_ms_{0};
++  // Set when a big batch of creations ended (the precompile): save after the short settle time.
++  std::atomic<bool> driver_pipeline_cache_save_soon_{false};
+ 
+   // Thread for asynchronous writing to the storage streams.
+   void StorageWriteThread();
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 9f1ae04..a44c4ed 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -705,15 +705,22 @@ void VulkanCommandProcessor::LogPipelineCountersIfDue() {
+   pipeline_counters_last_log_ns_ = now_ns;
+   VulkanPipelineCache::DrawTimeCounters counters = pipeline_cache_->TakeDrawTimeCounters();
+   if (counters.pipelines_queued || counters.pipelines_sync || counters.translations ||
+-      counter_draws_skipped_pending_ || counter_frames_held_) {
++      counters.libraries_created || counters.pipelines_linked || counters.pipelines_linked_sync ||
++      counter_draws_skipped_pending_ ||
++      counter_frames_held_) {
+     REXGPU_INFO(
+         "Pipelines (10 s): {} queued for the creation threads, {} created synchronously on the "
+         "GPU thread ({:.1f} ms), {} shader translations on the GPU thread ({:.1f} ms), {} draws "
+-        "skipped while pending, {} of {} frames held",
++        "skipped while pending, {} of {} frames held; {} libraries compiled ({:.0f} ms), {} "
++        "pipelines linked ({:.0f} ms incl. library compiles), {} linked on the GPU thread from "
++        "cached libraries ({:.1f} ms)",
+         counters.pipelines_queued, counters.pipelines_sync,
+         double(counters.pipelines_sync_us) / 1000.0, counters.translations,
+         double(counters.translations_us) / 1000.0, counter_draws_skipped_pending_,
+-        counter_frames_held_, counter_frames_held_ + counter_frames_presented_);
++        counter_frames_held_, counter_frames_held_ + counter_frames_presented_,
++        counters.libraries_created, double(counters.libraries_created_us) / 1000.0,
++        counters.pipelines_linked, double(counters.pipelines_linked_us) / 1000.0,
++        counters.pipelines_linked_sync, double(counters.pipelines_linked_sync_us) / 1000.0);
+   }
+   counter_draws_skipped_pending_ = 0;
+   counter_frames_held_ = 0;
+@@ -2171,6 +2178,14 @@ void VulkanCommandProcessor::ShutdownContext() {
+   for (const auto& pipeline_layout_pair : pipeline_layouts_) {
+     dfn.vkDestroyPipelineLayout(device, pipeline_layout_pair.second.GetPipelineLayout(), nullptr);
+   }
++  for (const auto& library_layout_pair : library_layouts_vertex_) {
++    dfn.vkDestroyPipelineLayout(device, library_layout_pair.second, nullptr);
++  }
++  library_layouts_vertex_.clear();
++  for (const auto& library_layout_pair : library_layouts_pixel_) {
++    dfn.vkDestroyPipelineLayout(device, library_layout_pair.second, nullptr);
++  }
++  library_layouts_pixel_.clear();
+   pipeline_layouts_.clear();
+   for (const auto& descriptor_set_layout_pair : descriptor_set_layouts_textures_) {
+     dfn.vkDestroyDescriptorSetLayout(device, descriptor_set_layout_pair.second, nullptr);
+@@ -4133,6 +4148,7 @@ VkDescriptorSet VulkanCommandProcessor::AllocateSingleTransientDescriptor(
+ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool is_vertex,
+                                                                             size_t texture_count,
+                                                                             size_t sampler_count) {
++  std::lock_guard<std::recursive_mutex> layouts_lock(pipeline_layouts_mutex_);
+   size_t binding_count = texture_count + sampler_count;
+   if (!binding_count) {
+     return descriptor_set_layout_empty_;
+@@ -4190,6 +4206,7 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
+ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPipelineLayout(
+     size_t texture_count_pixel, size_t sampler_count_pixel, size_t texture_count_vertex,
+     size_t sampler_count_vertex) {
++  std::lock_guard<std::recursive_mutex> layouts_lock(pipeline_layouts_mutex_);
+   PipelineLayoutKey pipeline_layout_key;
+   pipeline_layout_key.texture_count_pixel = uint16_t(texture_count_pixel);
+   pipeline_layout_key.sampler_count_pixel = uint16_t(sampler_count_pixel);
+@@ -4237,10 +4254,12 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+ 
++  const bool library_layouts = pipeline_cache_->UsesPipelineLibraries();
+   VkPipelineLayoutCreateInfo pipeline_layout_create_info;
+   pipeline_layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+   pipeline_layout_create_info.pNext = nullptr;
+-  pipeline_layout_create_info.flags = 0;
++  pipeline_layout_create_info.flags =
++      library_layouts ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0;
+   pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(descriptor_set_layouts));
+   pipeline_layout_create_info.pSetLayouts = descriptor_set_layouts;
+   pipeline_layout_create_info.pushConstantRangeCount = 0;
+@@ -4254,10 +4273,20 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
+         texture_count_pixel, texture_count_vertex);
+     return nullptr;
+   }
++  // Pipeline libraries: the pre-rasterization library only knows the vertex shader's texture set,
++  // the fragment library only the pixel shader's (the other set is a hole).
++  VkPipelineLayout pre_rasterization_library_layout = VK_NULL_HANDLE;
++  VkPipelineLayout fragment_library_layout = VK_NULL_HANDLE;
++  if (library_layouts) {
++    pre_rasterization_library_layout =
++        GetLibraryLayout(true, descriptor_set_layout_textures_vertex);
++    fragment_library_layout = GetLibraryLayout(false, descriptor_set_layout_textures_pixel);
++  }
+   auto emplaced_pair = pipeline_layouts_.emplace(
+       std::piecewise_construct, std::forward_as_tuple(pipeline_layout_key),
+       std::forward_as_tuple(pipeline_layout, descriptor_set_layout_textures_vertex,
+-                            descriptor_set_layout_textures_pixel));
++                            descriptor_set_layout_textures_pixel, pre_rasterization_library_layout,
++                            fragment_library_layout));
+   // unordered_map insertion doesn't invalidate element references.
+   return &emplaced_pair.first->second;
+ }
+@@ -4357,6 +4386,122 @@ void VulkanCommandProcessor::BindExternalGraphicsPipeline(VkPipeline pipeline,
+   current_external_graphics_pipeline_ = pipeline;
+   current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+   current_guest_graphics_pipeline_layout_ = VK_NULL_HANDLE;
++  // Its static state replaces the dynamic state of the library pipelines.
++  current_library_dynamic_state_valid_ = false;
++}
++
++VkPipelineLayout VulkanCommandProcessor::GetLibraryLayout(bool vertex_stage,
++                                                          VkDescriptorSetLayout textures_layout) {
++  std::lock_guard<std::recursive_mutex> layouts_lock(pipeline_layouts_mutex_);
++  auto& layouts = vertex_stage ? library_layouts_vertex_ : library_layouts_pixel_;
++  auto it = layouts.find(textures_layout);
++  if (it != layouts.end()) {
++    return it->second;
++  }
++  VkDescriptorSetLayout set_layouts[SpirvShaderTranslator::kDescriptorSetCount];
++  set_layouts[SpirvShaderTranslator::kDescriptorSetSharedMemoryAndEdram] =
++      descriptor_set_layout_shared_memory_and_edram_;
++  set_layouts[SpirvShaderTranslator::kDescriptorSetConstants] = descriptor_set_layout_constants_;
++  set_layouts[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
++      vertex_stage ? textures_layout : VK_NULL_HANDLE;
++  set_layouts[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
++      vertex_stage ? VK_NULL_HANDLE : textures_layout;
++  VkPipelineLayoutCreateInfo create_info = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++  create_info.flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
++  create_info.setLayoutCount = uint32_t(rex::countof(set_layouts));
++  create_info.pSetLayouts = set_layouts;
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  VkPipelineLayout layout = VK_NULL_HANDLE;
++  if (vulkan_device->functions().vkCreatePipelineLayout(vulkan_device->device(), &create_info,
++                                                        nullptr, &layout) != VK_SUCCESS) {
++    REXGPU_ERROR("Failed to create a Vulkan pipeline library layout");
++    return VK_NULL_HANDLE;
++  }
++  layouts.emplace(textures_layout, layout);
++  return layout;
++}
++
++VkPipelineLayout VulkanCommandProcessor::GetLibraryLayoutForTextures(bool vertex_stage,
++                                                                     size_t texture_count,
++                                                                     size_t sampler_count) {
++  std::lock_guard<std::recursive_mutex> layouts_lock(pipeline_layouts_mutex_);
++  VkDescriptorSetLayout textures_layout =
++      GetTextureDescriptorSetLayout(vertex_stage, texture_count, sampler_count);
++  if (textures_layout == VK_NULL_HANDLE) {
++    return VK_NULL_HANDLE;
++  }
++  return GetLibraryLayout(vertex_stage, textures_layout);
++}
++
++void VulkanCommandProcessor::ApplyLibraryPipelineDynamicState(
++    const VulkanPipelineCache::PipelineDynamicState& state) {
++  const bool valid = current_library_dynamic_state_valid_;
++  VulkanPipelineCache::PipelineDynamicState& current = current_library_dynamic_state_;
++  if (!valid || current.cull_mode != state.cull_mode) {
++    deferred_command_buffer_.CmdVkSetCullMode(state.cull_mode);
++  }
++  if (!valid || current.front_face != state.front_face) {
++    deferred_command_buffer_.CmdVkSetFrontFace(state.front_face);
++  }
++  if (!valid || current.depth_test_enable != state.depth_test_enable) {
++    deferred_command_buffer_.CmdVkSetDepthTestEnable(state.depth_test_enable);
++  }
++  if (!valid || current.depth_write_enable != state.depth_write_enable) {
++    deferred_command_buffer_.CmdVkSetDepthWriteEnable(state.depth_write_enable);
++  }
++  if (!valid || current.depth_compare_op != state.depth_compare_op) {
++    deferred_command_buffer_.CmdVkSetDepthCompareOp(state.depth_compare_op);
++  }
++  if (!valid || current.stencil_test_enable != state.stencil_test_enable) {
++    deferred_command_buffer_.CmdVkSetStencilTestEnable(state.stencil_test_enable);
++  }
++  if (!valid || std::memcmp(current.stencil_front_ops, state.stencil_front_ops,
++                            sizeof(state.stencil_front_ops)) ||
++      current.stencil_front_compare_op != state.stencil_front_compare_op) {
++    deferred_command_buffer_.CmdVkSetStencilOp(
++        VK_STENCIL_FACE_FRONT_BIT, state.stencil_front_ops[0], state.stencil_front_ops[1],
++        state.stencil_front_ops[2], state.stencil_front_compare_op);
++  }
++  if (!valid || std::memcmp(current.stencil_back_ops, state.stencil_back_ops,
++                            sizeof(state.stencil_back_ops)) ||
++      current.stencil_back_compare_op != state.stencil_back_compare_op) {
++    deferred_command_buffer_.CmdVkSetStencilOp(
++        VK_STENCIL_FACE_BACK_BIT, state.stencil_back_ops[0], state.stencil_back_ops[1],
++        state.stencil_back_ops[2], state.stencil_back_compare_op);
++  }
++  if (!valid || current.depth_bias_enable != state.depth_bias_enable) {
++    deferred_command_buffer_.CmdVkSetDepthBiasEnable(state.depth_bias_enable);
++  }
++  if (!valid || current.rasterizer_discard_enable != state.rasterizer_discard_enable) {
++    deferred_command_buffer_.CmdVkSetRasterizerDiscardEnable(state.rasterizer_discard_enable);
++  }
++  if (!valid || current.polygon_mode != state.polygon_mode) {
++    deferred_command_buffer_.CmdVkSetPolygonModeEXT(state.polygon_mode);
++  }
++  if (!valid || current.depth_clamp_enable != state.depth_clamp_enable) {
++    deferred_command_buffer_.CmdVkSetDepthClampEnableEXT(state.depth_clamp_enable);
++  }
++  uint32_t count = state.color_attachment_count;
++  if (count) {
++    if (!valid || current.color_attachment_count != count ||
++        std::memcmp(current.color_blend_enable, state.color_blend_enable,
++                    sizeof(VkBool32) * count)) {
++      deferred_command_buffer_.CmdVkSetColorBlendEnableEXT(0, count, state.color_blend_enable);
++    }
++    if (!valid || current.color_attachment_count != count ||
++        std::memcmp(current.color_blend_equation, state.color_blend_equation,
++                    sizeof(VkColorBlendEquationEXT) * count)) {
++      deferred_command_buffer_.CmdVkSetColorBlendEquationEXT(0, count,
++                                                             state.color_blend_equation);
++    }
++    if (!valid || current.color_attachment_count != count ||
++        std::memcmp(current.color_write_mask, state.color_write_mask,
++                    sizeof(VkColorComponentFlags) * count)) {
++      deferred_command_buffer_.CmdVkSetColorWriteMaskEXT(0, count, state.color_write_mask);
++    }
++  }
++  current = state;
++  current_library_dynamic_state_valid_ = true;
+ }
+ 
+ void VulkanCommandProcessor::BindExternalComputePipeline(VkPipeline pipeline) {
+@@ -4742,6 +4887,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     current_guest_graphics_pipeline_ = pipeline;
+     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+   }
++  if (const VulkanPipelineCache::PipelineDynamicState* library_dynamic_state =
++          pipeline_cache_->GetPipelineDynamicState(pipeline_handle)) {
++    ApplyLibraryPipelineDynamicState(*library_dynamic_state);
++  } else {
++    current_library_dynamic_state_valid_ = false;
++  }
+ 
+   // Update the graphics pipeline, and if the new graphics pipeline has a
+   // different layout, invalidate incompatible descriptor sets before updating
+@@ -6088,6 +6239,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+     current_external_compute_pipeline_ = VK_NULL_HANDLE;
+     current_guest_graphics_pipeline_layout_ = nullptr;
++    current_library_dynamic_state_valid_ = false;
+     current_graphics_descriptor_sets_bound_up_to_date_ = 0;
+ 
+     bool gpu_timing_enabled = REXCVAR_GET(vulkan_gpu_timing);
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index e30d15b..e8458e3 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -65,6 +65,13 @@ REXCVAR_DECLARE(std::string, vulkan_fragment_shading_rate);
+ #endif
+ #endif
+ 
++REXCVAR_DEFINE_BOOL(vulkan_pipeline_libraries, true, "GPU/Vulkan",
++                    "Link guest pipelines from per-stage libraries (VK_EXT_graphics_pipeline_"
++                    "library with fast linking, extended dynamic state 1/2/3, dynamic rendering): "
++                    "each shader is compiled once into a library that can be built ahead of time, "
++                    "and new state combinations only need a fast link.")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
+ REXCVAR_DEFINE_BOOL(vulkan_pipeline_compile_never_blocks, true, "GPU/Vulkan",
+                     "With async_shader_compilation, a pipeline missing at draw time is only "
+                     "created by the background creation threads: its draws are skipped until it "
+@@ -392,6 +399,24 @@ bool VulkanPipelineCache::Initialize() {
+   bool edram_fragment_shader_interlock =
+       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+ 
++  {
++    const ui::vulkan::VulkanDevice::Properties& p = vulkan_device->properties();
++    uses_pipeline_libraries_ =
++        REXCVAR_GET(vulkan_pipeline_libraries) && !edram_fragment_shader_interlock &&
++        REXCVAR_GET(vulkan_dynamic_rendering) && p.dynamicRendering &&
++        p.graphicsPipelineLibrary && p.graphicsPipelineLibraryFastLinking &&
++        p.extendedDynamicState && p.extendedDynamicState2 &&
++        p.extendedDynamicState3PolygonMode && p.extendedDynamicState3DepthClampEnable &&
++        p.extendedDynamicState3ColorBlendEnable && p.extendedDynamicState3ColorBlendEquation &&
++        p.extendedDynamicState3ColorWriteMask;
++    // Pairing-independent translations need interpolator I at location I in every stage.
++    SpirvShaderTranslator::SetFixedInterpolatorLocations(uses_pipeline_libraries_);
++    REXGPU_INFO("VulkanPipelineCache: guest pipelines {}",
++                uses_pipeline_libraries_
++                    ? "linked from per-stage pipeline libraries (fast linking, dynamic state)"
++                    : "created whole");
++  }
++
+   shader_translator_ = std::make_unique<SpirvShaderTranslator>(
+       SpirvShaderTranslator::Features(vulkan_device),
+       render_target_cache_.msaa_2x_attachments_supported(),
+@@ -667,6 +692,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       shader_storage_valid_bytes += sizeof(shader_header) + ucode_byte_count;
+       VulkanShader* shader = LoadShader(shader_header.type, ucode_dwords.data(),
+                                         shader_header.ucode_dword_count, ucode_data_hash);
++      if (uses_pipeline_libraries_ && shader_header.type == xenos::ShaderType::kPixel) {
++        precompile_pixel_shaders_.push_back({ucode_data_hash, ucode_dwords});
++      }
+       if (shader->ucode_storage_index() == shader_storage_index_) {
+         // Appeared twice in this file for some reason - skip.
+         continue;
+@@ -692,6 +720,28 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+ 
+   // Before creating the stored pipelines, so they come from the driver's cache when possible.
+   LoadDriverPipelineCache(GetDriverPipelineCachePath(cache_root, title_id));
++  if (uses_pipeline_libraries_) {
++    LoadLibraryKeys(shader_storage_shareable_root / fmt::format("{:08X}.vk.libkeys", title_id));
++    // Pixel shader metadata from tools/lr_shader_scan.py: 'XEPM', count, (u64 hash, u32 header
++    // word 3) records - bit 1: parameter generation, bits 8-15: its interpolator.
++    if (FILE* file = rex::filesystem::OpenFile(
++            shader_storage_shareable_root / fmt::format("{:08X}.psmeta", title_id), "rb")) {
++      uint32_t header[2];
++      if (fread(header, sizeof(header), 1, file) && header[0] == 0x4D504558) {
++        for (uint32_t i = 0; i < header[1]; ++i) {
++          uint64_t hash;
++          uint32_t field;
++          if (!fread(&hash, sizeof(hash), 1, file) || !fread(&field, sizeof(field), 1, file)) {
++            break;
++          }
++          pixel_shader_meta_.emplace(hash, field);
++        }
++      }
++      fclose(file);
++    }
++    precompile_marker_path_ =
++        shader_storage_shareable_root / fmt::format("{:08X}.vk.libprecompiled", title_id);
++  }
+ 
+   const double storage_ms_read = storage_ms_since_start();
+   uint32_t storage_logical_processor_count = rex::thread::logical_processor_count();
+@@ -1005,9 +1055,29 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+   storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
+   assert_not_null(storage_write_thread_);
+   storage_write_thread_->set_name("Vulkan Storage writer");
++
++  if (uses_pipeline_libraries_ && !precompile_pixel_shaders_.empty() &&
++      !pixel_shader_meta_.empty()) {
++    precompile_shutdown_ = false;
++    precompile_thread_ = rex::thread::Thread::Create({}, [this]() { PrecompileThread(); });
++    if (precompile_thread_) {
++      precompile_thread_->set_name("Vulkan Library Precompile");
++    }
++  } else {
++    precompile_pixel_shaders_.clear();
++  }
+ }
+ 
+ void VulkanPipelineCache::ShutdownShaderStorage() {
++  if (precompile_thread_) {
++    precompile_shutdown_ = true;
++    rex::thread::Wait(precompile_thread_.get(), false);
++    precompile_thread_.reset();
++  }
++  if (library_keys_file_) {
++    fclose(library_keys_file_);
++    library_keys_file_ = nullptr;
++  }
+   if (storage_write_thread_) {
+     {
+       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+@@ -1172,9 +1242,18 @@ int64_t VulkanPipelineCache::GetDriverPipelineCacheSaveDelayMs() const {
+   }
+   uint64_t last_use_ms = std::max(
+       driver_pipeline_cache_last_use_ms_.load(std::memory_order_relaxed), first_unsaved_use_ms);
+-  // A few seconds after the last creation, or periodically while creations keep coming.
+-  uint64_t save_ms = std::min(last_use_ms + kDriverPipelineCacheSaveSettleMs,
+-                              first_unsaved_use_ms + kDriverPipelineCacheSaveMaxDelayMs);
++  // A few seconds after the last creation, or periodically while creations keep coming. A big
++  // cache (precompiled pipeline libraries: well over 100 MB) is rewritten whole by every save, so
++  // it waits for a longer quiet period and is saved at most every few minutes.
++  bool big = driver_pipeline_cache_saved_size_ > (size_t(32) << 20);
++  uint64_t settle_ms = big ? 30000 : kDriverPipelineCacheSaveSettleMs;
++  uint64_t max_delay_ms = big ? 180000 : kDriverPipelineCacheSaveMaxDelayMs;
++  if (driver_pipeline_cache_save_soon_.load(std::memory_order_relaxed)) {
++    settle_ms = kDriverPipelineCacheSaveSettleMs;
++    max_delay_ms = kDriverPipelineCacheSaveSettleMs;
++  }
++  uint64_t save_ms =
++      std::min(last_use_ms + settle_ms, first_unsaved_use_ms + max_delay_ms);
+   uint64_t now_ms = GetDriverPipelineCacheClockMs();
+   return save_ms > now_ms ? int64_t(save_ms - now_ms) : 0;
+ }
+@@ -1191,17 +1270,31 @@ void VulkanPipelineCache::SaveDriverPipelineCache() {
+   std::lock_guard<std::mutex> lock(driver_pipeline_cache_save_mutex_);
+   // Creations from now on are for the next save.
+   driver_pipeline_cache_first_unsaved_use_ms_.store(0, std::memory_order_relaxed);
++  driver_pipeline_cache_save_soon_.store(false, std::memory_order_relaxed);
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
++  // Library keys created before the data is fetched are covered by this save.
++  std::vector<uint64_t> saved_library_keys;
++  {
++    std::lock_guard<std::mutex> libraries_lock(pipeline_libraries_mutex_);
++    saved_library_keys.swap(unsaved_library_keys_);
++  }
++  auto restore_library_keys = [&]() {
++    std::lock_guard<std::mutex> libraries_lock(pipeline_libraries_mutex_);
++    unsaved_library_keys_.insert(unsaved_library_keys_.end(), saved_library_keys.begin(),
++                                 saved_library_keys.end());
++  };
+   // Getting the data is internally synchronized with pipeline creation by other threads.
+   size_t data_size = 0;
+   if (dfn.vkGetPipelineCacheData(device, device_pipeline_cache, &data_size, nullptr) !=
+           VK_SUCCESS ||
+       !data_size) {
++    restore_library_keys();
+     return;
+   }
+   if (data_size == driver_pipeline_cache_saved_size_) {
+     // Only cache hits since the last load or save.
++    restore_library_keys();
+     return;
+   }
+   std::vector<uint8_t> data(data_size);
+@@ -1212,6 +1305,7 @@ void VulkanPipelineCache::SaveDriverPipelineCache() {
+       // Grew in between - retry on the next round.
+       MarkDriverPipelineCacheUsed();
+     }
++    restore_library_keys();
+     return;
+   }
+   data.resize(data_size);
+@@ -1231,8 +1325,14 @@ void VulkanPipelineCache::SaveDriverPipelineCache() {
+     std::filesystem::remove(temp_path, error_code);
+     REXGPU_WARN("VulkanPipelineCache: Failed to save the driver pipeline cache to {}",
+                 rex::path_to_utf8(driver_pipeline_cache_path_));
++    restore_library_keys();
+     return;
+   }
++  if (library_keys_file_ && !saved_library_keys.empty()) {
++    fwrite(saved_library_keys.data(), sizeof(uint64_t), saved_library_keys.size(),
++           library_keys_file_);
++    fflush(library_keys_file_);
++  }
+   driver_pipeline_cache_saved_size_ = data.size();
+   REXGPU_INFO("VulkanPipelineCache: Saved the driver pipeline cache: {} KB to {}",
+               data.size() / 1024, rex::path_to_utf8(driver_pipeline_cache_path_));
+@@ -1328,6 +1428,15 @@ void VulkanPipelineCache::Shutdown() {
+     }
+   }
+   pipelines_.clear();
++  {
++    std::lock_guard<std::mutex> lock(pipeline_libraries_mutex_);
++    for (const auto& library_pair : pipeline_libraries_) {
++      if (library_pair.second != VK_NULL_HANDLE) {
++        dfn.vkDestroyPipeline(device, library_pair.second, nullptr);
++      }
++    }
++    pipeline_libraries_.clear();
++  }
+ 
+   // Destroy all internal shaders.
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+@@ -1691,7 +1800,24 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   }
+ 
+   bool queued_async_creation = false;
+-  if (use_async && never_block) {
++  bool linked_from_cached_libraries = false;
++  if (uses_pipeline_libraries_) {
++    // Every library already exists or is a driver cache hit: a fast link right here, no pending
++    // draws and no held frame.
++    auto link_start = std::chrono::steady_clock::now();
++    if (EnsurePipelineCreatedFromLibraries(creation_arguments_real, true)) {
++      linked_from_cached_libraries = true;
++      counter_pipelines_linked_sync_.fetch_add(1, std::memory_order_relaxed);
++      counter_pipelines_linked_sync_us_.fetch_add(
++          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                       std::chrono::steady_clock::now() - link_start)
++                       .count()),
++          std::memory_order_relaxed);
++    }
++  }
++  if (linked_from_cached_libraries) {
++    // Published by EnsurePipelineCreatedFromLibraries.
++  } else if (use_async && never_block) {
+     // Pending until a creation thread publishes it (is_placeholder with a null pipeline).
+     creation_arguments_real.priority = async_priority;
+     pipeline.second.is_placeholder.store(true, std::memory_order_release);
+@@ -1721,7 +1847,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     }
+   }
+ 
+-  if (!queued_async_creation) {
++  if (!queued_async_creation && !linked_from_cached_libraries) {
+     auto sync_start = std::chrono::steady_clock::now();
+     if (!EnsurePipelineCreated(creation_arguments_real)) {
+       pipelines_.erase(description);
+@@ -1766,9 +1892,29 @@ VulkanPipelineCache::DrawTimeCounters VulkanPipelineCache::TakeDrawTimeCounters(
+   counters.pipelines_sync_us = counter_pipelines_sync_us_.exchange(0, std::memory_order_relaxed);
+   counters.translations = counter_translations_.exchange(0, std::memory_order_relaxed);
+   counters.translations_us = counter_translations_us_.exchange(0, std::memory_order_relaxed);
++  counters.libraries_created = counter_libraries_created_.exchange(0, std::memory_order_relaxed);
++  counters.libraries_created_us =
++      counter_libraries_created_us_.exchange(0, std::memory_order_relaxed);
++  counters.pipelines_linked = counter_pipelines_linked_.exchange(0, std::memory_order_relaxed);
++  counters.pipelines_linked_us =
++      counter_pipelines_linked_us_.exchange(0, std::memory_order_relaxed);
++  counters.pipelines_linked_sync =
++      counter_pipelines_linked_sync_.exchange(0, std::memory_order_relaxed);
++  counters.pipelines_linked_sync_us =
++      counter_pipelines_linked_sync_us_.exchange(0, std::memory_order_relaxed);
+   return counters;
+ }
+ 
++const VulkanPipelineCache::PipelineDynamicState* VulkanPipelineCache::GetPipelineDynamicState(
++    void* handle) const {
++  if (!handle) {
++    return nullptr;
++  }
++  const auto* pipeline = reinterpret_cast<const Pipeline*>(handle);
++  return pipeline->uses_dynamic_state.load(std::memory_order_acquire) ? &pipeline->dynamic_state
++                                                                       : nullptr;
++}
++
+ bool VulkanPipelineCache::IsCreatingPipelines() const {
+   std::lock_guard<std::mutex> lock(creation_request_lock_);
+   if (creation_threads_.empty()) {
+@@ -3598,6 +3744,594 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
+   return true;
+ }
+ 
++namespace {
++uint64_t FragmentLibraryKeyHash(uint64_t pixel_shader_hash, uint64_t pixel_shader_variant,
++                                const VkPipelineMultisampleStateCreateInfo& multisample) {
++  struct {
++    uint32_t kind = 3;
++    uint32_t samples;
++    uint32_t sample_mask;
++    uint32_t sample_shading;
++    uint64_t pixel_shader_hash;
++    uint64_t pixel_shader_variant;
++  } key;
++  key.samples = uint32_t(multisample.rasterizationSamples);
++  key.sample_mask = multisample.pSampleMask ? *multisample.pSampleMask : UINT32_MAX;
++  key.sample_shading = multisample.sampleShadingEnable;
++  key.pixel_shader_hash = pixel_shader_hash;
++  key.pixel_shader_variant = pixel_shader_variant;
++  return XXH3_64bits(&key, sizeof(key));
++}
++}  // namespace
++
++bool VulkanPipelineCache::IsLibraryAvailable(uint64_t key_hash) {
++  std::lock_guard<std::mutex> lock(pipeline_libraries_mutex_);
++  return pipeline_libraries_.count(key_hash) || known_library_keys_.count(key_hash);
++}
++
++void VulkanPipelineCache::LoadLibraryKeys(const std::filesystem::path& path) {
++  // 'XELK', vendor, device, pipelineCacheUUID[16], then u64 key hashes (appended as created).
++  const ui::vulkan::VulkanDevice::Properties& properties =
++      command_processor_.GetVulkanDevice()->properties();
++  uint8_t header[28];
++  uint32_t magic = 0x4B4C4558;
++  std::memcpy(header, &magic, 4);
++  std::memcpy(header + 4, &properties.vendorID, 4);
++  std::memcpy(header + 8, &properties.deviceID, 4);
++  std::memcpy(header + 12, properties.pipelineCacheUUID, 16);
++  std::vector<uint8_t> data;
++  if (FILE* file = rex::filesystem::OpenFile(path, "rb")) {
++    rex::filesystem::Seek(file, 0, SEEK_END);
++    int64_t size = rex::filesystem::Tell(file);
++    rex::filesystem::Seek(file, 0, SEEK_SET);
++    if (size >= int64_t(sizeof(header)) && size < (int64_t(64) << 20)) {
++      data.resize(size_t(size));
++      if (fread(data.data(), 1, data.size(), file) != data.size()) {
++        data.clear();
++      }
++    }
++    fclose(file);
++  }
++  bool valid = data.size() >= sizeof(header) && !std::memcmp(data.data(), header, sizeof(header));
++  if (valid) {
++    for (size_t offset = sizeof(header); offset + 8 <= data.size(); offset += 8) {
++      uint64_t key_hash;
++      std::memcpy(&key_hash, data.data() + offset, 8);
++      known_library_keys_.insert(key_hash);
++    }
++    library_keys_file_ = OpenStorageFileForAppend(path);
++  } else {
++    library_keys_file_ = rex::filesystem::OpenFile(path, "wb");
++    if (library_keys_file_) {
++      fwrite(header, 1, sizeof(header), library_keys_file_);
++      fflush(library_keys_file_);
++    }
++  }
++  REXGPU_INFO("VulkanPipelineCache: {} pipeline libraries known in the driver cache{}",
++              known_library_keys_.size(), valid ? "" : " (new list for this driver build)");
++}
++
++VkPipeline VulkanPipelineCache::GetOrCreatePipelineLibrary(
++    const void* key, size_t key_size, VkGraphicsPipelineCreateInfo& create_info,
++    VkGraphicsPipelineLibraryFlagsEXT library_flags, bool only_if_cached) {
++  return GetOrCreatePipelineLibraryByHash(XXH3_64bits(key, key_size), create_info, library_flags,
++                                          only_if_cached);
++}
++
++VkPipeline VulkanPipelineCache::GetOrCreatePipelineLibraryByHash(
++    uint64_t key_hash, VkGraphicsPipelineCreateInfo& create_info,
++    VkGraphicsPipelineLibraryFlagsEXT library_flags, bool only_if_cached) {
++  {
++    std::lock_guard<std::mutex> lock(pipeline_libraries_mutex_);
++    auto it = pipeline_libraries_.find(key_hash);
++    if (it != pipeline_libraries_.end()) {
++      return it->second;
++    }
++    if (only_if_cached && !known_library_keys_.count(key_hash)) {
++      return VK_NULL_HANDLE;
++    }
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  VkGraphicsPipelineLibraryCreateInfoEXT library_info = {
++      VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
++  library_info.pNext = create_info.pNext;
++  library_info.flags = library_flags;
++  create_info.pNext = &library_info;
++  create_info.flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
++  auto start = std::chrono::steady_clock::now();
++  VkPipeline library = VK_NULL_HANDLE;
++  VkResult result = vulkan_device->functions().vkCreateGraphicsPipelines(
++      vulkan_device->device(), vulkan_device->pipeline_cache(), 1, &create_info, nullptr,
++      &library);
++  create_info.pNext = library_info.pNext;
++  if (result != VK_SUCCESS) {
++    REXGPU_ERROR("VulkanPipelineCache: failed to create a pipeline library (flags 0x{:X}, {})",
++                 uint32_t(library_flags), int32_t(result));
++    return VK_NULL_HANDLE;
++  }
++  MarkDriverPipelineCacheUsed();
++  counter_libraries_created_.fetch_add(1, std::memory_order_relaxed);
++  counter_libraries_created_us_.fetch_add(
++      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                   std::chrono::steady_clock::now() - start)
++                   .count()),
++      std::memory_order_relaxed);
++  std::lock_guard<std::mutex> lock(pipeline_libraries_mutex_);
++  auto emplaced = pipeline_libraries_.emplace(key_hash, library);
++  if (!emplaced.second) {
++    // Created concurrently by another thread - keep the first one.
++    vulkan_device->functions().vkDestroyPipeline(vulkan_device->device(), library, nullptr);
++    return emplaced.first->second;
++  }
++  // Recorded in the key list only once a saved driver cache contains it (SaveDriverPipelineCache),
++  // so the list never claims a library the cache on disk can't produce.
++  if (known_library_keys_.insert(key_hash).second) {
++    unsaved_library_keys_.push_back(key_hash);
++  }
++  return library;
++}
++
++VkPipeline VulkanPipelineCache::GetOrCreateFragmentLibrary(
++    uint64_t key_hash, VkShaderModule fragment_module, VkPipelineLayout layout,
++    const VkPipelineMultisampleStateCreateInfo& multisample) {
++  VkPipelineRenderingCreateInfo view_mask_rendering = {
++      VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++  VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++  stage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
++  stage.module = fragment_module;
++  stage.pName = "main";
++  VkPipelineDepthStencilStateCreateInfo depth_stencil_state = {
++      VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
++  static const VkDynamicState kDynamicStates[] = {
++      VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,  VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
++      VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,   VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
++      VK_DYNAMIC_STATE_STENCIL_OP,         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
++      VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
++  };
++  VkPipelineDynamicStateCreateInfo dynamic_state = {
++      VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++  dynamic_state.dynamicStateCount = uint32_t(rex::countof(kDynamicStates));
++  dynamic_state.pDynamicStates = kDynamicStates;
++  VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++  info.pNext = &view_mask_rendering;
++  info.stageCount = fragment_module != VK_NULL_HANDLE ? 1 : 0;
++  info.pStages = fragment_module != VK_NULL_HANDLE ? &stage : nullptr;
++  info.pDepthStencilState = &depth_stencil_state;
++  info.pMultisampleState = &multisample;
++  info.pDynamicState = &dynamic_state;
++  info.layout = layout;
++  return GetOrCreatePipelineLibraryByHash(key_hash, info,
++                                          VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT,
++                                          false);
++}
++
++bool VulkanPipelineCache::EnsurePipelineCreatedFromLibraries(
++    const PipelineCreationArguments& creation_arguments, bool only_if_cached) {
++  const PipelineDescription& description = creation_arguments.pipeline->first;
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++
++  if (description.primitive_topology == PipelinePrimitiveTopology::kPatchList) {
++    static bool tessellation_logged = false;
++    if (!tessellation_logged) {
++      tessellation_logged = true;
++      REXGPU_WARN("VulkanPipelineCache: tessellated draws are not supported with pipeline "
++                  "libraries (vulkan_pipeline_libraries); skipping them");
++    }
++    return false;
++  }
++  assert_true(creation_arguments.vertex_shader->is_translated());
++  if (!creation_arguments.vertex_shader->is_valid()) {
++    return false;
++  }
++  const PipelineLayoutProvider* layout_provider = creation_arguments.pipeline_layout;
++  VkPipelineLayout pre_rasterization_layout = layout_provider->GetPreRasterizationLibraryLayout();
++  VkPipelineLayout fragment_layout = layout_provider->GetFragmentLibraryLayout();
++  if (pre_rasterization_layout == VK_NULL_HANDLE || fragment_layout == VK_NULL_HANDLE) {
++    return false;
++  }
++  auto link_start = std::chrono::steady_clock::now();
++
++  // Shared pieces.
++  VkPipelineRenderingCreateInfo view_mask_rendering = {
++      VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++  view_mask_rendering.viewMask = 0;
++
++  // Multisample state (identical in the fragment shader and output libraries).
++  const auto& rp_key = description.render_pass_key;
++  bool has_attachments = rp_key.depth_and_color_used != 0;
++  VkSampleMask sample_mask = UINT32_MAX;
++  VkPipelineMultisampleStateCreateInfo multisample_state = {
++      VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++  bool sample_mask_used = false;
++  if (description.rasterizer_discard || !has_attachments) {
++    multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++  } else if (rp_key.msaa_samples == xenos::MsaaSamples::k2X &&
++             !render_target_cache_.IsMsaa2xSupported(has_attachments)) {
++    multisample_state.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
++    sample_mask = 0b1001;
++    multisample_state.pSampleMask = &sample_mask;
++    sample_mask_used = true;
++  } else {
++    multisample_state.rasterizationSamples =
++        VkSampleCountFlagBits(uint32_t(1) << uint32_t(rp_key.msaa_samples));
++  }
++  if (description.sample_rate_shading &&
++      multisample_state.rasterizationSamples != VK_SAMPLE_COUNT_1_BIT) {
++    multisample_state.sampleShadingEnable = VK_TRUE;
++    multisample_state.minSampleShading = 1.0f;
++  }
++
++  // 1. Vertex input interface: topology and primitive restart (no vertex buffers - the shaders
++  // fetch from the shared memory).
++  VkPipeline vertex_input_library;
++  {
++    VkPrimitiveTopology topology;
++    switch (description.primitive_topology) {
++      case PipelinePrimitiveTopology::kPointList:
++        topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++        break;
++      case PipelinePrimitiveTopology::kLineList:
++        topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
++        break;
++      case PipelinePrimitiveTopology::kLineStrip:
++        topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
++        break;
++      case PipelinePrimitiveTopology::kTriangleList:
++        topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++        break;
++      case PipelinePrimitiveTopology::kTriangleStrip:
++        topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;
++        break;
++      case PipelinePrimitiveTopology::kLineListWithAdjacency:
++        topology = VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY;
++        break;
++      default:
++        return false;
++    }
++    struct {
++      uint32_t kind = 1;
++      uint32_t topology;
++      uint32_t primitive_restart;
++    } key;
++    key.topology = uint32_t(topology);
++    key.primitive_restart = description.primitive_restart;
++    VkPipelineVertexInputStateCreateInfo vertex_input_state = {
++        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
++    VkPipelineInputAssemblyStateCreateInfo input_assembly_state = {
++        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
++    input_assembly_state.topology = topology;
++    input_assembly_state.primitiveRestartEnable =
++        description.primitive_restart ? VK_TRUE : VK_FALSE;
++    VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++    info.pVertexInputState = &vertex_input_state;
++    info.pInputAssemblyState = &input_assembly_state;
++    vertex_input_library = GetOrCreatePipelineLibrary(
++        &key, sizeof(key), info, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
++        only_if_cached);
++    if (vertex_input_library == VK_NULL_HANDLE) {
++      return false;
++    }
++  }
++
++  // 2. Pre-rasterization shaders: the vertex shader (and the primitive expansion geometry shader),
++  // rasterization state dynamic.
++  VkPipeline pre_rasterization_library;
++  {
++    // Stable across runs: the shader's ucode hash + modification determine its translation
++    // (and its texture set), the geometry shader key the expansion shader.
++    struct {
++      uint32_t kind = 2;
++      uint32_t geometry_shader_key = 0;
++      uint64_t vertex_shader_hash;
++      uint64_t vertex_shader_modification;
++    } key;
++    key.vertex_shader_hash = creation_arguments.vertex_shader->shader().ucode_data_hash();
++    key.vertex_shader_modification = description.vertex_shader_modification;
++    {
++      GeometryShaderKey geometry_shader_key;
++      if (GetGeometryShaderKey(
++              description.geometry_shader,
++              SpirvShaderTranslator::Modification(description.vertex_shader_modification),
++              SpirvShaderTranslator::Modification(description.pixel_shader_modification),
++              geometry_shader_key)) {
++        key.geometry_shader_key = geometry_shader_key.key;
++      }
++    }
++    VkPipelineShaderStageCreateInfo stages[2] = {};
++    uint32_t stage_count = 0;
++    stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++    stages[stage_count].stage = VK_SHADER_STAGE_VERTEX_BIT;
++    stages[stage_count].module = creation_arguments.vertex_shader->shader_module();
++    stages[stage_count].pName = "main";
++    ++stage_count;
++    if (creation_arguments.geometry_shader != VK_NULL_HANDLE) {
++      stages[stage_count].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
++      stages[stage_count].stage = VK_SHADER_STAGE_GEOMETRY_BIT;
++      stages[stage_count].module = creation_arguments.geometry_shader;
++      stages[stage_count].pName = "main";
++      ++stage_count;
++    }
++    VkPipelineViewportStateCreateInfo viewport_state = {
++        VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
++    viewport_state.viewportCount = 1;
++    viewport_state.scissorCount = 1;
++    VkPipelineRasterizationStateCreateInfo rasterization_state = {
++        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
++    rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
++    rasterization_state.cullMode = VK_CULL_MODE_NONE;
++    rasterization_state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
++    rasterization_state.lineWidth = 1.0f;
++    static const VkDynamicState kDynamicStates[] = {
++        VK_DYNAMIC_STATE_VIEWPORT,
++        VK_DYNAMIC_STATE_SCISSOR,
++        VK_DYNAMIC_STATE_DEPTH_BIAS,
++        VK_DYNAMIC_STATE_CULL_MODE,
++        VK_DYNAMIC_STATE_FRONT_FACE,
++        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
++        VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE,
++        VK_DYNAMIC_STATE_POLYGON_MODE_EXT,
++        VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT,
++    };
++    VkPipelineDynamicStateCreateInfo dynamic_state = {
++        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++    dynamic_state.dynamicStateCount = uint32_t(rex::countof(kDynamicStates));
++    dynamic_state.pDynamicStates = kDynamicStates;
++    VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++    info.pNext = &view_mask_rendering;
++    info.stageCount = stage_count;
++    info.pStages = stages;
++    info.pViewportState = &viewport_state;
++    info.pRasterizationState = &rasterization_state;
++    info.pDynamicState = &dynamic_state;
++    info.layout = pre_rasterization_layout;
++    pre_rasterization_library = GetOrCreatePipelineLibrary(
++        &key, sizeof(key), info, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
++        only_if_cached);
++    if (pre_rasterization_library == VK_NULL_HANDLE) {
++      return false;
++    }
++  }
++
++  // 3. Fragment shader: the pixel shader (or a depth-only helper), depth / stencil dynamic.
++  VkPipeline fragment_library;
++  {
++    VkShaderModule fragment_module = VK_NULL_HANDLE;
++    if (creation_arguments.pixel_shader) {
++      assert_true(creation_arguments.pixel_shader->is_translated());
++      if (!creation_arguments.pixel_shader->is_valid()) {
++        return false;
++      }
++      fragment_module = creation_arguments.pixel_shader->shader_module();
++    } else if (render_target_cache_.depth_float24_convert_in_pixel_shader() &&
++               (rp_key.depth_and_color_used & 1) &&
++               (description.depth_compare_op != xenos::CompareFunction::kAlways ||
++                description.depth_write_enable) &&
++               rp_key.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
++      fragment_module = render_target_cache_.depth_float24_round()
++                            ? depth_float24_round_fragment_shader_
++                            : depth_float24_truncate_fragment_shader_;
++      if (fragment_module == VK_NULL_HANDLE) {
++        return false;
++      }
++    }
++    uint64_t fragment_key_hash = FragmentLibraryKeyHash(
++        creation_arguments.pixel_shader
++            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
++            : 0,
++        creation_arguments.pixel_shader ? description.pixel_shader_modification
++        : fragment_module == VK_NULL_HANDLE ? 0
++        : fragment_module == depth_float24_round_fragment_shader_ ? 1
++                                                                 : 2,
++        multisample_state);
++    if (only_if_cached && !IsLibraryAvailable(fragment_key_hash)) {
++      return false;
++    }
++    fragment_library =
++        GetOrCreateFragmentLibrary(fragment_key_hash, fragment_module, fragment_layout,
++                                   multisample_state);
++    if (fragment_library == VK_NULL_HANDLE) {
++      return false;
++    }
++  }
++
++  // 4. Fragment output interface: attachment formats, blending dynamic.
++  VkPipeline fragment_output_library;
++  uint32_t color_rts_used = rp_key.depth_and_color_used >> 1;
++  uint32_t color_attachment_count = 32 - rex::lzcnt(color_rts_used);
++  {
++    VkFormat color_formats[xenos::kMaxColorRenderTargets] = {};
++    xenos::ColorRenderTargetFormat guest_color_formats[] = {
++        rp_key.color_0_view_format, rp_key.color_1_view_format, rp_key.color_2_view_format,
++        rp_key.color_3_view_format};
++    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
++      if (color_rts_used & (1 << i)) {
++        color_formats[i] = render_target_cache_.GetColorVulkanFormat(guest_color_formats[i]);
++      }
++    }
++    VkFormat depth_format = (rp_key.depth_and_color_used & 0b1)
++                                ? render_target_cache_.GetDepthVulkanFormat(rp_key.depth_format)
++                                : VK_FORMAT_UNDEFINED;
++    struct {
++      uint32_t kind = 4;
++      uint32_t samples;
++      uint32_t sample_mask;
++      uint32_t sample_shading;
++      uint32_t color_attachment_count;
++      uint32_t depth_format;
++      uint32_t color_formats[xenos::kMaxColorRenderTargets];
++    } key;
++    key.samples = uint32_t(multisample_state.rasterizationSamples);
++    key.sample_mask = sample_mask_used ? sample_mask : UINT32_MAX;
++    key.sample_shading = multisample_state.sampleShadingEnable;
++    key.color_attachment_count = color_attachment_count;
++    key.depth_format = uint32_t(depth_format);
++    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
++      key.color_formats[i] = uint32_t(color_formats[i]);
++    }
++    VkPipelineRenderingCreateInfo rendering = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
++    rendering.colorAttachmentCount = color_attachment_count;
++    rendering.pColorAttachmentFormats = color_attachment_count ? color_formats : nullptr;
++    rendering.depthAttachmentFormat = depth_format;
++    rendering.stencilAttachmentFormat = depth_format;
++    VkPipelineColorBlendAttachmentState attachments[xenos::kMaxColorRenderTargets] = {};
++    VkPipelineColorBlendStateCreateInfo color_blend_state = {
++        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
++    color_blend_state.attachmentCount = color_attachment_count;
++    color_blend_state.pAttachments = attachments;
++    static const VkDynamicState kDynamicStates[] = {
++        VK_DYNAMIC_STATE_BLEND_CONSTANTS,
++        VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,
++        VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
++        VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,
++    };
++    VkPipelineDynamicStateCreateInfo dynamic_state = {
++        VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
++    dynamic_state.dynamicStateCount = uint32_t(rex::countof(kDynamicStates));
++    dynamic_state.pDynamicStates = kDynamicStates;
++    VkGraphicsPipelineCreateInfo info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++    info.pNext = &rendering;
++    info.pColorBlendState = &color_blend_state;
++    info.pMultisampleState = &multisample_state;
++    info.pDynamicState = &dynamic_state;
++    fragment_output_library = GetOrCreatePipelineLibrary(
++        &key, sizeof(key), info, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT,
++        only_if_cached);
++    if (fragment_output_library == VK_NULL_HANDLE) {
++      return false;
++    }
++  }
++
++  // Dynamic state values of this pipeline.
++  PipelineDynamicState dynamic;
++  dynamic.cull_mode = VK_CULL_MODE_NONE;
++  if (description.cull_front) {
++    dynamic.cull_mode |= VK_CULL_MODE_FRONT_BIT;
++  }
++  if (description.cull_back) {
++    dynamic.cull_mode |= VK_CULL_MODE_BACK_BIT;
++  }
++  dynamic.front_face =
++      description.front_face_clockwise ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
++  if (description.depth_write_enable ||
++      description.depth_compare_op != xenos::CompareFunction::kAlways) {
++    dynamic.depth_test_enable = VK_TRUE;
++    dynamic.depth_write_enable = description.depth_write_enable ? VK_TRUE : VK_FALSE;
++    dynamic.depth_compare_op =
++        VkCompareOp(uint32_t(VK_COMPARE_OP_NEVER) + uint32_t(description.depth_compare_op));
++  }
++  if (description.stencil_test_enable) {
++    dynamic.stencil_test_enable = VK_TRUE;
++    dynamic.stencil_front_ops[0] =
++        VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_fail_op));
++    dynamic.stencil_front_ops[1] =
++        VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) + uint32_t(description.stencil_front_pass_op));
++    dynamic.stencil_front_ops[2] = VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) +
++                                               uint32_t(description.stencil_front_depth_fail_op));
++    dynamic.stencil_front_compare_op = VkCompareOp(
++        uint32_t(VK_COMPARE_OP_NEVER) + uint32_t(description.stencil_front_compare_op));
++    dynamic.stencil_back_ops[0] =
++        VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_fail_op));
++    dynamic.stencil_back_ops[1] =
++        VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) + uint32_t(description.stencil_back_pass_op));
++    dynamic.stencil_back_ops[2] = VkStencilOp(uint32_t(VK_STENCIL_OP_KEEP) +
++                                              uint32_t(description.stencil_back_depth_fail_op));
++    dynamic.stencil_back_compare_op = VkCompareOp(uint32_t(VK_COMPARE_OP_NEVER) +
++                                                  uint32_t(description.stencil_back_compare_op));
++  }
++  dynamic.depth_bias_enable = (rp_key.depth_and_color_used & 0b1) ? VK_TRUE : VK_FALSE;
++  dynamic.rasterizer_discard_enable = description.rasterizer_discard ? VK_TRUE : VK_FALSE;
++  switch (description.polygon_mode) {
++    case PipelinePolygonMode::kLine:
++      dynamic.polygon_mode = VK_POLYGON_MODE_LINE;
++      break;
++    case PipelinePolygonMode::kPoint:
++      dynamic.polygon_mode = VK_POLYGON_MODE_POINT;
++      break;
++    default:
++      dynamic.polygon_mode = VK_POLYGON_MODE_FILL;
++      break;
++  }
++  dynamic.depth_clamp_enable = description.depth_clamp_enable ? VK_TRUE : VK_FALSE;
++  dynamic.color_attachment_count = color_attachment_count;
++  {
++    static const VkBlendFactor kBlendFactorMap[] = {
++        VK_BLEND_FACTOR_ZERO,           VK_BLEND_FACTOR_ONE,
++        VK_BLEND_FACTOR_SRC_COLOR,      VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR,
++        VK_BLEND_FACTOR_DST_COLOR,      VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR,
++        VK_BLEND_FACTOR_SRC_ALPHA,      VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
++        VK_BLEND_FACTOR_DST_ALPHA,      VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,
++        VK_BLEND_FACTOR_CONSTANT_COLOR, VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR,
++        VK_BLEND_FACTOR_CONSTANT_ALPHA, VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA,
++        VK_BLEND_FACTOR_SRC_ALPHA_SATURATE,
++    };
++    static const VkBlendOp kBlendOpMap[] = {
++        VK_BLEND_OP_ADD, VK_BLEND_OP_SUBTRACT, VK_BLEND_OP_MIN, VK_BLEND_OP_MAX,
++        VK_BLEND_OP_REVERSE_SUBTRACT, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD, VK_BLEND_OP_ADD};
++    for (uint32_t i = 0; i < color_attachment_count; ++i) {
++      VkColorBlendEquationEXT& equation = dynamic.color_blend_equation[i];
++      equation.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
++      equation.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
++      equation.colorBlendOp = VK_BLEND_OP_ADD;
++      equation.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
++      equation.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
++      equation.alphaBlendOp = VK_BLEND_OP_ADD;
++      if (!(color_rts_used & (1 << i))) {
++        continue;
++      }
++      const PipelineRenderTarget& color_rt = description.render_targets[i];
++      if (color_rt.src_color_blend_factor != PipelineBlendFactor::kOne ||
++          color_rt.dst_color_blend_factor != PipelineBlendFactor::kZero ||
++          color_rt.color_blend_op != xenos::BlendOp::kAdd ||
++          color_rt.src_alpha_blend_factor != PipelineBlendFactor::kOne ||
++          color_rt.dst_alpha_blend_factor != PipelineBlendFactor::kZero ||
++          color_rt.alpha_blend_op != xenos::BlendOp::kAdd) {
++        dynamic.color_blend_enable[i] = VK_TRUE;
++        equation.srcColorBlendFactor = kBlendFactorMap[uint32_t(color_rt.src_color_blend_factor)];
++        equation.dstColorBlendFactor = kBlendFactorMap[uint32_t(color_rt.dst_color_blend_factor)];
++        equation.colorBlendOp = kBlendOpMap[uint32_t(color_rt.color_blend_op)];
++        equation.srcAlphaBlendFactor = kBlendFactorMap[uint32_t(color_rt.src_alpha_blend_factor)];
++        equation.dstAlphaBlendFactor = kBlendFactorMap[uint32_t(color_rt.dst_alpha_blend_factor)];
++        equation.alphaBlendOp = kBlendOpMap[uint32_t(color_rt.alpha_blend_op)];
++      }
++      dynamic.color_write_mask[i] = VkColorComponentFlags(color_rt.color_write_mask);
++    }
++  }
++
++  // Fast link.
++  VkPipeline libraries[] = {vertex_input_library, pre_rasterization_library, fragment_library,
++                            fragment_output_library};
++  VkPipelineLibraryCreateInfoKHR library_info = {VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
++  library_info.libraryCount = uint32_t(rex::countof(libraries));
++  library_info.pLibraries = libraries;
++  VkGraphicsPipelineCreateInfo link_info = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
++  link_info.pNext = &library_info;
++  link_info.layout = layout_provider->GetPipelineLayout();
++  VkPipeline pipeline = VK_NULL_HANDLE;
++  if (dfn.vkCreateGraphicsPipelines(device, vulkan_device->pipeline_cache(), 1, &link_info,
++                                    nullptr, &pipeline) != VK_SUCCESS) {
++    REXGPU_ERROR("VulkanPipelineCache: failed to link a pipeline from libraries (VS {:016X})",
++                 creation_arguments.vertex_shader->shader().ucode_data_hash());
++    return false;
++  }
++  counter_pipelines_linked_.fetch_add(1, std::memory_order_relaxed);
++  counter_pipelines_linked_us_.fetch_add(
++      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                   std::chrono::steady_clock::now() - link_start)
++                   .count()),
++      std::memory_order_relaxed);
++
++  Pipeline& pipeline_entry = creation_arguments.pipeline->second;
++  pipeline_entry.dynamic_state = dynamic;
++  pipeline_entry.uses_dynamic_state.store(true, std::memory_order_release);
++  pipeline_entry.pipeline_layout.store(creation_arguments.pipeline_layout,
++                                       std::memory_order_release);
++  pipeline_entry.pipeline.store(pipeline, std::memory_order_release);
++  pipeline_entry.is_placeholder.store(false, std::memory_order_release);
++  return true;
++}
++
+ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments& creation_arguments,
+                                                 VkShaderModule fragment_shader_override) {
+   VkPipeline existing_pipeline =
+@@ -3633,6 +4367,10 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     return false;
+   }
+ 
++  if (uses_pipeline_libraries_ && fragment_shader_override == VK_NULL_HANDLE) {
++    return EnsurePipelineCreatedFromLibraries(creation_arguments);
++  }
++
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+ 
+   bool edram_fragment_shader_interlock =
+@@ -4226,6 +4964,173 @@ void LowerPipelineCreationThreadPriority() {
+ }  // namespace
+ #endif
+ 
++void VulkanPipelineCache::PrecompileThread() {
++#if defined(__ANDROID__)
++  LowerPipelineCreationThreadPriority();
++#endif
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Properties& properties = vulkan_device->properties();
++  // Skip when this driver build already got the whole set (marker: UUID + shader count).
++  // Marker: driver pipeline cache UUID, shader count, precompile variant set version.
++  uint8_t marker[28];
++  std::memcpy(marker, properties.pipelineCacheUUID, 16);
++  uint64_t shader_count = precompile_pixel_shaders_.size();
++  std::memcpy(marker + 16, &shader_count, 8);
++  uint32_t precompile_version = 2;  // 2: 1x only (the game draws its pixel shaders at 1x).
++  std::memcpy(marker + 24, &precompile_version, 4);
++  if (FILE* file = rex::filesystem::OpenFile(precompile_marker_path_, "rb")) {
++    uint8_t existing[28];
++    bool done = fread(existing, sizeof(existing), 1, file) == 1 &&
++                !std::memcmp(existing, marker, sizeof(marker));
++    fclose(file);
++    if (done) {
++      REXGPU_INFO("VulkanPipelineCache: pipeline libraries for {} pixel shaders already "
++                  "precompiled for this driver",
++                  shader_count);
++      precompile_pixel_shaders_.clear();
++      return;
++    }
++  }
++  auto start = std::chrono::steady_clock::now();
++  bool edram_fragment_shader_interlock =
++      render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
++  std::atomic<size_t> next_index(0);
++  std::atomic<uint32_t> compiled(0), skipped(0), failed(0), already(0);
++  auto worker = [&]() {
++    SpirvShaderTranslator translator(
++        SpirvShaderTranslator::Features(vulkan_device),
++        render_target_cache_.msaa_2x_attachments_supported(),
++        render_target_cache_.msaa_2x_no_attachments_supported(), edram_fragment_shader_interlock,
++        render_target_cache_.draw_resolution_scale_x(),
++        render_target_cache_.draw_resolution_scale_y());
++    string::StringBuffer ucode_disasm_buffer;
++    VkPipelineMultisampleStateCreateInfo multisample = {
++        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
++    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++    while (!precompile_shutdown_) {
++      size_t index = next_index.fetch_add(1);
++      if (index >= precompile_pixel_shaders_.size()) {
++        break;
++      }
++      if (index && index % 1000 == 0) {
++        REXGPU_INFO("VulkanPipelineCache: precompiling pixel shader libraries, {} of {} ({} new)",
++                    index, precompile_pixel_shaders_.size(), compiled.load());
++      }
++      const PrecompileShader& entry = precompile_pixel_shaders_[index];
++      auto meta_it = pixel_shader_meta_.find(entry.hash);
++      if (meta_it == pixel_shader_meta_.end()) {
++        ++skipped;
++        continue;
++      }
++      VulkanShader shader(vulkan_device, xenos::ShaderType::kPixel, entry.hash,
++                          entry.ucode.data(), uint32_t(entry.ucode.size()));
++      shader.AnalyzeUcode(ucode_disasm_buffer);
++      if (shader.uses_register_dynamic_addressing()) {
++        ++skipped;
++        continue;
++      }
++      // The canonical modification the draws will request (GetCurrentPixelShaderModification and
++      // the canonical interpolator masks in IssueDraw).
++      uint32_t interpolator_count =
++          std::min(xenos::kMaxInterpolators, shader.register_static_address_bound());
++      uint32_t interpolator_mask = (UINT32_C(1) << interpolator_count) - 1;
++      uint32_t field = meta_it->second;
++      uint32_t param_gen_pos = (field >> 8) & 0xFF;
++      bool param_gen = (field & 0b10) && param_gen_pos < interpolator_count;
++      if (param_gen) {
++        interpolator_mask &= ~(UINT32_C(1) << param_gen_pos);
++      }
++      using DepthStencilMode = SpirvShaderTranslator::Modification::DepthStencilMode;
++      DepthStencilMode depth_modes[2];
++      uint32_t depth_mode_count = 0;
++      if (shader.implicit_early_z_write_allowed()) {
++        depth_modes[depth_mode_count++] = DepthStencilMode::kEarlyHint;
++        if (shader.writes_color_target(0)) {
++          // With alpha test / alpha to coverage.
++          depth_modes[depth_mode_count++] = DepthStencilMode::kNoModifiers;
++        }
++      } else {
++        depth_modes[depth_mode_count++] = DepthStencilMode::kNoModifiers;
++      }
++      for (uint32_t m = 0; m < depth_mode_count; ++m) {
++        SpirvShaderTranslator::Modification modification(
++            translator.GetDefaultPixelShaderModification(0));
++        modification.pixel.interpolator_mask = interpolator_mask;
++        modification.pixel.interpolators_centroid = 0;
++        if (param_gen) {
++          modification.pixel.param_gen_enable = 1;
++          modification.pixel.param_gen_interpolator = param_gen_pos;
++        }
++        modification.pixel.depth_stencil_mode = depth_modes[m];
++        uint64_t key_hash = FragmentLibraryKeyHash(entry.hash, modification.value, multisample);
++        if (IsLibraryAvailable(key_hash)) {
++          ++already;
++          continue;
++        }
++        auto* translation = static_cast<VulkanShader::VulkanTranslation*>(
++            shader.GetOrCreateTranslation(modification.value));
++        if (!translation->is_translated() && !TranslateAnalyzedShader(translator, *translation)) {
++          ++failed;
++          continue;
++        }
++        VkPipelineLayout layout = command_processor_.GetLibraryLayoutForTextures(
++            false, shader.GetTextureBindingsAfterTranslation().size(),
++            shader.GetSamplerBindingsAfterTranslation().size());
++        if (layout == VK_NULL_HANDLE || translation->shader_module() == VK_NULL_HANDLE) {
++          ++failed;
++          continue;
++        }
++        if (GetOrCreateFragmentLibrary(key_hash, translation->shader_module(), layout,
++                                       multisample) != VK_NULL_HANDLE) {
++          ++compiled;
++        } else {
++          ++failed;
++        }
++      }
++    }
++  };
++  // A few threads at a low priority, not on the slowest cores (see
++  // LowerPipelineCreationThreadPriority): the game's threads win any contended core.
++  uint32_t thread_count =
++      std::max(uint32_t(1), std::min(uint32_t(4), rex::thread::logical_processor_count() / 2));
++  std::vector<std::unique_ptr<rex::thread::Thread>> threads;
++  for (uint32_t i = 1; i < thread_count; ++i) {
++    threads.push_back(rex::thread::Thread::Create({}, [&worker]() {
++#if defined(__ANDROID__)
++      LowerPipelineCreationThreadPriority();
++#endif
++      worker();
++    }));
++    threads.back()->set_name("Vulkan Library Precompile");
++  }
++  worker();
++  for (const auto& thread : threads) {
++    rex::thread::Wait(thread.get(), false);
++  }
++  bool finished = !precompile_shutdown_;
++  REXGPU_INFO("VulkanPipelineCache: pixel shader library precompile {}: {} libraries compiled, "
++              "{} shader variants already done, {} shaders skipped (no metadata / dynamic "
++              "registers), {} failed, {:.1f} s on {} threads",
++              finished ? "finished" : "stopped", compiled.load(), already.load(), skipped.load(),
++              failed.load(),
++              double(std::chrono::duration_cast<std::chrono::milliseconds>(
++                         std::chrono::steady_clock::now() - start)
++                         .count()) /
++                  1000.0,
++              thread_count);
++  if (finished) {
++    if (FILE* file = rex::filesystem::OpenFile(precompile_marker_path_, "wb")) {
++      fwrite(marker, sizeof(marker), 1, file);
++      fclose(file);
++    }
++    // The driver cache now holds the libraries: save it soon.
++    MarkDriverPipelineCacheUsed();
++    driver_pipeline_cache_save_soon_.store(true, std::memory_order_relaxed);
++  }
++  precompile_pixel_shaders_.clear();
++  precompile_pixel_shaders_.shrink_to_fit();
++}
++
+ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+ #if defined(__ANDROID__)
+   LowerPipelineCreationThreadPriority();

@@ -1,0 +1,174 @@
+From 552f39649eaa830c6a8e3680a10484fb225c0b57 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Wed, 11 Nov 2026 10:37:45 +0800
+Subject: [PATCH 098/108] gpu: boot precompile builds the shaders used in play
+ first (stored pipelines), saves them at once; thread-count cvars
+
+
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 538a871..bbbc159 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -525,6 +525,10 @@ class VulkanPipelineCache {
+     std::vector<uint32_t> ucode;
+   };
+   std::vector<PrecompileShader> precompile_pixel_shaders_;
++  // The first precompile_priority_count_ entries are the pixel shaders of the stored pipelines
++  // (.xpso: used in play on this device or on the one its shader cache came from), in first-use
++  // order; the app's notice covers only them.
++  size_t precompile_priority_count_ = 0;
+   std::unordered_map<uint64_t, uint32_t> pixel_shader_meta_;
+   std::unique_ptr<rex::thread::Thread> precompile_thread_;
+   std::atomic<bool> precompile_shutdown_{false};
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index e81f64c..ff88d36 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -122,6 +122,18 @@ REXCVAR_DEFINE_INT32(vulkan_precompile_in_game, 2, "GPU/Vulkan",
+     .range(0, 2)
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_INT32(vulkan_precompile_threads, 0, "GPU/Vulkan",
++                     "Threads for the boot pipeline library precompile (on Android: on the faster "
++                     "CPU clusters); 0 = min(4, logical processors / 2)")
++    .range(0, 16)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++REXCVAR_DEFINE_INT32(vulkan_precompile_little_threads, 0, "GPU/Vulkan",
++                     "Android: extra boot precompile threads on the slowest CPU cluster (idle at "
++                     "the title)")
++    .range(0, 8)
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -1096,6 +1108,29 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+ 
+   if (uses_pipeline_libraries_ && !precompile_pixel_shaders_.empty() &&
+       !pixel_shader_meta_.empty()) {
++    // Pixel shaders used in play first, in first-use order (the stored pipelines): on the Thor
++    // ~540 of the 7,375 scanned shaders, ~25 s of the ~350 s precompile.
++    std::unordered_map<uint64_t, uint32_t> used_rank;
++    for (const PipelineStoredDescription& stored : pipeline_stored_descriptions) {
++      uint64_t hash = stored.description.pixel_shader_hash;
++      if (hash && pixel_shader_meta_.count(hash)) {
++        used_rank.emplace(hash, uint32_t(used_rank.size()));
++      }
++    }
++    std::stable_sort(precompile_pixel_shaders_.begin(), precompile_pixel_shaders_.end(),
++                     [&used_rank](const PrecompileShader& a, const PrecompileShader& b) {
++                       auto ia = used_rank.find(a.hash), ib = used_rank.find(b.hash);
++                       uint32_t ra = ia != used_rank.end() ? ia->second : UINT32_MAX;
++                       uint32_t rb = ib != used_rank.end() ? ib->second : UINT32_MAX;
++                       return ra < rb;
++                     });
++    precompile_priority_count_ = 0;
++    for (const PrecompileShader& entry : precompile_pixel_shaders_) {
++      if (!used_rank.count(entry.hash)) {
++        break;
++      }
++      ++precompile_priority_count_;
++    }
+     precompile_shutdown_ = false;
+     precompile_thread_ = rex::thread::Thread::Create({}, [this]() { PrecompileThread(); });
+     if (precompile_thread_) {
+@@ -5185,7 +5220,8 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+ 
+ #if defined(__ANDROID__)
+ // 1 once gameplay started (set by the game library); the boot precompile's progress in permille
+-// while it runs, else -1 (for the app's on-screen notice). Defined in the runtime
++// over the shaders used in play while they compile, -2 once they are done and the rest compiles
++// in the background, else -1 (for the app's on-screen notice). Defined in the runtime
+ // (xboxkrnl_threading.cpp) so that both libraries link them.
+ extern "C" volatile int rex_game_interactive;
+ extern "C" volatile int rex_precompile_permille;
+@@ -5287,6 +5323,45 @@ void VulkanPipelineCache::PrecompileThread() {
+   std::atomic<uint32_t> compiled(0), skipped(0), failed(0), already(0);
+   std::atomic<bool> moved_logged(false), stopped_in_game(false);
+   const size_t precompile_total = precompile_pixel_shaders_.size();
++  // The shaders used in play (sorted first): progress and "ready" for the app cover only them,
++  // the rest continues in the background (or after an interruption, at later launches).
++  const size_t priority_total =
++      precompile_priority_count_ ? std::min(precompile_priority_count_, precompile_total)
++                                 : precompile_total;
++  std::atomic<size_t> priority_done(0);
++  const std::function<void()> priority_item_done = [&]() {
++    size_t done = priority_done.fetch_add(1) + 1;
++#if defined(__ANDROID__)
++    rex_precompile_permille = done >= priority_total ? -2 : int(done * 1000 / priority_total);
++#endif
++    if (done == priority_total) {
++      // Save them right away (the regular schedule waits up to 30 s on a cold start, 3 min with a
++      // big cache): a player who starts the game and later swipes the app away (killed, no save at
++      // exit) would otherwise lose them and rebuild them at the next launch.
++      MarkDriverPipelineCacheUsed();
++      {
++        // Under the lock so the storage writer can't miss the wake-up between computing its
++        // (longer) wait and starting it.
++        std::lock_guard<std::mutex> lock(storage_write_request_lock_);
++        driver_pipeline_cache_save_soon_.store(true, std::memory_order_relaxed);
++      }
++      storage_write_request_cond_.notify_all();
++      REXGPU_INFO("VulkanPipelineCache: pixel shader libraries for the {} shaders used in play "
++                  "ready after {:.1f} s ({} new)",
++                  priority_total,
++                  double(std::chrono::duration_cast<std::chrono::milliseconds>(
++                             std::chrono::steady_clock::now() - start)
++                             .count()) /
++                      1000.0,
++                  compiled.load());
++    }
++  };
++  struct PriorityGuard {
++    const std::function<void()>* on_done;
++    ~PriorityGuard() {
++      if (on_done) (*on_done)();
++    }
++  };
+ #if defined(__ANDROID__)
+   rex_precompile_permille = 0;
+   const int in_game_mode = REXCVAR_GET(vulkan_precompile_in_game);
+@@ -5337,9 +5412,8 @@ void VulkanPipelineCache::PrecompileThread() {
+       if (index >= precompile_total) {
+         break;
+       }
+-#if defined(__ANDROID__)
+-      rex_precompile_permille = int(index * 1000 / precompile_total);
+-#endif
++      // Counts this entry towards the used-in-play set when the iteration ends (any path).
++      PriorityGuard priority_guard{index < priority_total ? &priority_item_done : nullptr};
+       if (index && index % 1000 == 0) {
+         REXGPU_INFO("VulkanPipelineCache: precompiling pixel shader libraries, {} of {} ({} new)",
+                     index, precompile_pixel_shaders_.size(), compiled.load());
+@@ -5420,17 +5494,26 @@ void VulkanPipelineCache::PrecompileThread() {
+   // A few threads at a low priority, not on the slowest cores (see
+   // LowerPipelineCreationThreadPriority): the game's threads win any contended core.
+   uint32_t thread_count =
+-      std::max(uint32_t(1), std::min(uint32_t(4), rex::thread::logical_processor_count() / 2));
++      REXCVAR_GET(vulkan_precompile_threads) > 0
++          ? uint32_t(REXCVAR_GET(vulkan_precompile_threads))
++          : std::max(uint32_t(1),
++                     std::min(uint32_t(4), rex::thread::logical_processor_count() / 2));
++  uint32_t little_thread_count = 0;
++#if defined(__ANDROID__)
++  little_thread_count = uint32_t(REXCVAR_GET(vulkan_precompile_little_threads));
++#endif
+   std::vector<std::unique_ptr<rex::thread::Thread>> threads;
+-  for (uint32_t i = 1; i < thread_count; ++i) {
+-    threads.push_back(rex::thread::Thread::Create({}, [&worker]() {
++  for (uint32_t i = 1; i < thread_count + little_thread_count; ++i) {
++    const bool little = i >= thread_count;
++    threads.push_back(rex::thread::Thread::Create({}, [&worker, little]() {
+ #if defined(__ANDROID__)
+-      LowerPipelineCreationThreadPriority();
++      LowerPipelineCreationThreadPriority(little);
+ #endif
+       worker();
+     }));
+     threads.back()->set_name("Vulkan Library Precompile");
+   }
++  thread_count += little_thread_count;
+   worker();
+   for (const auto& thread : threads) {
+     rex::thread::Wait(thread.get(), false);

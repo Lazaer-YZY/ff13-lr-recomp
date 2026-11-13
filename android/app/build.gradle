@@ -1,0 +1,89 @@
+plugins {
+    id 'com.android.application'
+}
+
+apply from: '../sdl-java.gradle'
+
+// Native libraries are built separately (ReXGlue/CMake, NDK) and dropped into
+// app/src/main/jniLibs/arm64-v8a/ by a staging script; there is no
+// externalNativeBuild here. Pass -PlrSkipNativeCheck=true to compile and
+// package the Java side without them.
+def jniLibsDir = file('src/main/jniLibs/arm64-v8a')
+def requiredLibraries = ['libmain.so', 'libSDL3.so', 'libc++_shared.so', 'librexruntime.so', 'librexgpu-xenos.so']
+// libadrenotools hook libraries: present only when the custom Vulkan driver loader is built.
+def optionalLibraries = ['libhook_impl.so', 'libmain_hook.so', 'libfile_redirect_hook.so', 'libgsl_alloc_hook.so']
+def skipNativeCheck = (project.findProperty('lrSkipNativeCheck') ?: 'false').toString().toBoolean()
+def checkNativeLibraries = tasks.register('checkNativeLibraries') {
+    onlyIf { !skipNativeCheck }
+    doLast {
+        def missing = requiredLibraries.findAll { !new File(jniLibsDir, it).isFile() }
+        if (!missing.isEmpty()) {
+            throw new GradleException("Missing native libraries in ${jniLibsDir}: ${missing.join(', ')}. " +
+                "Stage them with the native build script, or pass -PlrSkipNativeCheck=true to build the Java side only.")
+        }
+        fileTree(jniLibsDir).matching { include '**/*.so' }.each { library ->
+            if (!requiredLibraries.contains(library.name) && !optionalLibraries.contains(library.name)) {
+                logger.warn("Unrecognised staged native library: ${library.name}")
+            }
+        }
+    }
+}
+
+// -PlrVersionName=v0.8.0 gives versionName 0.8.0 and versionCode 80000
+// (major*1000000 + minor*10000 + patch), so updates install over each other.
+def lrVersionName = (project.findProperty('lrVersionName') ?: '0.1.0').toString().replaceFirst(/^v/, '')
+def lrVersionMatch = lrVersionName =~ /^(\d+)\.(\d+)\.(\d+)/
+def lrVersionCode = lrVersionMatch.find()
+    ? lrVersionMatch.group(1).toInteger() * 1000000 + lrVersionMatch.group(2).toInteger() * 10000 + lrVersionMatch.group(3).toInteger()
+    : 1
+// Signing: the app is debug-signed, always, for both build types (as Lost
+// Odyssey Recomp does). There is no release keystore to guard: users sideload
+// the APK, and a stable key across releases only needs LR_ANDROID_DEBUG_KEYSTORE
+// to point at the same keystore every time so updates install over each other;
+// unset, AGP's own debug keystore is used.
+def lrDebugKeystore = System.getenv('LR_ANDROID_DEBUG_KEYSTORE')
+
+android {
+    namespace 'com.lrrecomp.android'
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+    ndkVersion '28.2.13676358'
+    defaultConfig {
+        applicationId 'com.lrrecomp.android'
+        minSdk 26
+        targetSdk 35
+        versionCode lrVersionCode
+        versionName lrVersionName
+        ndk { abiFilters 'arm64-v8a' }
+    }
+    if (lrDebugKeystore) {
+        signingConfigs.debug.storeFile = file(lrDebugKeystore)
+    }
+    sourceSets.main {
+        java.srcDir layout.buildDirectory.dir('generated/sdl-java')
+    }
+    lint { lintConfig = file('../lint.xml') }
+    // Bottom-screen previews on the PC (CompanionPreviewTest, Robolectric native graphics):
+    // ./gradlew :app:testDebugUnitTest --tests '*CompanionPreviewTest*' -> app/build/companion_preview/
+    testOptions { unitTests { includeAndroidResources = true } }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    // Extracted native libraries: libadrenotools opens its hook libraries by
+    // path from nativeLibraryDir when a custom Vulkan driver is loaded.
+    packaging { jniLibs { useLegacyPackaging = true } }
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+}
+
+tasks.named('preBuild') { dependsOn checkNativeLibraries }
+dependencies {
+    implementation 'androidx.core:core:1.15.0'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+}

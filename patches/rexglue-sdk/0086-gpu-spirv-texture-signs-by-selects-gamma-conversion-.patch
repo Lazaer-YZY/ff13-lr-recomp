@@ -1,0 +1,147 @@
+From 3577e3db27a0c595af9f88962a9abb5f7f8b158d Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 16:55:04 +0800
+Subject: [PATCH 086/108] gpu: spirv: texture signs by selects, gamma
+ conversion in one uniform branch (default on); vertex-only multiply switch
+
+The per-component OpSwitch on the texture sign is lowered by Mesa to ifs that it
+flattens, so the piecewise-linear gamma conversion of every fetched component ran
+and was discarded for every texture. spirv_texture_sign_branch (on): signed and
+biased components by selects, the gamma conversion inside one uniform
+DontFlatten branch taken when any used component is gamma. Same results. Idea
+from Xendroid+ (phforner0/Xendroid-Plus, spirv_texture_sign_branch), written anew.
+Thor (Turnip, 60 fps mode, Ark screen view): 21.3 -> 18.8 ms per frame, GPU work
+13.84 -> 12.09 Mcycles per frame, same image.
+
+vulkan_shader_xenos_multiply_vertex (on): off drops the 0 * x = 0 emulation in
+vertex shaders only (for A/B).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/pipeline/shader/spirv_translator_alu.cpp b/src/graphics/pipeline/shader/spirv_translator_alu.cpp
+index efc2365..667ab80 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_alu.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_alu.cpp
+@@ -26,13 +26,19 @@ REXCVAR_DEFINE_BOOL(vulkan_shader_xenos_multiply, true, "GPU/Vulkan",
+                     "and NaN) in translated shaders. Turning it off saves ALU work but may "
+                     "produce NaN / infinity where the guest got zero. Experimental; takes effect "
+                     "for shaders translated afterwards.");
++REXCVAR_DEFINE_BOOL(vulkan_shader_xenos_multiply_vertex, true, "GPU/Vulkan",
++                    "vulkan_shader_xenos_multiply for vertex shaders. Off: vertex shaders multiply "
++                    "with host rules (for finite operands only the sign of a zero product may "
++                    "differ, so positions computed by different shaders still match; Xendroid+ "
++                    "measured a third of the main-pass vertex shader instructions saved).");
+ 
+ namespace rex::graphics {
+ 
+ spv::Id SpirvShaderTranslator::ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs,
+                                                       spv::Id operand_1_abs) {
+   EnsureBuildPointAvailable();
+-  if (!REXCVAR_GET(vulkan_shader_xenos_multiply)) {
++  if (!REXCVAR_GET(vulkan_shader_xenos_multiply) ||
++      (is_vertex_shader() && !REXCVAR_GET(vulkan_shader_xenos_multiply_vertex))) {
+     return value;
+   }
+   int num_components = builder_->getNumComponents(value);
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 2c94e3c..4cf7e4d 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -23,6 +23,12 @@
+ #include <rex/math.h>
+ #include <rex/cvar.h>
+ 
++REXCVAR_DEFINE_BOOL(spirv_texture_sign_branch, true, "GPU/Vulkan",
++                    "Texture fetch results: signed and biased components by selects, and the "
++                    "piecewise-linear gamma conversion only inside one uniform branch taken when "
++                    "a used component is gamma, instead of a per-component switch (which Mesa "
++                    "flattens, running the gamma conversion for every fetched component). Same "
++                    "results. Takes effect for shaders translated afterwards.");
+ REXCVAR_DEFINE_BOOL(vulkan_texture_fetch_implicit_lod, true, "GPU/Vulkan",
+                     "Sample pixel shader texture fetches with a computed LOD (except 3D / stacked "
+                     "textures and register gradients) with implicit derivatives and the fetch "
+@@ -1959,7 +1965,83 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         // to gamma-correct.
+         spv::Id const_float_2 = builder_->makeFloatConstant(2.0f);
+         spv::Id const_float_minus_1 = builder_->makeFloatConstant(-1.0f);
+-        {
++        if (REXCVAR_GET(spirv_texture_sign_branch)) {
++          // Signed and biased components by selects; the piecewise-linear gamma conversion only
++          // inside one uniform, non-flattened branch taken when any used component is gamma. The
++          // per-component OpSwitch below is lowered by Mesa to ifs that it flattens, so the gamma
++          // conversion of every fetched component ran (and was discarded) for every texture.
++          spv::Id component_unsigned[4] = {};
++          spv::Id component_is_gamma[4] = {};
++          spv::Id any_gamma = spv::NoResult;
++          uint32_t result_remaining_components = used_result_nonzero_components;
++          uint32_t result_component_index;
++          while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {
++            result_remaining_components &= ~(UINT32_C(1) << result_component_index);
++            spv::Id sign = swizzled_signs[result_component_index];
++            spv::Id component_value =
++                features_.image_view_format_swizzle
++                    ? builder_->createCompositeExtract(sample_result_unsigned, type_float_,
++                                                       result_component_index)
++                    : result[result_component_index];
++            component_unsigned[result_component_index] = component_value;
++            if (features_.image_view_format_swizzle) {
++              component_value = builder_->createTriOp(
++                  spv::OpSelect, type_float_,
++                  builder_->createBinOp(spv::OpIEqual, type_bool_, sign,
++                                        builder_->makeUintConstant(
++                                            uint32_t(xenos::TextureSign::kSigned))),
++                  builder_->createCompositeExtract(sample_result_signed, type_float_,
++                                                   result_component_index),
++                  component_value);
++            }
++            spv::Id component_biased = builder_->createNoContractionBinOp(
++                spv::OpFAdd, type_float_,
++                builder_->createNoContractionBinOp(spv::OpFMul, type_float_,
++                                                   component_unsigned[result_component_index],
++                                                   const_float_2),
++                const_float_minus_1);
++            component_value = builder_->createTriOp(
++                spv::OpSelect, type_float_,
++                builder_->createBinOp(
++                    spv::OpIEqual, type_bool_, sign,
++                    builder_->makeUintConstant(uint32_t(xenos::TextureSign::kUnsignedBiased))),
++                component_biased, component_value);
++            result[result_component_index] = component_value;
++            spv::Id is_gamma = builder_->createBinOp(
++                spv::OpIEqual, type_bool_, sign,
++                builder_->makeUintConstant(uint32_t(xenos::TextureSign::kGamma)));
++            component_is_gamma[result_component_index] = is_gamma;
++            any_gamma = any_gamma != spv::NoResult
++                            ? builder_->createBinOp(spv::OpLogicalOr, type_bool_, any_gamma,
++                                                    is_gamma)
++                            : is_gamma;
++          }
++          if (any_gamma != spv::NoResult) {
++            spv::Id gamma_results[4] = {};
++            SpirvBuilder::IfBuilder if_any_gamma(any_gamma, spv::SelectionControlDontFlattenMask,
++                                                 *builder_);
++            {
++              uint32_t gamma_remaining_components = used_result_nonzero_components;
++              uint32_t gamma_component_index;
++              while (rex::bit_scan_forward(gamma_remaining_components, &gamma_component_index)) {
++                gamma_remaining_components &= ~(UINT32_C(1) << gamma_component_index);
++                spv::Id gamma_value =
++                    PWLGammaToLinear(component_unsigned[gamma_component_index], false);
++                gamma_results[gamma_component_index] = builder_->createTriOp(
++                    spv::OpSelect, type_float_, component_is_gamma[gamma_component_index],
++                    gamma_value, result[gamma_component_index]);
++              }
++            }
++            if_any_gamma.makeEndIf();
++            uint32_t gamma_remaining_components = used_result_nonzero_components;
++            uint32_t gamma_component_index;
++            while (rex::bit_scan_forward(gamma_remaining_components, &gamma_component_index)) {
++              gamma_remaining_components &= ~(UINT32_C(1) << gamma_component_index);
++              result[gamma_component_index] = if_any_gamma.createMergePhi(
++                  gamma_results[gamma_component_index], result[gamma_component_index]);
++            }
++          }
++        } else {
+           uint32_t result_remaining_components = used_result_nonzero_components;
+           uint32_t result_component_index;
+           while (rex::bit_scan_forward(result_remaining_components, &result_component_index)) {

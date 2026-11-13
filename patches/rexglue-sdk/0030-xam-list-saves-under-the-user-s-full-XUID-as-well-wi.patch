@@ -1,0 +1,86 @@
+From f7d44cd208bc63c4a6f6bf44bd5250a0670f8b1e Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:48:26 +0800
+Subject: [PATCH 030/108] xam: list saves under the user's full XUID as well,
+ without duplicates (behaviour informed by lr-ffxiii-port's Android patch,
+ re-implemented)
+
+XamContentAggregateCreateEnumerator listed content for the passed XUID and
+common content (0). Lightning Returns passes the user's XUID with the upper
+half cleared while its saves are stored under the full XUID, so no saves were
+found. Saved games (type 1) now list the user's XUID first, then the passed
+XUID, then 0; each title/file name is listed once.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/kernel/xam/xam_content_aggregate.cpp b/src/kernel/xam/xam_content_aggregate.cpp
+index de4a527..dbc2acf 100644
+--- a/src/kernel/xam/xam_content_aggregate.cpp
++++ b/src/kernel/xam/xam_content_aggregate.cpp
+@@ -9,6 +9,11 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <set>
++#include <string>
++#include <vector>
++
+ #include <rex/filesystem/file.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+@@ -102,6 +107,24 @@ u32 XamContentAggregateCreateEnumerator_entry(u64 xuid, u32 device_id, u32 conte
+ 
+   uint64_t userxuid = REX_KERNEL_STATE()->user_profile()->xuid();
+ 
++  // XUIDs to list, each once. Some titles (Lightning Returns) pass the
++  // signed-in user's XUID with the upper half cleared, while their saves are
++  // written under the full XUID, so saved games (type 1) also list the user's
++  // own XUID - first, so a save found there wins. Common content (XUID 0) as
++  // before.
++  std::vector<uint64_t> list_xuids;
++  if (content_type == 1 && userxuid != 0) {
++    list_xuids.push_back(userxuid);
++  }
++  if (std::find(list_xuids.begin(), list_xuids.end(), uint64_t(xuid)) == list_xuids.end()) {
++    list_xuids.push_back(xuid);
++  }
++  if (userxuid != 0 &&
++      std::find(list_xuids.begin(), list_xuids.end(), uint64_t(0)) == list_xuids.end()) {
++    list_xuids.push_back(0);
++  }
++  std::set<std::string> listed;  // "<title id>/<file name>"
++
+   if (!device_info || device_info->device_type == DeviceType::HDD) {
+     // Fetch any alternate title IDs defined in the XEX header
+     // (used by games to load saves from other titles, etc)
+@@ -113,22 +136,13 @@ u32 XamContentAggregateCreateEnumerator_entry(u64 xuid, u32 device_id, u32 conte
+     }
+ 
+     for (auto& title_id : title_ids) {
+-      // Get user-specific content
+-      auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
+-          static_cast<uint32_t>(DummyDeviceId::HDD), xuid, content_type_enum, title_id);
+-      for (const auto& content_data : content_datas) {
+-        auto item = e->AppendItem();
+-        assert_not_null(item);
+-        if (item) {
+-          *item = content_data;
+-        }
+-      }
+-
+-      // Also get common content (xuid=0)
+-      if (userxuid != 0) {
+-        auto common_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
+-            static_cast<uint32_t>(DummyDeviceId::HDD), 0, content_type_enum, title_id);
+-        for (const auto& content_data : common_datas) {
++      for (uint64_t list_xuid : list_xuids) {
++        auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
++            static_cast<uint32_t>(DummyDeviceId::HDD), list_xuid, content_type_enum, title_id);
++        for (const auto& content_data : content_datas) {
++          if (!listed.insert(fmt::format("{:08X}/{}", title_id, content_data.file_name())).second) {
++            continue;
++          }
+           auto item = e->AppendItem();
+           assert_not_null(item);
+           if (item) {

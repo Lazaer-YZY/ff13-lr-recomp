@@ -1,0 +1,47 @@
+From 6d798ae12aae9bd582b1e43a2c7ec6187a6eab4f Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 23:10:08 +0800
+Subject: [PATCH 091/108] codegen: share_registers functions also get the
+ caller's localized non-volatile FPRs and VMX registers
+
+With non_volatile_as_local a function marked share_registers (an SEH funclet,
+or a fragment split off another function) received only r14-r31 through ctx;
+f14-f31, v14-v31 and v64-v127 now go the same way.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/codegen/builders/context.cpp b/src/codegen/builders/context.cpp
+index f78e0d8..a4706dd 100644
+--- a/src/codegen/builders/context.cpp
++++ b/src/codegen/builders/context.cpp
+@@ -213,15 +213,30 @@ void BuilderContext::emit_function_call(uint32_t address) {
+       // them back afterwards. Only registers already localized here can be live at
+       // this point, so that set is the whole live-in the funclet can see.
+       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
++        // GPRs, and the localized non-volatile FPRs / VMX registers too: a function split off
++        // another (a branch target the analysis made a function) can read any of them.
++        auto vmx_non_volatile = [](size_t i) { return (i >= 14 && i < 32) || (i >= 64 && i < 128); };
+         for (size_t i = 14; i < 32; ++i) {
+           if (locals.r[i])
+             println("\tctx.r{} = r{};", i, i);
++          if (locals.f[i])
++            println("\tctx.f{} = f{};", i, i);
++        }
++        for (size_t i = 14; i < 128; ++i) {
++          if (vmx_non_volatile(i) && locals.v[i])
++            println("\tctx.v{} = v{};", i, i);
+         }
+         emitCtx.reference(name);
+         println("\t{}(ctx, base);", name);
+         for (size_t i = 14; i < 32; ++i) {
+           if (locals.r[i])
+             println("\tr{} = ctx.r{};", i, i);
++          if (locals.f[i])
++            println("\tf{} = ctx.f{};", i, i);
++        }
++        for (size_t i = 14; i < 128; ++i) {
++          if (vmx_non_volatile(i) && locals.v[i])
++            println("\tv{} = ctx.v{};", i, i);
+         }
+         return;
+       }

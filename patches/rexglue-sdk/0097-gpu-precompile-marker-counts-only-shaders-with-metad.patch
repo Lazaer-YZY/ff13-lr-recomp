@@ -1,0 +1,26 @@
+From 7819229cb5fd5c532ecbdfc554f666e8dc68f91f Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Wed, 11 Nov 2026 09:51:26 +0800
+Subject: [PATCH 097/108] gpu: precompile marker counts only shaders with
+ metadata (no rerun after new shaders in play)
+
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index daa4b14..e81f64c 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -5247,7 +5247,13 @@ void VulkanPipelineCache::PrecompileThread() {
+   // Marker: driver pipeline cache UUID, shader count, precompile variant set version.
+   uint8_t marker[28];
+   std::memcpy(marker, properties.pipelineCacheUUID, 16);
+-  uint64_t shader_count = precompile_pixel_shaders_.size();
++  // Only the shaders with offline-scan metadata count: the others are skipped below, and new ones
++  // join the storage during play, which would rerun the precompile (and show the title notice) on
++  // the next launch for nothing. This set changes with an app update that ships new metadata.
++  uint64_t shader_count = 0;
++  for (const PrecompileShader& entry : precompile_pixel_shaders_) {
++    shader_count += pixel_shader_meta_.count(entry.hash);
++  }
+   std::memcpy(marker + 16, &shader_count, 8);
+   // 2: 1x only (the game draws its pixel shaders at 1x). 3+: the translation switches are part of
+   // the marker - a change rebuilds the libraries here, in the background, instead of compiling

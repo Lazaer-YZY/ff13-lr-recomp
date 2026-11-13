@@ -1,0 +1,28 @@
+From 7eea4f79d36b73fb58e82311229a321ba8d05bba Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 09:27:30 +0800
+Subject: [PATCH 052/108] gpu: vulkan: log whether S3TC / 3Dc textures are
+ native or decompressed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 28d8e5c..e0bf139 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -2524,6 +2524,15 @@ bool VulkanTextureCache::Initialize() {
+     host_format_dxt5a.format_unsigned.format = VK_FORMAT_R8_UNORM;
+     host_format_dxt5a.format_unsigned.block_compressed = false;
+   }
++  REXGPU_INFO(
++      "VulkanTextureCache: S3TC / 3Dc host formats: DXT1 {}, DXT2_3 {}, DXT4_5 {}, DXN {}, DXT5A {}",
++      host_format_dxt1.format_unsigned.block_compressed ? "BC1" : "decompressed",
++      host_format_dxt2_3.format_unsigned.block_compressed ? "BC2" : "decompressed",
++      host_formats_[uint32_t(xenos::TextureFormat::k_DXT4_5)].format_unsigned.block_compressed
++          ? "BC3"
++          : "decompressed",
++      host_format_dxn.format_unsigned.block_compressed ? "BC5" : "decompressed",
++      host_format_dxt5a.format_unsigned.block_compressed ? "BC4" : "decompressed");
+   // Keep signed format support aligned with D3D12 for texture formats where
+   // D3D12 doesn't expose signed sampling paths.
+   constexpr std::array<xenos::TextureFormat, 19> kD3D12SignedUnsupportedFormats = {

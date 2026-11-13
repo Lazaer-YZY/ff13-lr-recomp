@@ -1,0 +1,235 @@
+From 4f65b2cc9aa5223cc0e0a82e947d1d674be89c36 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:34:33 +0800
+Subject: [PATCH 013/108] ui(vulkan): process-wide vkGetInstanceProcAddr
+ override
+
+New rex::ui::vulkan::SetInstanceProcAddrOverride(void*) /
+GetInstanceProcAddrOverride() (include/rex/ui/vulkan/loader_override.h). The
+storage is an atomic in src/ui/vulkan/loader_override.cpp, part of the rexui
+OBJECT library, which is linked only into librexruntime (enforced by
+rexglue_link_audit), so the game and the GPU plugin share one copy through the
+exported accessors. It is compiled regardless of REXGLUE_USE_VULKAN.
+
+When set, VulkanInstance::Create skips loading the system Vulkan loader, uses
+the override as vkGetInstanceProcAddr for the global functions and resolves
+vkDestroyInstance from the created instance. Intended for Turnip via
+libadrenotools on Android; never set on desktop.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/ui/vulkan/loader_override.h b/include/rex/ui/vulkan/loader_override.h
+new file mode 100644
+index 0000000..47157da
+--- /dev/null
++++ b/include/rex/ui/vulkan/loader_override.h
+@@ -0,0 +1,24 @@
++#pragma once
++/**
++ * @file        rex/ui/vulkan/loader_override.h
++ * @brief       Process-wide override of the Vulkan loader entry point
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++namespace rex::ui::vulkan {
++
++// Hands the runtime a custom vkGetInstanceProcAddr (e.g. a Turnip driver
++// loaded through libadrenotools on Android). Call before the GPU plugin
++// creates its VulkanInstance; once set, VulkanInstance::Create does not load
++// the system Vulkan loader and resolves everything through this function.
++// Pass nullptr to clear. Plain void* so callers need no Vulkan headers.
++//
++// The storage lives once in librexruntime (rexui objects are only linked into
++// rexruntime; see cmake/rexglue_link_audit.cmake), so the game library and
++// the GPU plugin observe the same value through these exported accessors.
++void SetInstanceProcAddrOverride(void* pfn_vkGetInstanceProcAddr);
++void* GetInstanceProcAddrOverride();
++
++}  // namespace rex::ui::vulkan
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index ddc3f98..df15688 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -18,6 +18,9 @@ set(REXUI_CORE_SOURCES
+     windowed_app.cpp
+     windowed_app_context.cpp
+     windowed_app_context_sdl.cpp
++    # Backend-agnostic (no Vulkan headers), so the accessor exists in every
++    # rexruntime build even with Vulkan disabled.
++    vulkan/loader_override.cpp
+ )
+ 
+ # Optional overlay dialogs
+diff --git a/src/ui/vulkan/loader_override.cpp b/src/ui/vulkan/loader_override.cpp
+new file mode 100644
+index 0000000..e2605e0
+--- /dev/null
++++ b/src/ui/vulkan/loader_override.cpp
+@@ -0,0 +1,27 @@
++/**
++ * @file        rex/ui/vulkan/loader_override.cpp
++ * @brief       Storage for the process-wide vkGetInstanceProcAddr override
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#include <atomic>
++
++#include <rex/ui/vulkan/loader_override.h>
++
++namespace rex::ui::vulkan {
++
++namespace {
++std::atomic<void*> instance_proc_addr_override{nullptr};
++}  // namespace
++
++void SetInstanceProcAddrOverride(void* pfn_vkGetInstanceProcAddr) {
++  instance_proc_addr_override.store(pfn_vkGetInstanceProcAddr, std::memory_order_release);
++}
++
++void* GetInstanceProcAddrOverride() {
++  return instance_proc_addr_override.load(std::memory_order_acquire);
++}
++
++}  // namespace rex::ui::vulkan
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 914b311..e313fc1 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -19,6 +19,7 @@
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/instance.h>
++#include <rex/ui/vulkan/loader_override.h>
+ #include <rex/ui/vulkan/presenter.h>
+ 
+ #if REX_PLATFORM_MAC
+@@ -45,51 +46,61 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+ 
+   bool functions_loaded = true;
+   bool loader_loaded = false;
++  // Application-provided vkGetInstanceProcAddr (e.g. Turnip via
++  // libadrenotools): skip the system loader entirely. vkDestroyInstance is
++  // resolved from the instance after it has been created.
++  void* const instance_proc_addr_override = GetInstanceProcAddrOverride();
++  if (instance_proc_addr_override) {
++    ifn.vkGetInstanceProcAddr =
++        reinterpret_cast<PFN_vkGetInstanceProcAddr>(instance_proc_addr_override);
++    REXLOG_INFO("Vulkan: using application-provided vkGetInstanceProcAddr override");
++  } else {
+ #if REX_PLATFORM_MAC
+-  const MacOSVulkanRuntimePaths macos_runtime_paths = DetectMacOSVulkanRuntimePaths();
+-  ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
+-
+-  std::vector<std::filesystem::path> loader_candidates = macos_runtime_paths.loader_candidates;
+-  loader_candidates.emplace_back(platform::lib_names::kVulkanLoader);
+-  loader_candidates.emplace_back("libvulkan.dylib");
+-  loader_candidates.emplace_back("libMoltenVK.dylib");
+-
+-  std::vector<std::string> attempted_loader_paths;
+-  attempted_loader_paths.reserve(loader_candidates.size());
+-  for (const std::filesystem::path& candidate : loader_candidates) {
+-    if (candidate.empty()) {
+-      continue;
+-    }
+-    attempted_loader_paths.push_back(candidate.string());
+-    if (vulkan_instance->loader_.Load(candidate)) {
+-      loader_loaded = true;
+-      REXLOG_INFO("Loaded Vulkan runtime from {}", candidate.string());
+-      break;
++    const MacOSVulkanRuntimePaths macos_runtime_paths = DetectMacOSVulkanRuntimePaths();
++    ConfigureMacOSVulkanEnvironment(macos_runtime_paths);
++
++    std::vector<std::filesystem::path> loader_candidates = macos_runtime_paths.loader_candidates;
++    loader_candidates.emplace_back(platform::lib_names::kVulkanLoader);
++    loader_candidates.emplace_back("libvulkan.dylib");
++    loader_candidates.emplace_back("libMoltenVK.dylib");
++
++    std::vector<std::string> attempted_loader_paths;
++    attempted_loader_paths.reserve(loader_candidates.size());
++    for (const std::filesystem::path& candidate : loader_candidates) {
++      if (candidate.empty()) {
++        continue;
++      }
++      attempted_loader_paths.push_back(candidate.string());
++      if (vulkan_instance->loader_.Load(candidate)) {
++        loader_loaded = true;
++        REXLOG_INFO("Loaded Vulkan runtime from {}", candidate.string());
++        break;
++      }
+     }
+-  }
+-  if (!loader_loaded) {
+-    REXLOG_ERROR("Failed to load a Vulkan runtime on macOS");
+-    for (const std::string& attempted_loader_path : attempted_loader_paths) {
+-      REXLOG_ERROR("* tried {}", attempted_loader_path);
++    if (!loader_loaded) {
++      REXLOG_ERROR("Failed to load a Vulkan runtime on macOS");
++      for (const std::string& attempted_loader_path : attempted_loader_paths) {
++        REXLOG_ERROR("* tried {}", attempted_loader_path);
++      }
++      return nullptr;
+     }
+-    return nullptr;
+-  }
+ #else
+-  loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
+-  if (!loader_loaded) {
+-    REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
+-    return nullptr;
+-  }
++    loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
++    if (!loader_loaded) {
++      REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
++      return nullptr;
++    }
+ #endif
+ 
+ #define XE_VULKAN_LOAD_LOADER_FUNCTION(name) \
+   functions_loaded &= (ifn.name = vulkan_instance->loader_.GetSymbol<PFN_##name>(#name)) != nullptr;
+-  XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
+-  XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
++    XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
++    XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
+ #undef XE_VULKAN_LOAD_LOADER_FUNCTION
+-  if (!functions_loaded) {
+-    REXLOG_ERROR("Failed to get Vulkan loader function pointers");
+-    return nullptr;
++    if (!functions_loaded) {
++      REXLOG_ERROR("Failed to get Vulkan loader function pointers");
++      return nullptr;
++    }
+   }
+ 
+   // Load global functions.
+@@ -384,6 +395,16 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+     return nullptr;
+   }
+ 
++  if (!ifn.vkDestroyInstance) {
++    // Loader override path: not exported by a loader module, query the instance.
++    ifn.vkDestroyInstance = PFN_vkDestroyInstance(
++        ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, "vkDestroyInstance"));
++    if (!ifn.vkDestroyInstance) {
++      REXLOG_ERROR("Failed to get vkDestroyInstance via the vkGetInstanceProcAddr override");
++      return nullptr;  // Leaks the instance; the destructor cannot destroy it.
++    }
++  }
++
+   // Load instance functions.
+ 
+ #define XE_UI_VULKAN_FUNCTION(name)                                                            \
+@@ -529,7 +550,9 @@ VulkanInstance::~VulkanInstance() {
+       functions_.vkDestroyDebugUtilsMessengerEXT(instance_, debug_utils_messenger_, nullptr);
+     }
+ 
+-    functions_.vkDestroyInstance(instance_, nullptr);
++    if (functions_.vkDestroyInstance) {
++      functions_.vkDestroyInstance(instance_, nullptr);
++    }
+   }
+ 
+   loader_.Close();

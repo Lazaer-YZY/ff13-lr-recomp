@@ -1,0 +1,45 @@
+From efcc51546e28e14a24aa6efab89bbbe4f02ca9ba Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 09:38:56 +0800
+Subject: [PATCH 055/108] gpu: vulkan: battle-exit grey filter skip is a
+ diagnostic switch, off by default
+
+Skipping the draw hides the Adreno noise without explaining it; keep the
+switch for confirming the source while the cause is investigated.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 856134a..bbd7908 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -77,9 +77,10 @@ REXCVAR_DEFINE_BOOL(vulkan_gpu_timing, false, "GPU",
+                     "transfers, resolves, texture loads, draws and submissions every 10 s")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+-REXCVAR_DEFINE_BOOL(vulkan_lr_skip_battle_grey, REX_PLATFORM_ANDROID ? true : false, "GPU/Vulkan",
+-                    "Lightning Returns: leave out the battle-exit grey filter overlay, which "
+-                    "flickers and shows line noise on Adreno")
++REXCVAR_DEFINE_BOOL(vulkan_lr_skip_battle_grey, false, "GPU/Vulkan",
++                    "Lightning Returns, diagnostic only: leave out the battle-exit grey filter "
++                    "overlay, which flickers / shows line noise on Adreno. Hides the symptom; the "
++                    "cause is not known yet")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_gpu_trace_frame, false, "GPU",
+@@ -4320,10 +4321,11 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       return true;
+     }
+   }
+-  // Lightning Returns: the battle-exit grey filter (a blurred, desaturated
+-  // full-screen overlay, pixel shader 8DA8D0C5199404FF, drawn after the frame's
+-  // crossfade by the blend constant) flickers / shows line noise on Adreno, so
+-  // it is left out there (as lr-ffxiii-port does; vulkan_lr_skip_battle_grey).
++  // Lightning Returns, diagnostic: the battle-exit grey filter (a blurred,
++  // desaturated full-screen overlay, pixel shader 8DA8D0C5199404FF, drawn after
++  // the frame's crossfade by the blend constant) flickers / shows line noise on
++  // Adreno. vulkan_lr_skip_battle_grey leaves it out to confirm that it is the
++  // source; not a fix.
+   if (REXCVAR_GET(vulkan_lr_skip_battle_grey)) {
+     for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+       uint32_t blend_control = regs.values[XE_GPU_REG_RB_BLENDCONTROL0 + i];

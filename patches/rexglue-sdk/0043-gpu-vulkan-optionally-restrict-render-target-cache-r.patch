@@ -1,0 +1,450 @@
+From fa9d3e545ab64637ae3aea02bd735918be2f538c Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 01:04:51 +0800
+Subject: [PATCH 043/108] gpu: vulkan: optionally restrict render target cache
+ render areas (vulkan_render_area_restrict)
+
+Every render target cache render pass instance used the whole framebuffer
+as its render area, and the framebuffer is as tall as the whole EDRAM for
+its pitch (1280x2048 for a 1280-wide target the game draws 720 rows of),
+so with LOAD / STORE attachments a tile-based GPU loaded and stored ~2.8x
+the needed pixels in each of ~84 passes per frame.
+
+With vulkan_render_area_restrict (default off), the union of everything a
+command in the instance may write is tracked: the dynamic scissor of each
+guest draw (the whole framebuffer if the scissor state is unknown), the
+geometry rectangles of render target ownership transfer draws (their
+scissor is the whole framebuffer), and the vkCmdClearAttachments rectangles
+of stencil clears and resolve clears. When the instance ends, the union,
+aligned to 80x16 pixels (whole EDRAM tiles for every sample count and bpp)
+and clamped to the framebuffer, is written into the begin command already
+recorded in the deferred command buffer (VkRenderPassBeginInfo or
+VkRenderingInfo). The instance is never split or re-begun, so the pass
+structure is identical to the cvar being off; pixels outside the area are
+neither loaded nor stored and keep their contents, as before.
+
+The 10-s vulkan_gpu_timing line gains the average render area, framebuffer
+size, pixel coverage (actual and what the writes need) and the number of
+restricted passes per frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 4f3633e..336b57b 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -203,6 +203,17 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // including adding pipeline barriers that are not a part of the render pass
+   // scope. Submission must be open.
+   void EndRenderPass();
++  // Must be called (after entering the render target cache render pass) for
++  // every rectangle (in framebuffer pixels, including the resolution scale)
++  // that a command recorded in the current render target cache render pass
++  // instance may write: the scissor of a draw, the geometry of a transfer draw
++  // whose scissor is the whole framebuffer, the rectangles of
++  // vkCmdClearAttachments. With vulkan_render_area_restrict, the render area of
++  // the instance is shrunk to the tile-aligned union of these rectangles when
++  // the instance ends (the begin command is patched in the deferred command
++  // buffer, so the render pass instance is never split). No-op outside a
++  // render target cache render pass.
++  void ExtendRenderPassArea(const VkRect2D& rect);
+ 
+   // Optional GPU timing breakdown (vulkan_gpu_timing). GPU work is split into
+   // segments by timestamps written only outside render passes (a timestamp
+@@ -240,6 +251,19 @@ class VulkanCommandProcessor : public CommandProcessor {
+     uint64_t uploads = 0;
+     uint64_t draws = 0;
+     uint64_t submissions = 0;
++    // Render target cache render pass instances (guest and transfer) and their
++    // render areas (vulkan_render_area_restrict), summed over the instances.
++    uint64_t render_area_passes = 0;
++    uint64_t render_area_restricted_passes = 0;
++    uint64_t render_area_width = 0;
++    uint64_t render_area_height = 0;
++    uint64_t render_area_pixels = 0;
++    // Tile-aligned union of what the commands in the instances may write,
++    // regardless of whether the render area has actually been restricted.
++    uint64_t render_area_touched_pixels = 0;
++    uint64_t render_area_framebuffer_width = 0;
++    uint64_t render_area_framebuffer_height = 0;
++    uint64_t render_area_framebuffer_pixels = 0;
+   };
+   GpuTimingCounters& gpu_timing_counters() { return gpu_timing_counters_; }
+ 
+@@ -834,6 +858,33 @@ class VulkanCommandProcessor : public CommandProcessor {
+   const VulkanRenderTargetCache::Framebuffer* current_framebuffer_;
+   bool in_render_pass_ = false;
+ 
++  // Area written by the commands in the current render target cache render
++  // pass instance, see ExtendRenderPassArea.
++  struct RenderPassArea {
++    // Whether a render target cache render pass instance is being recorded.
++    bool active = false;
++    // vulkan_render_area_restrict at the beginning of the instance.
++    bool restrict_enabled = false;
++    // Location of the render area of the begin command in the deferred command
++    // buffer.
++    size_t begin_render_area_offset = SIZE_MAX;
++    uint32_t framebuffer_width = 0;
++    uint32_t framebuffer_height = 0;
++    // Union of the written rectangles, clamped to the framebuffer, empty if
++    // x0 >= x1 or y0 >= y1.
++    uint32_t x0 = UINT32_MAX;
++    uint32_t y0 = UINT32_MAX;
++    uint32_t x1 = 0;
++    uint32_t y1 = 0;
++  };
++  // Call after recording the begin command of a render target cache render
++  // pass instance.
++  void RenderPassAreaBegin(const VkExtent2D& framebuffer_extent);
++  // Call before recording the end command of a render target cache render pass
++  // instance, while the begin command can still be patched.
++  void RenderPassAreaEnd();
++  RenderPassArea render_pass_area_;
++
+   // Currently bound graphics pipeline, either from the pipeline cache (with
+   // potentially deferred creation - current_external_graphics_pipeline_ is
+   // VK_NULL_HANDLE in this case) or a non-Xenos one
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index 57408df..e0b9ca5 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -31,6 +31,22 @@ class DeferredCommandBuffer {
+   void Reset();
+   void Execute(VkCommandBuffer command_buffer);
+ 
++  // Location (byte offset in the command stream) of the render area of the
++  // last recorded CmdVkBeginRenderPass or CmdVkBeginRendering. The render area
++  // may be overwritten with SetRecordedRenderArea until the buffer is executed
++  // or reset, so it can be shrunk to what the commands recorded in the render
++  // pass instance have actually written once the instance has ended.
++  size_t GetLastRenderAreaOffset() const { return last_render_area_offset_; }
++  void SetRecordedRenderArea(size_t render_area_offset, const VkRect2D& render_area) {
++    if (render_area_offset == SIZE_MAX ||
++        render_area_offset + sizeof(VkRect2D) > command_stream_.size() * sizeof(uintmax_t)) {
++      assert_always();
++      return;
++    }
++    std::memcpy(reinterpret_cast<uint8_t*>(command_stream_.data()) + render_area_offset,
++                &render_area, sizeof(VkRect2D));
++  }
++
+   // render_pass_begin->pNext of all barriers must be null.
+   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
+                             VkSubpassContents contents) {
+@@ -49,6 +65,8 @@ class DeferredCommandBuffer {
+     args.render_pass = render_pass_begin->renderPass;
+     args.framebuffer = render_pass_begin->framebuffer;
+     args.render_area = render_pass_begin->renderArea;
++    last_render_area_offset_ = size_t(reinterpret_cast<const uint8_t*>(&args.render_area) -
++                                      reinterpret_cast<const uint8_t*>(command_stream_.data()));
+     args.clear_value_count = clear_value_count;
+     args.contents = contents;
+     if (clear_value_count) {
+@@ -599,6 +617,9 @@ class DeferredCommandBuffer {
+ 
+   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
+   std::vector<uintmax_t> command_stream_;
++
++  // See GetLastRenderAreaOffset.
++  size_t last_render_area_offset_ = SIZE_MAX;
+ };
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 0478620..de65683 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -77,6 +77,13 @@ REXCVAR_DEFINE_BOOL(vulkan_gpu_timing, false, "GPU",
+                     "transfers, resolves, texture loads, draws and submissions every 10 s")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_render_area_restrict, false, "GPU",
++                    "Restrict the render area of render target cache render passes (guest draws, "
++                    "render target ownership transfers, resolve clears) to the EDRAM-tile-aligned "
++                    "union of the scissors and rectangles their commands write, instead of the "
++                    "whole EDRAM-tall framebuffer, so tile-based GPUs load and store less")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+@@ -3122,6 +3129,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   }
+ 
+   if (in_render_pass_) {
++    RenderPassAreaEnd();
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+@@ -3188,6 +3196,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
+   in_render_pass_ = true;
++  RenderPassAreaBegin(framebuffer->host_extent);
+ }
+ 
+ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+@@ -3210,6 +3219,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   }
+ 
+   if (in_render_pass_) {
++    RenderPassAreaEnd();
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+@@ -3285,6 +3295,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
+   in_render_pass_ = true;
++  RenderPassAreaBegin(framebuffer->host_extent);
+ }
+ 
+ void VulkanCommandProcessor::EndRenderPass() {
+@@ -3292,6 +3303,7 @@ void VulkanCommandProcessor::EndRenderPass() {
+   if (!in_render_pass_) {
+     return;
+   }
++  RenderPassAreaEnd();
+   if (current_render_pass_ == VK_NULL_HANDLE) {
+     deferred_command_buffer_.CmdVkEndRendering();
+   } else {
+@@ -3305,6 +3317,95 @@ void VulkanCommandProcessor::EndRenderPass() {
+   GpuTimingMark(GpuTimingCategory::kOther);
+ }
+ 
++void VulkanCommandProcessor::ExtendRenderPassArea(const VkRect2D& rect) {
++  RenderPassArea& area = render_pass_area_;
++  if (!area.active) {
++    return;
++  }
++  int64_t x0 = std::max(int64_t(rect.offset.x), int64_t(0));
++  int64_t y0 = std::max(int64_t(rect.offset.y), int64_t(0));
++  int64_t x1 = std::min(int64_t(rect.offset.x) + int64_t(rect.extent.width),
++                        int64_t(area.framebuffer_width));
++  int64_t y1 = std::min(int64_t(rect.offset.y) + int64_t(rect.extent.height),
++                        int64_t(area.framebuffer_height));
++  if (x0 >= x1 || y0 >= y1) {
++    return;
++  }
++  area.x0 = std::min(area.x0, uint32_t(x0));
++  area.y0 = std::min(area.y0, uint32_t(y0));
++  area.x1 = std::max(area.x1, uint32_t(x1));
++  area.y1 = std::max(area.y1, uint32_t(y1));
++}
++
++void VulkanCommandProcessor::RenderPassAreaBegin(const VkExtent2D& framebuffer_extent) {
++  RenderPassArea& area = render_pass_area_;
++  area.active = true;
++  area.restrict_enabled = REXCVAR_GET(vulkan_render_area_restrict);
++  area.begin_render_area_offset = deferred_command_buffer_.GetLastRenderAreaOffset();
++  area.framebuffer_width = framebuffer_extent.width;
++  area.framebuffer_height = framebuffer_extent.height;
++  area.x0 = UINT32_MAX;
++  area.y0 = UINT32_MAX;
++  area.x1 = 0;
++  area.y1 = 0;
++}
++
++void VulkanCommandProcessor::RenderPassAreaEnd() {
++  RenderPassArea& area = render_pass_area_;
++  if (!area.active) {
++    return;
++  }
++  area.active = false;
++  // Align to whole EDRAM tiles of every attachment: a tile is 80x16 samples,
++  // so 80x16 pixels is a whole number of tiles for any sample count and for
++  // both 32bpp and 64bpp render targets (the framebuffer origin is the base
++  // tile of every attachment). Pixels outside the render area are neither
++  // loaded nor stored by the LOAD / STORE render pass, so they keep what the
++  // images already contain, exactly as with the whole framebuffer as the area.
++  uint32_t align_x =
++      xenos::kEdramTileWidthSamples * render_target_cache_->draw_resolution_scale_x();
++  uint32_t align_y =
++      xenos::kEdramTileHeightSamples * render_target_cache_->draw_resolution_scale_y();
++  uint32_t framebuffer_width = area.framebuffer_width;
++  uint32_t framebuffer_height = area.framebuffer_height;
++  VkRect2D touched;
++  if (area.x0 < area.x1 && area.y0 < area.y1) {
++    uint32_t x0 = area.x0 / align_x * align_x;
++    uint32_t y0 = area.y0 / align_y * align_y;
++    uint32_t x1 = std::min((area.x1 + (align_x - 1)) / align_x * align_x, framebuffer_width);
++    uint32_t y1 = std::min((area.y1 + (align_y - 1)) / align_y * align_y, framebuffer_height);
++    touched.offset.x = int32_t(x0);
++    touched.offset.y = int32_t(y0);
++    touched.extent.width = x1 - x0;
++    touched.extent.height = y1 - y0;
++  } else {
++    // Nothing may have been written, but the render area must not be empty.
++    touched.offset.x = 0;
++    touched.offset.y = 0;
++    touched.extent.width = std::min(align_x, framebuffer_width);
++    touched.extent.height = std::min(align_y, framebuffer_height);
++  }
++  uint64_t framebuffer_pixels = uint64_t(framebuffer_width) * framebuffer_height;
++  uint64_t touched_pixels = uint64_t(touched.extent.width) * touched.extent.height;
++  GpuTimingCounters& c = gpu_timing_counters_;
++  ++c.render_area_passes;
++  c.render_area_framebuffer_width += framebuffer_width;
++  c.render_area_framebuffer_height += framebuffer_height;
++  c.render_area_framebuffer_pixels += framebuffer_pixels;
++  c.render_area_touched_pixels += touched_pixels;
++  if (area.restrict_enabled && area.begin_render_area_offset != SIZE_MAX) {
++    deferred_command_buffer_.SetRecordedRenderArea(area.begin_render_area_offset, touched);
++    c.render_area_restricted_passes += uint64_t(touched_pixels < framebuffer_pixels);
++    c.render_area_width += touched.extent.width;
++    c.render_area_height += touched.extent.height;
++    c.render_area_pixels += touched_pixels;
++  } else {
++    c.render_area_width += framebuffer_width;
++    c.render_area_height += framebuffer_height;
++    c.render_area_pixels += framebuffer_pixels;
++  }
++}
++
+ void VulkanCommandProcessor::GpuTimingWriteTimestamp(GpuTimingCategory category) {
+   // Never inside a render pass; consecutive work of one category stays in one
+   // segment.
+@@ -3465,6 +3566,23 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+   }
+   double frames = double(gpu_timing_frames_);
+   const GpuTimingCounters& c = gpu_timing_counters_;
++  // Render target cache render pass instance render areas
++  // (vulkan_render_area_restrict).
++  std::string render_area_info;
++  {
++    double area_passes = double(std::max(c.render_area_passes, uint64_t(1)));
++    double framebuffer_pixels = double(std::max(c.render_area_framebuffer_pixels, uint64_t(1)));
++    render_area_info = fmt::format(
++        "; render area per pass {:.0f}x{:.0f} of {:.0f}x{:.0f} avg = {:.1f}% of framebuffer "
++        "pixels (writes need {:.1f}%), {:.1f} of {:.1f} passes restricted (restrict {})",
++        double(c.render_area_width) / area_passes, double(c.render_area_height) / area_passes,
++        double(c.render_area_framebuffer_width) / area_passes,
++        double(c.render_area_framebuffer_height) / area_passes,
++        double(c.render_area_pixels) / framebuffer_pixels * 100.0,
++        double(c.render_area_touched_pixels) / framebuffer_pixels * 100.0,
++        double(c.render_area_restricted_passes) / frames, double(c.render_area_passes) / frames,
++        REXCVAR_GET(vulkan_render_area_restrict) ? "on" : "off");
++  }
+   if (gpu_timing_support_ > 0) {
+     const double* ns = gpu_timing_category_ns_;
+     double total_ns = 0.0;
+@@ -3478,7 +3596,7 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+         "{:.2f} + swap {:.2f} + other {:.2f}; presenter paint {:.2f} ms x {} paints; per frame "
+         "{:.1f} render passes ({:.1f} with load), {:.1f} transfers, {:.1f} resolves, {:.1f} "
+         "texture loads, {:.1f} uploads, {:.1f} draws, {:.2f} submissions ({} measured, {} "
+-        "dropped marks)",
++        "dropped marks){}",
+         double(elapsed_ns) * 1.0e-9, gpu_timing_frames_, ms(total_ns),
+         total_ns / double(elapsed_ns) * 100.0, ms(ns[size_t(GpuTimingCategory::kDraws)]),
+         ms(ns[size_t(GpuTimingCategory::kTransfers)]),
+@@ -3490,16 +3608,18 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+         double(c.render_passes) / frames, double(c.render_passes_with_load) / frames,
+         double(c.transfers) / frames, double(c.resolves) / frames,
+         double(c.texture_loads) / frames, double(c.uploads) / frames, double(c.draws) / frames,
+-        double(c.submissions) / frames, gpu_timing_submissions_measured_, gpu_timing_overflows_);
++        double(c.submissions) / frames, gpu_timing_submissions_measured_, gpu_timing_overflows_,
++        render_area_info);
+   } else {
+     REXGPU_INFO(
+         "GPU timing ({:.1f} s, {} frames, no timestamps): per frame {:.1f} render passes ({:.1f} "
+         "with load), {:.1f} transfers, {:.1f} resolves, {:.1f} texture loads, {:.1f} uploads, "
+-        "{:.1f} draws, {:.2f} submissions",
++        "{:.1f} draws, {:.2f} submissions{}",
+         double(elapsed_ns) * 1.0e-9, gpu_timing_frames_, double(c.render_passes) / frames,
+         double(c.render_passes_with_load) / frames, double(c.transfers) / frames,
+         double(c.resolves) / frames, double(c.texture_loads) / frames,
+-        double(c.uploads) / frames, double(c.draws) / frames, double(c.submissions) / frames);
++        double(c.uploads) / frames, double(c.draws) / frames, double(c.submissions) / frames,
++        render_area_info);
+   }
+   gpu_timing_window_start_ns_ = now_ns;
+   std::fill(std::begin(gpu_timing_category_ns_), std::end(gpu_timing_category_ns_), 0.0);
+@@ -4375,6 +4495,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       render_target_cache_->last_update_render_pass(),
+       render_target_cache_->last_update_framebuffer());
+ 
++  // The draw can't write outside its scissor (set in UpdateDynamicState). If
++  // the dynamic scissor state is unknown, be conservative.
++  if (dynamic_scissor_update_needed_) {
++    VkRect2D whole_framebuffer;
++    whole_framebuffer.offset.x = 0;
++    whole_framebuffer.offset.y = 0;
++    whole_framebuffer.extent.width = UINT32_MAX >> 1;
++    whole_framebuffer.extent.height = UINT32_MAX >> 1;
++    ExtendRenderPassArea(whole_framebuffer);
++  } else {
++    ExtendRenderPassArea(dynamic_scissor_);
++  }
++
+   ++gpu_timing_counters_.draws;
+ 
+   // Draw.
+@@ -5424,6 +5557,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     current_render_pass_ = VK_NULL_HANDLE;
+     current_framebuffer_ = nullptr;
+     in_render_pass_ = false;
++    render_pass_area_.active = false;
+     current_guest_graphics_pipeline_ = VK_NULL_HANDLE;
+     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+     current_external_compute_pipeline_ = VK_NULL_HANDLE;
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index 51215f2..57e2241 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -30,6 +30,7 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
+ 
+ void DeferredCommandBuffer::Reset() {
+   command_stream_.clear();
++  last_render_area_offset_ = SIZE_MAX;
+ }
+ 
+ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+@@ -398,6 +399,8 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
+   auto& args = *reinterpret_cast<ArgsVkBeginRendering*>(args_ptr);
+   args.flags = rendering_info->flags;
+   args.render_area = rendering_info->renderArea;
++  last_render_area_offset_ = size_t(reinterpret_cast<const uint8_t*>(&args.render_area) -
++                                    reinterpret_cast<const uint8_t*>(command_stream_.data()));
+   args.layer_count = rendering_info->layerCount;
+   args.view_mask = rendering_info->viewMask;
+   args.color_attachment_count = rendering_info->colorAttachmentCount;
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 9cfdd42..90835e2 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -5002,6 +5002,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+                 stencil_clear_rectangle.height_pixels * draw_resolution_scale_y();
+             stencil_clear_rect_write_ptr->baseArrayLayer = 0;
+             stencil_clear_rect_write_ptr->layerCount = 1;
++            command_processor_.ExtendRenderPassArea(stencil_clear_rect_write_ptr->rect);
+             ++stencil_clear_rect_write_ptr;
+           }
+         }
+@@ -5087,6 +5088,18 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+           assert_not_zero(transfer_invocation_rectangle_count);
+           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
+             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
++            // The scissor is the whole framebuffer, the geometry is what limits
++            // the pixels written by the transfer.
++            VkRect2D transfer_rectangle_host;
++            transfer_rectangle_host.offset.x =
++                int32_t(transfer_rectangle.x_pixels * draw_resolution_scale_x());
++            transfer_rectangle_host.offset.y =
++                int32_t(transfer_rectangle.y_pixels * draw_resolution_scale_y());
++            transfer_rectangle_host.extent.width =
++                transfer_rectangle.width_pixels * draw_resolution_scale_x();
++            transfer_rectangle_host.extent.height =
++                transfer_rectangle.height_pixels * draw_resolution_scale_y();
++            command_processor_.ExtendRenderPassArea(transfer_rectangle_host);
+             float transfer_rectangle_x0 = -1.0f + transfer_rectangle.x_pixels * pixels_to_ndc_x;
+             float transfer_rectangle_y0 = -1.0f + transfer_rectangle.y_pixels * pixels_to_ndc_y;
+             float transfer_rectangle_x1 =
+@@ -5409,6 +5422,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+           } break;
+         }
+       }
++      command_processor_.ExtendRenderPassArea(resolve_clear_rect.rect);
+       command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1, &resolve_clear_rect);
+     }
+   }

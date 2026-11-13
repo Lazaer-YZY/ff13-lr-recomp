@@ -1,0 +1,447 @@
+From 692da7dbd8db2ea9bd6dcbdede015a7f8842d8e8 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 16:37:40 +0800
+Subject: [PATCH 017/108] core: crash context for unresolved host faults
+
+New rex::arch fault-report API (exception_handler.h, src/core/fault_context.cpp):
+SetFaultContextProvider, Begin/EndFaultDispatch and LogCurrentFaultContext,
+which logs one critical block per (host PC, fault address) per thread: reason,
+host PC, fault address, provider lines and a symbolised host backtrace (up to
+24 frames), then flushes the logs.
+
+- Windows: unwinds from the faulting CONTEXT (RtlLookupFunctionEntry /
+  RtlVirtualUnwind; RtlCaptureStackBackTrace fallback) and symbolises with
+  dbghelp loaded at runtime (module!symbol+off, or module+off without PDB).
+  A chained SetUnhandledExceptionFilter reports truly unhandled exceptions and
+  then defers to the previous filter, so the process dies as before.
+- POSIX/Android: _Unwind_Backtrace + dladdr (+ demangling); the signal handler
+  reports when no installed handler resolved the fault, behaviour after that
+  is unchanged.
+- The VEH/signal handlers only record (pc, address, context) in a
+  thread_local before running handlers: no cost unless a fault goes unhandled.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/exception_handler.h b/include/rex/exception_handler.h
+index bcd00bf..9a16172 100644
+--- a/include/rex/exception_handler.h
++++ b/include/rex/exception_handler.h
+@@ -531,4 +531,26 @@ class ExceptionHandler {
+   static void Uninstall(Handler fn, void* data);
+ };
+ 
++//=============================================================================
++// Fault crash context (cold path: only used once a fault is not resolved)
++//=============================================================================
++
++// Optional extra lines for the fault report (e.g. guest thread name/entry).
++// Set by the runtime; called on the faulting thread. Appends to `out`.
++using FaultContextProvider = void (*)(std::string& out);
++void SetFaultContextProvider(FaultContextProvider provider);
++
++// Records the fault being dispatched on this thread (called by the platform
++// exception handlers before running the installed handlers; `platform_context`
++// is EXCEPTION_POINTERS* on Windows, ucontext_t* on POSIX).
++void BeginFaultDispatch(uint64_t host_pc, uint64_t fault_address, const void* platform_context);
++void EndFaultDispatch();
++
++// Logs one critical block for the fault currently being dispatched on this
++// thread: reason, host PC, fault address, guest context (provider) and a
++// symbolised host backtrace (up to 24 frames), then flushes the logs. Logs at
++// most once per (host PC, fault address) per thread; no-op outside a fault.
++// Never resolves the fault: callers keep their normal failure path.
++void LogCurrentFaultContext(const char* reason);
++
+ }  // namespace rex::arch
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 8505deb..f7bbb03 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -9,6 +9,7 @@ add_library(rexcore OBJECT
+     clock.cpp
+     cvar.cpp
+     exception_handler.cpp
++    fault_context.cpp
+     filesystem.cpp
+     filesystem_wildcard.cpp
+     hash.cpp
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 8b1c76a..2265655 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -22,6 +22,7 @@
+ #include <signal.h>
+ 
+ #include <cstdint>
++#include <cstdio>
+ #include <cstring>
+ 
+ #include <rex/assert.h>
+@@ -260,6 +261,12 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       assert_unhandled_case(signal_number);
+   }
+ 
++  // Cheap bookkeeping so a handler that gives up can log crash context.
++#if REX_ARCH_AMD64
++  BeginFaultDispatch(thread_context.rip, ex.fault_address(), signal_context);
++#elif REX_ARCH_ARM64
++  BeginFaultDispatch(thread_context.pc, ex.fault_address(), signal_context);
++#endif
+   for (size_t i = 0; i < rex::countof(handlers_) && handlers_[i].first; ++i) {
+     if (handlers_[i].first(&ex, handlers_[i].second)) {
+       // Exception handled.
+@@ -414,9 +421,16 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       }
+ #endif  // REX_PLATFORM_MAC
+ #endif  // REX_ARCH
++      EndFaultDispatch();
+       return;
+     }
+   }
++  // No handler resolved the fault. Report it once; the subsequent behaviour
++  // (returning and re-executing the faulting instruction) is unchanged.
++  char reason[48];
++  std::snprintf(reason, sizeof(reason), "unhandled host signal %d", signal_number);
++  LogCurrentFaultContext(reason);
++  EndFaultDispatch();
+ }
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
+diff --git a/src/core/exception_handler_win.cpp b/src/core/exception_handler_win.cpp
+index 4a9b1ee..1372654 100644
+--- a/src/core/exception_handler_win.cpp
++++ b/src/core/exception_handler_win.cpp
+@@ -15,6 +15,10 @@
+ 
+ #include "platform_win.h"
+ 
++#include <string>
++
++#include <fmt/format.h>
++
+ #include <rex/assert.h>
+ #include <rex/math.h>
+ 
+@@ -34,6 +38,27 @@ constexpr size_t kMaxHandlerCount = 8;
+ // Executed in order.
+ std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
+ 
++// Previous process-wide unhandled exception filter (chained after logging).
++LPTOP_LEVEL_EXCEPTION_FILTER previous_unhandled_filter_ = nullptr;
++bool unhandled_filter_installed_ = false;
++
++// Runs only for exceptions nothing else handled: log crash context, then let
++// the previous filter / default behaviour terminate the process as before.
++LONG WINAPI UnhandledExceptionFilterCallback(PEXCEPTION_POINTERS ex_info) {
++  const EXCEPTION_RECORD* record = ex_info->ExceptionRecord;
++  uint64_t fault_address = 0;
++  if (record->ExceptionCode == STATUS_ACCESS_VIOLATION && record->NumberParameters >= 2) {
++    fault_address = record->ExceptionInformation[1];
++  }
++  BeginFaultDispatch(uint64_t(reinterpret_cast<uintptr_t>(record->ExceptionAddress)),
++                     fault_address, ex_info);
++  std::string reason = fmt::format("unhandled exception 0x{:08X}", uint32_t(record->ExceptionCode));
++  LogCurrentFaultContext(reason.c_str());
++  EndFaultDispatch();
++  return previous_unhandled_filter_ ? previous_unhandled_filter_(ex_info)
++                                    : EXCEPTION_CONTINUE_SEARCH;
++}
++
+ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
+   // Visual Studio SetThreadName.
+   if (ex_info->ExceptionRecord->ExceptionCode == 0x406D1388) {
+@@ -77,8 +102,11 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
+       return EXCEPTION_CONTINUE_SEARCH;
+   }
+ 
++  // Cheap bookkeeping so a handler that gives up can log crash context.
++  BeginFaultDispatch(thread_context.rip, ex.fault_address(), ex_info);
+   for (size_t i = 0; i < rex::countof(handlers_) && handlers_[i].first; ++i) {
+     if (handlers_[i].first(&ex, handlers_[i].second)) {
++      EndFaultDispatch();
+       // Exception handled.
+       ex_info->ContextRecord->Rip = thread_context.rip;
+       ex_info->ContextRecord->EFlags = thread_context.eflags;
+@@ -98,10 +126,15 @@ LONG CALLBACK ExceptionHandlerCallback(PEXCEPTION_POINTERS ex_info) {
+       return EXCEPTION_CONTINUE_EXECUTION;
+     }
+   }
++  EndFaultDispatch();
+   return EXCEPTION_CONTINUE_SEARCH;
+ }
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
++  if (!unhandled_filter_installed_) {
++    previous_unhandled_filter_ = SetUnhandledExceptionFilter(UnhandledExceptionFilterCallback);
++    unhandled_filter_installed_ = true;
++  }
+   if (!veh_handle_) {
+     veh_handle_ = AddVectoredExceptionHandler(1, ExceptionHandlerCallback);
+ 
+diff --git a/src/core/fault_context.cpp b/src/core/fault_context.cpp
+new file mode 100644
+index 0000000..55a3cea
+--- /dev/null
++++ b/src/core/fault_context.cpp
+@@ -0,0 +1,261 @@
++/**
++ * @file        rex/core/fault_context.cpp
++ * @brief       Crash context for unresolved host faults (PC, address, guest
++ *              thread, symbolised host backtrace)
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#include <rex/exception_handler.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cstdint>
++#include <iterator>
++#include <mutex>
++#include <string>
++
++#include <fmt/format.h>
++
++#include <rex/logging.h>
++#include <rex/platform.h>
++
++#if REX_PLATFORM_WIN32
++#include "platform_win.h"
++
++#include <dbghelp.h>
++#else
++#include <cxxabi.h>
++#include <dlfcn.h>
++#include <unwind.h>
++
++#include <cstdlib>
++#endif
++
++namespace rex::arch {
++
++namespace {
++
++constexpr size_t kMaxFrames = 24;
++
++std::atomic<FaultContextProvider> fault_context_provider{nullptr};
++
++struct FaultDispatchState {
++  bool active = false;
++  uint64_t host_pc = 0;
++  uint64_t fault_address = 0;
++  const void* platform_context = nullptr;
++};
++thread_local FaultDispatchState tls_fault;
++thread_local uint64_t tls_last_logged_pc = 0;
++thread_local uint64_t tls_last_logged_address = ~uint64_t(0);
++
++std::mutex& SymbolMutex() {
++  static std::mutex mutex;
++  return mutex;
++}
++
++#if REX_PLATFORM_WIN32
++
++using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
++using SymInitializeFn = BOOL(WINAPI*)(HANDLE, PCSTR, BOOL);
++using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, PDWORD64, PSYMBOL_INFO);
++
++struct DbgHelp {
++  SymFromAddrFn sym_from_addr = nullptr;
++  bool ok = false;
++};
++
++// dbghelp.dll is loaded on first use only (no link dependency).
++DbgHelp& GetDbgHelp() {
++  static DbgHelp dbghelp = [] {
++    DbgHelp d;
++    HMODULE module = LoadLibraryW(L"dbghelp.dll");
++    if (!module) {
++      return d;
++    }
++    auto set_options = reinterpret_cast<SymSetOptionsFn>(
++        reinterpret_cast<void*>(GetProcAddress(module, "SymSetOptions")));
++    auto initialize = reinterpret_cast<SymInitializeFn>(
++        reinterpret_cast<void*>(GetProcAddress(module, "SymInitialize")));
++    d.sym_from_addr = reinterpret_cast<SymFromAddrFn>(
++        reinterpret_cast<void*>(GetProcAddress(module, "SymFromAddr")));
++    if (!set_options || !initialize || !d.sym_from_addr) {
++      return d;
++    }
++    set_options(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_FAIL_CRITICAL_ERRORS);
++    d.ok = initialize(GetCurrentProcess(), nullptr, TRUE) != FALSE;
++    return d;
++  }();
++  return dbghelp;
++}
++
++std::string Symbolize(uint64_t address) {
++  std::string module_name = "?";
++  uint64_t module_base = 0;
++  HMODULE module = nullptr;
++  if (GetModuleHandleExW(
++          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++          reinterpret_cast<LPCWSTR>(address), &module)) {
++    char path[MAX_PATH];
++    DWORD len = GetModuleFileNameA(module, path, MAX_PATH);
++    if (len) {
++      std::string full(path, len);
++      size_t slash = full.find_last_of("\\/");
++      module_name = slash == std::string::npos ? full : full.substr(slash + 1);
++    }
++    module_base = reinterpret_cast<uint64_t>(module);
++  }
++
++  DbgHelp& dbghelp = GetDbgHelp();
++  if (dbghelp.ok) {
++    alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 256];
++    auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
++    symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
++    symbol->MaxNameLen = 255;
++    DWORD64 displacement = 0;
++    if (dbghelp.sym_from_addr(GetCurrentProcess(), address, &displacement, symbol)) {
++      return fmt::format("{}!{}+0x{:X}", module_name, symbol->Name, displacement);
++    }
++  }
++  if (module_base) {
++    return fmt::format("{}+0x{:X}", module_name, address - module_base);
++  }
++  return "?";
++}
++
++size_t CaptureBacktrace(const void* platform_context, uint64_t* frames, size_t max_frames) {
++#if REX_ARCH_AMD64
++  if (platform_context) {
++    // Unwind from the faulting context itself (not from the handler's stack).
++    CONTEXT context = *static_cast<const EXCEPTION_POINTERS*>(platform_context)->ContextRecord;
++    size_t count = 0;
++    while (count < max_frames && context.Rip) {
++      frames[count++] = context.Rip;
++      DWORD64 image_base = 0;
++      PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
++      if (function) {
++        void* handler_data = nullptr;
++        DWORD64 establisher_frame = 0;
++        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
++                         &handler_data, &establisher_frame, nullptr);
++      } else {
++        // Leaf function (or no unwind info): return address is at [rsp].
++        if (!context.Rsp) {
++          break;
++        }
++        context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
++        context.Rsp += 8;
++      }
++    }
++    return count;
++  }
++#else
++  (void)platform_context;
++#endif
++  void* raw[kMaxFrames];
++  USHORT n = RtlCaptureStackBackTrace(0, DWORD(std::min(max_frames, kMaxFrames)), raw, nullptr);
++  for (USHORT i = 0; i < n; ++i) {
++    frames[i] = reinterpret_cast<uint64_t>(raw[i]);
++  }
++  return n;
++}
++
++#else  // POSIX / Android
++
++std::string Symbolize(uint64_t address) {
++  Dl_info info{};
++  if (!dladdr(reinterpret_cast<void*>(address), &info) || !info.dli_fname) {
++    return "?";
++  }
++  std::string module_name = info.dli_fname;
++  size_t slash = module_name.find_last_of('/');
++  if (slash != std::string::npos) {
++    module_name = module_name.substr(slash + 1);
++  }
++  if (info.dli_sname && info.dli_saddr) {
++    int status = 0;
++    char* demangled = abi::__cxa_demangle(info.dli_sname, nullptr, nullptr, &status);
++    std::string name = (status == 0 && demangled) ? demangled : info.dli_sname;
++    std::free(demangled);
++    return fmt::format("{}!{}+0x{:X}", module_name, name,
++                       address - reinterpret_cast<uint64_t>(info.dli_saddr));
++  }
++  return fmt::format("{}+0x{:X}", module_name,
++                     address - reinterpret_cast<uint64_t>(info.dli_fbase));
++}
++
++struct UnwindState {
++  uint64_t* frames;
++  size_t count;
++  size_t max;
++};
++
++_Unwind_Reason_Code UnwindCallback(struct _Unwind_Context* context, void* arg) {
++  auto* state = static_cast<UnwindState*>(arg);
++  uint64_t pc = uint64_t(_Unwind_GetIP(context));
++  if (pc) {
++    state->frames[state->count++] = pc;
++  }
++  return state->count >= state->max ? _URC_END_OF_STACK : _URC_NO_REASON;
++}
++
++// Unwinds from the handler through the signal frame into the faulting frames.
++size_t CaptureBacktrace(const void* /*platform_context*/, uint64_t* frames, size_t max_frames) {
++  UnwindState state{frames, 0, max_frames};
++  _Unwind_Backtrace(UnwindCallback, &state);
++  return state.count;
++}
++
++#endif
++
++}  // namespace
++
++void SetFaultContextProvider(FaultContextProvider provider) {
++  fault_context_provider.store(provider, std::memory_order_release);
++}
++
++void BeginFaultDispatch(uint64_t host_pc, uint64_t fault_address, const void* platform_context) {
++  tls_fault = {true, host_pc, fault_address, platform_context};
++}
++
++void EndFaultDispatch() {
++  tls_fault.active = false;
++}
++
++void LogCurrentFaultContext(const char* reason) {
++  if (!tls_fault.active) {
++    return;
++  }
++  if (tls_last_logged_pc == tls_fault.host_pc &&
++      tls_last_logged_address == tls_fault.fault_address) {
++    return;  // Already reported (e.g. by the guest memory path).
++  }
++  tls_last_logged_pc = tls_fault.host_pc;
++  tls_last_logged_address = tls_fault.fault_address;
++
++  std::lock_guard<std::mutex> lock(SymbolMutex());
++  std::string out;
++  out.reserve(4096);
++  auto it = std::back_inserter(out);
++  fmt::format_to(it, "==== Host fault: {} ====\n", reason ? reason : "unhandled");
++  fmt::format_to(it, "  host pc: 0x{:016X} {}\n", tls_fault.host_pc,
++                 Symbolize(tls_fault.host_pc));
++  fmt::format_to(it, "  fault address: 0x{:016X}\n", tls_fault.fault_address);
++  if (auto provider = fault_context_provider.load(std::memory_order_acquire)) {
++    provider(out);
++  }
++  uint64_t frames[kMaxFrames];
++  size_t count = CaptureBacktrace(tls_fault.platform_context, frames, kMaxFrames);
++  fmt::format_to(it, "  host backtrace ({} frame(s)):\n", count);
++  for (size_t i = 0; i < count; ++i) {
++    fmt::format_to(it, "    #{:02} 0x{:016X} {}{}\n", i, frames[i], Symbolize(frames[i]),
++                   frames[i] == tls_fault.host_pc ? "  <-- fault" : "");
++  }
++  out += "==== end of host fault ====";
++  REXLOG_CRITICAL("{}", out);
++  rex::FlushLogging();
++}
++
++}  // namespace rex::arch

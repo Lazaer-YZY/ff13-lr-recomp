@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Lightning Returns Recomp</string>
+    <string name="touch_hide_all">Hide all touch controls</string>
+    <string name="touch_hide_all_help">Reveal the system bars or use Android Back to show CTRL for 4 seconds.</string>
+    <string name="touch_settings_title">Controller settings</string>
+    <string name="touch_show_controls">Show touch controls</string>
+    <string name="touch_controller_hint">Physical controller connected. Touch controls hide automatically; turn them on here to use both together.</string>
+    <string name="touch_control_size">Control size: %1$d%%</string>
+    <string name="touch_opacity">Opacity: %1$d%%</string>
+    <string name="touch_ctrl_auto_hide">Auto-hide CTRL button</string>
+    <string name="touch_gpu_driver">GPU driver: %1$s …</string>
+    <string name="touch_gpu_driver_system">System</string>
+    <string name="touch_game_folder">Game folder …</string>
+    <string name="touch_apply">Apply</string>
+    <string name="touch_edit_layout">Edit layout</string>
+    <string name="touch_render_title">Display</string>
+    <string name="touch_frame_rate">Frame rate</string>
+    <string name="touch_fps_30">30 fps (as on the Xbox 360)</string>
+    <string name="touch_fps_40">40 fps in gameplay (120 Hz panel mode; cutscenes stay at 30; from the next start)</string>
+    <string name="touch_fps_60">60 fps in gameplay (cutscenes stay at 30; needs GPU headroom, runs hotter)</string>
+    <string name="touch_panel120">Smoother 60 fps: 120 Hz panel mode (a frame that misses 16.7 ms shows after 25 ms instead of 33; runs hotter; from the next start)</string>
+    <string name="touch_fps_40_fallback">The last start at 40 fps did not get going; back to 30 fps.</string>
+    <string name="touch_aa">Anti-aliasing (FXAA, at the game\'s 720p)</string>
+    <string name="touch_aa_off">Off</string>
+    <string name="touch_aa_fxaa">FXAA</string>
+    <string name="touch_upscale">Upscaling 720p to the screen (applies at the next start)</string>
+    <string name="touch_upscale_bilinear">Bilinear</string>
+    <string name="touch_upscale_fsr">AMD FSR 1.0 (sharper edges)</string>
+    <string name="touch_upscale_cas">AMD CAS (sharpening)</string>
+    <string name="touch_perf_overlay">Performance overlay (frame rate, frame time graph; the game\'s own frames)</string>
+    <string name="touch_exact_shader_math">Exact Xbox shader math (slower; only if something renders wrong; from the next start, shaders rebuild once)</string>
+    <string name="touch_companion">Second screen: schemata in battle (tap to switch), map in the field, artwork in cutscenes</string>
+    <string name="touch_debug_log">Debug logging (frame and wait statistics for troubleshooting; slight extra load; from the next start)</string>
+    <string name="touch_cancel">Cancel</string>
+</resources>

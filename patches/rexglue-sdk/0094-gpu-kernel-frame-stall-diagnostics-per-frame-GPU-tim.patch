@@ -1,0 +1,285 @@
+From c6e26e2c3da7183accc82262972dd6d8418a3e28 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Tue, 10 Nov 2026 21:59:57 +0800
+Subject: [PATCH 094/108] gpu/kernel: frame-stall diagnostics (per-frame GPU
+ time, upload/primitive timers, timeline observers)
+
+- "GPU slow frame on the GPU": per-frame GPU time from the timing queries when
+  over vulkan_slow_frame_ms, split by category.
+- Command thread slow-frame line also times primitive processing (index
+  buffers) and vertex buffer requests; render target creation logs its time.
+- rex_set_event_observer (KeSetEvent, NtSetEvent, KeReleaseSemaphore,
+  NtReleaseSemaphore) and rex_gpu_timeline_observer (command thread idle,
+  WAIT_REG_MEM, swaps) for the game library's frame timeline recorder.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 40f2d47..72292e1 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -388,7 +388,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // vulkan_slow_frame_ms: the command thread's time between two swaps, split by activity.
+   struct CpFrameStats {
+     uint64_t start_ns = 0, translate_ns = 0, textures_ns = 0, pipeline_ns = 0, rt_update_ns = 0,
+-             copy_ns = 0, submit_ns = 0, fence_us = 0, regmem_us_start = 0;
++             copy_ns = 0, submit_ns = 0, fence_us = 0, regmem_us_start = 0, primitives_ns = 0,
++             vertex_buffers_ns = 0, vertex_buffer_bytes = 0;
+     uint32_t draws = 0, copies = 0;
+   };
+   CpFrameStats cp_frame_;
+@@ -1059,7 +1060,14 @@ class VulkanCommandProcessor : public CommandProcessor {
+     // vulkan_gpu_trace_frame: timestamp query written after each draw of the
+     // traced frame, and the index of the draw in gpu_trace_draws_.
+     std::vector<std::pair<uint32_t, uint32_t>> draw_queries;
++    // Guest frame (swap count) the submission belongs to.
++    uint64_t frame = 0;
+   };
++  // vulkan_slow_frame_ms on the GPU side: the GPU time of each frame, from its submissions.
++  uint64_t gpu_timing_frame_index_ = 0;
++  uint64_t gpu_frame_accum_frame_ = 0;
++  double gpu_frame_accum_ns_[size_t(GpuTimingCategory::kCount)] = {};
++  void GpuTimingFlushFrame();
+   void GpuTimingWriteTimestamp(GpuTimingCategory category);
+   void GpuTimingBeginSubmission();
+   void GpuTimingEndSubmission();
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index b88faf7..93e8091 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -102,6 +102,12 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+                     "pipelines are being prepared.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++// Diagnostics: the GPU command thread's timeline (lr_hooks.cpp frame timeline recorder).
++// kind 1/2 = waiting for new commands begins/ends, 3/4 = WAIT_REG_MEM wait begins/ends (value =
++// the polled address), 5 = swap (value = front buffer address).
++// Defined in the runtime (xboxkrnl_threading.cpp) so the game library can set it.
++extern "C" void (*rex_gpu_timeline_observer)(uint32_t kind, uint32_t value);
++
+ namespace rex::graphics {
+ 
+ using namespace rex::graphics::xenos;
+@@ -250,10 +256,12 @@ void CommandProcessor::WorkerThreadMain() {
+           // event is set by every write pointer update, CallInThread and
+           // Shutdown, so an untimed wait is enough.
+           const int wait_time_ms = 5;
++          if (auto observer = rex_gpu_timeline_observer) observer(1, 0);
+           rex::thread::Wait(write_ptr_index_event_.get(), true,
+                             REXCVAR_GET(gpu_command_wait_untimed)
+                                 ? std::chrono::milliseconds::max()
+                                 : std::chrono::milliseconds(wait_time_ms));
++          if (auto observer = rex_gpu_timeline_observer) observer(2, 0);
+         }
+ 
+         rex::thread::MaybeYield();
+@@ -988,6 +996,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
++  if (auto observer = rex_gpu_timeline_observer) observer(5, frontbuffer_ptr);
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+ 
+   ++counter_;
+@@ -1067,6 +1076,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+     if (!matched) {
+       if (!polls++) {
++        if (auto observer = rex_gpu_timeline_observer) observer(3, poll_reg_addr);
+         wait_start_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch())
+                                      .count());
+@@ -1101,6 +1111,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+   } while (!matched);
+   if (polls) {
++    if (auto observer = rex_gpu_timeline_observer) observer(4, poll_reg_addr);
+     wait_reg_mem_us_total_ += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count()) -
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 8080340..fb959fe 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3812,6 +3812,7 @@ void VulkanCommandProcessor::GpuTimingBeginSubmission() {
+   }
+   submission.timestamp_count = 0;
+   submission.closed = false;
++  submission.frame = gpu_timing_frame_index_;
+   gpu_timing_current_ = std::move(submission);
+   deferred_command_buffer_.CmdVkResetQueryPool(gpu_timing_current_.pool, 0,
+                                                kGpuTimingMaxTimestamps);
+@@ -3842,6 +3843,10 @@ void VulkanCommandProcessor::GpuTimingReadCompleted() {
+     }
+     GpuTimingSubmission& submission = submission_pair.second;
+     uint32_t count = submission.timestamp_count;
++    if (submission.frame != gpu_frame_accum_frame_) {
++      GpuTimingFlushFrame();
++      gpu_frame_accum_frame_ = submission.frame;
++    }
+     if (count >= 2) {
+       gpu_timing_results_.resize(count);
+       // The submission fence is signaled, so this doesn't wait.
+@@ -3856,6 +3861,7 @@ void VulkanCommandProcessor::GpuTimingReadCompleted() {
+           uint64_t ticks =
+               (gpu_timing_results_[i + 1] - gpu_timing_results_[i]) & gpu_timing_valid_mask_;
+           gpu_timing_category_ns_[category] += double(ticks) * gpu_timing_period_ns_;
++          gpu_frame_accum_ns_[category] += double(ticks) * gpu_timing_period_ns_;
+           if (category == uint8_t(GpuTimingCategory::kDraws) ||
+               category == uint8_t(GpuTimingCategory::kTransfers)) {
+             gpu_timing_tag_stats_[submission.tags[i]].ns += double(ticks) * gpu_timing_period_ns_;
+@@ -3883,7 +3889,24 @@ void VulkanCommandProcessor::GpuTimingReadCompleted() {
+   }
+ }
+ 
++void VulkanCommandProcessor::GpuTimingFlushFrame() {
++  double total = 0.0;
++  for (double ns : gpu_frame_accum_ns_) total += ns;
++  const uint32_t threshold_ms = REXCVAR_GET(vulkan_slow_frame_ms);
++  if (threshold_ms && total > double(threshold_ms) * 1e6) {
++    auto ms = [&](GpuTimingCategory c) { return gpu_frame_accum_ns_[size_t(c)] * 1e-6; };
++    REXGPU_INFO("GPU slow frame on the GPU: frame {}: {:.1f} ms = draws {:.1f} + transfers {:.1f} + "
++                "resolves {:.1f} + texture loads {:.1f} + uploads {:.1f} + swap {:.1f} + other {:.1f}",
++                gpu_frame_accum_frame_, total * 1e-6, ms(GpuTimingCategory::kDraws),
++                ms(GpuTimingCategory::kTransfers), ms(GpuTimingCategory::kResolves),
++                ms(GpuTimingCategory::kTextureLoads), ms(GpuTimingCategory::kUploads),
++                ms(GpuTimingCategory::kSwap), ms(GpuTimingCategory::kOther));
++  }
++  for (double& ns : gpu_frame_accum_ns_) ns = 0.0;
++}
++
+ void VulkanCommandProcessor::GpuTimingOnSwap() {
++  ++gpu_timing_frame_index_;
+   ui::vulkan::VulkanPresenter* presenter =
+       graphics_system_
+           ? static_cast<ui::vulkan::VulkanPresenter*>(graphics_system_->presenter())
+@@ -4666,13 +4689,16 @@ void VulkanCommandProcessor::CpFrameOnSwap() {
+     const double total = (now - f.start_ns) / 1e6;
+     const double regmem = (wait_reg_mem_us_total_ - f.regmem_us_start) / 1e3;
+     const double known = (f.translate_ns + f.textures_ns + f.pipeline_ns + f.rt_update_ns +
+-                          f.copy_ns + f.submit_ns) / 1e6 + f.fence_us / 1e3 + regmem;
++                          f.copy_ns + f.submit_ns + f.primitives_ns + f.vertex_buffers_ns) / 1e6 +
++                         f.fence_us / 1e3 + regmem;
+     REXGPU_INFO("GPU slow frame: {:.1f} ms between swaps = shader translation {:.1f} + pipelines "
+                 "{:.1f} + textures {:.1f} + render targets {:.1f} + copies {:.1f} ({}) + submits "
+-                "{:.1f} + fence waits {:.1f} + WAIT_REG_MEM {:.1f} + other {:.1f}; {} draws",
++                "{:.1f} + fence waits {:.1f} + WAIT_REG_MEM {:.1f} + primitives/indices {:.1f} + "
++                "vertex buffers {:.1f} ({:.1f} MB requested) + other {:.1f}; {} draws",
+                 total, f.translate_ns / 1e6, f.pipeline_ns / 1e6, f.textures_ns / 1e6,
+                 f.rt_update_ns / 1e6, f.copy_ns / 1e6, f.copies, f.submit_ns / 1e6, f.fence_us / 1e3,
+-                regmem, total - known, f.draws);
++                regmem, f.primitives_ns / 1e6, f.vertex_buffers_ns / 1e6,
++                f.vertex_buffer_bytes / 1048576.0, total - known, f.draws);
+   }
+   f = CpFrameStats();
+   f.start_ns = now;
+@@ -4960,7 +4986,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+ 
+     // Process primitives.
+-    if (!primitive_processor_->Process(primitive_processing_result)) {
++    bool primitives_processed;
++    {
++      CpScopedTimer primitives_timer(cp_frame_.primitives_ns);
++      primitives_processed = primitive_processor_->Process(primitive_processing_result);
++    }
++    if (!primitives_processed) {
+       return draw_fail("primitive_processing");
+     }
+     if (!primitive_processing_result.host_draw_vertex_count) {
+@@ -5325,7 +5356,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+         continue;
+       }
+-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
++      bool vertex_buffer_requested;
++      {
++        CpScopedTimer vertex_buffer_timer(cp_frame_.vertex_buffers_ns);
++        cp_frame_.vertex_buffer_bytes += uint64_t(vfetch_constant.size) << 2;
++        vertex_buffer_requested =
++            shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2);
++      }
++      if (!vertex_buffer_requested) {
+         REXGPU_ERROR(
+             "Failed to request vertex buffer at 0x{:08X} (size {}) in the shared "
+             "memory",
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index fbf3b0b..3ddffc0 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <unordered_set>
+ #include <array>
+ #include <cstddef>
+@@ -2445,6 +2446,19 @@ uint32_t VulkanRenderTargetCache::GetMaxRenderTargetHeight() const {
+ }
+ 
+ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(RenderTargetKey key) {
++  // How long creating a render target takes on the command thread (image, memory, views,
++  // descriptors): logged per creation.
++  struct CreateTimer {
++    RenderTargetKey key;
++    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++    ~CreateTimer() {
++      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
++      REXGPU_INFO("Render target created in {:.2f} ms: {} {} wide (pitch {} tiles), {}x MSAA, "
++                  "format {}", ms,
++                  key.is_depth ? "depth" : "color", key.GetWidth(), uint32_t(key.pitch_tiles_at_32bpp),
++                  1u << uint32_t(key.msaa_samples), uint32_t(key.resource_format));
++    }
++  } create_timer{key};
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 57fd161..d1f5405 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -472,7 +472,19 @@ uint32_t xeKeSetEvent(X_KEVENT* event_ptr, uint32_t increment, uint32_t wait) {
+   return ev->Set(increment, !!wait);
+ }
+ 
++// Diagnostics: called on every KeSetEvent (kind 0, the event's guest address), NtSetEvent
++// (kind 1, the handle), KeReleaseSemaphore (2, address) and NtReleaseSemaphore (3, handle) when set (the game's frame timeline recorder in lr_hooks.cpp).
++extern "C" __attribute__((visibility("default"))) void (*rex_set_event_observer)(uint32_t kind,
++                                                                                uint32_t object) =
++    nullptr;
++// The GPU command thread's timeline observer (set by the game library, called in
++// graphics/command_processor.cpp; lives here so both libraries link it).
++extern "C" __attribute__((visibility("default"))) void (*rex_gpu_timeline_observer)(uint32_t kind,
++                                                                                   uint32_t value) =
++    nullptr;
++
+ u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
++  if (auto observer = rex_set_event_observer) observer(0, event_ptr.guest_address());
+   return xeKeSetEvent(event_ptr, increment, wait);
+ }
+ 
+@@ -544,6 +556,7 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
+ }
+ 
+ u32 NtSetEvent_entry(u32 handle, mapped_u32 previous_state_ptr) {
++  if (auto observer = rex_set_event_observer) observer(1, handle);
+   return xeNtSetEvent(handle, previous_state_ptr);
+ }
+ 
+@@ -613,6 +626,7 @@ uint32_t xeKeReleaseSemaphore(X_KSEMAPHORE* semaphore_ptr, uint32_t increment, u
+ 
+ u32 KeReleaseSemaphore_entry(ppc_ptr_t<X_KSEMAPHORE> semaphore_ptr, u32 increment, u32 adjustment,
+                              u32 wait) {
++  if (auto observer = rex_set_event_observer) observer(2, semaphore_ptr.guest_address());
+   return xeKeReleaseSemaphore(semaphore_ptr, increment, adjustment, wait);
+ }
+ 
+@@ -655,6 +669,7 @@ u32 NtCreateSemaphore_entry(mapped_u32 handle_ptr, mapped_void obj_attributes_pt
+ }
+ 
+ u32 NtReleaseSemaphore_entry(u32 sem_handle, u32 release_count, mapped_u32 previous_count_ptr) {
++  if (auto observer = rex_set_event_observer) observer(3, sem_handle);
+   X_STATUS result = X_STATUS_SUCCESS;
+   int32_t previous_count = 0;
+ 

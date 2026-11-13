@@ -1,0 +1,62 @@
+From 2a62147ddced53937f3e01e7a13bb0bc1b774bd7 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 21:30:56 +0800
+Subject: [PATCH 037/108] input: sdl: queue at most one controller-update pump
+ every 4 ms
+
+Every XInput poll queued an SDL_PumpEvents call on the UI thread, re-queued as
+soon as the last one ran. Games that poll from several threads in loops kept
+the UI thread waking for nothing; one pump per 4 ms is plenty since the UI loop
+also pumps whenever input arrives.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/input/sdl/sdl_input_driver.h b/include/rex/input/sdl/sdl_input_driver.h
+index be1f9b8..14470f6 100644
+--- a/include/rex/input/sdl/sdl_input_driver.h
++++ b/include/rex/input/sdl/sdl_input_driver.h
+@@ -96,6 +96,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+   bool SDL_Gamepad_initialized_;
+   std::atomic<int> sdl_events_unflushed_;
+   std::atomic<bool> sdl_pumpevents_queued_;
++  // steady_clock time (ns) the last pump was queued; see QueueControllerUpdate.
++  std::atomic<uint64_t> sdl_pumpevents_last_ns_{0};
+   // Appended in connection order, never re-sorted, and unbounded: the
+   // assignment decides how many the guest sees.
+   std::vector<ControllerState> controllers_;
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index 57f65c4..aa5ba00 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cctype>
++#include <chrono>
+ #include <filesystem>
+ #include <string_view>
+ 
+@@ -841,10 +842,22 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
+ }
+ 
+ void SDLInputDriver::QueueControllerUpdate() {
+-  // Pump SDL events to ensure controller state is up to date.
++  // Pump SDL events to ensure controller state is up to date. Games can poll
++  // XInput in tight loops from several threads; queueing a pump on every poll
++  // kept the UI thread waking and running SDL_PumpEvents back to back (70% of a
++  // core on an Android handheld). The UI loop pumps by itself whenever input
++  // arrives, so one extra pump every few ms is enough.
++  constexpr uint64_t kMinPumpIntervalNs = 4'000'000;
++  const uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                       std::chrono::steady_clock::now().time_since_epoch())
++                                       .count());
++  if (now_ns - sdl_pumpevents_last_ns_.load(std::memory_order_relaxed) < kMinPumpIntervalNs) {
++    return;
++  }
+   bool is_queued = false;
+   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+   if (!is_queued) {
++    sdl_pumpevents_last_ns_.store(now_ns, std::memory_order_relaxed);
+     attached_window_->app_context().CallInUIThread([this]() {
+       SDL_PumpEvents();
+       sdl_pumpevents_queued_ = false;

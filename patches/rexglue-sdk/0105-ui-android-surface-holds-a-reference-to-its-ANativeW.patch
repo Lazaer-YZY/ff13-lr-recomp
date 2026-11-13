@@ -1,0 +1,52 @@
+From 57b89dae293729ea8b9b02564cbe0ae80eb7d1c9 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Thu, 12 Nov 2026 18:38:03 +0800
+Subject: [PATCH 105/108] ui/android: surface holds a reference to its
+ ANativeWindow (no crash reconnecting after a failed swapchain)
+
+
+diff --git a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
+index 5693321..aa1d584 100644
+--- a/include/rex/ui/surface_android.h
++++ b/include/rex/ui/surface_android.h
+@@ -19,9 +19,16 @@ namespace ui {
+ 
+ // Wraps the ANativeWindow owned by SDL's Android backend (SDLActivity). The
+ // presenter creates the VkSurfaceKHR itself via vkCreateAndroidSurfaceKHR.
++// Holds its own reference (ANativeWindow_acquire/release): SDL releases the window when the
++// activity pauses, and a presenter reconnecting to the stale pointer after a failed swapchain
++// creation crashed in the Vulkan loader's incStrong (2026-11-12, surface churn at app start).
++// With the reference the object stays valid; the dead surface only fails swapchain creation.
+ class AndroidNativeWindowSurface final : public Surface {
+  public:
+-  explicit AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {}
++  explicit AndroidNativeWindowSurface(ANativeWindow* window);
++  ~AndroidNativeWindowSurface() override;
++  AndroidNativeWindowSurface(const AndroidNativeWindowSurface&) = delete;
++  AndroidNativeWindowSurface& operator=(const AndroidNativeWindowSurface&) = delete;
+   TypeIndex GetType() const override { return kTypeIndex_AndroidNativeWindow; }
+   ANativeWindow* window() const { return window_; }
+ 
+diff --git a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
+index ceb1405..f8d1897 100644
+--- a/src/ui/surface_android.cpp
++++ b/src/ui/surface_android.cpp
+@@ -22,6 +22,18 @@ REXCVAR_DECLARE(int32_t, present_max_height);
+ namespace rex {
+ namespace ui {
+ 
++AndroidNativeWindowSurface::AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {
++  if (window_) {
++    ANativeWindow_acquire(window_);
++  }
++}
++
++AndroidNativeWindowSurface::~AndroidNativeWindowSurface() {
++  if (window_) {
++    ANativeWindow_release(window_);
++  }
++}
++
+ bool AndroidNativeWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
+   if (!window_) {
+     return false;

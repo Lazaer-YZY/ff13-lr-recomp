@@ -1,0 +1,56 @@
+From 610f4dca22f813c6fc4c5d3708dff90a70dd8985 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 21:48:10 +0800
+Subject: [PATCH 090/108] core: arm64 raw clock source (CNTVCT_EL0) for
+ clock_source_raw
+
+Guest mftb reads went through clock_gettime (vdso) plus a mutex. On arm64 the
+raw source now reads the generic timer's virtual counter. Measured with
+--clock_source_raw --clock_no_scaling on the Thor (Yusnaan, 60 fps): no
+measurable change in game code per frame, so the defaults stay.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/chrono/clock.h b/include/rex/chrono/clock.h
+index c19caea..7705afc 100644
+--- a/include/rex/chrono/clock.h
++++ b/include/rex/chrono/clock.h
+@@ -24,6 +24,14 @@ REXCVAR_DECLARE(bool, clock_source_raw);
+ // Raw clock source requires platform-specific implementation
+ // Disable for now - use platform clock functions instead
+ #define REX_CLOCK_RAW_AVAILABLE 0
++#elif REX_ARCH_ARM64 && defined(__aarch64__) && !defined(__APPLE__)
++// The generic timer's virtual counter (CNTVCT_EL0, frequency in CNTFRQ_EL0): readable from user
++// space, synchronised across cores, a few ns per read instead of a vdso clock_gettime call
++// (guest mftb reads are frequent: ~3% of the main thread's time on the Thor).
++#define REX_CLOCK_RAW_AVAILABLE 1
++#endif
++#ifndef REX_CLOCK_RAW_AVAILABLE
++#define REX_CLOCK_RAW_AVAILABLE 0
+ #endif
+ 
+ namespace rex::chrono {
+diff --git a/src/core/clock_posix.cpp b/src/core/clock_posix.cpp
+index 00f2382..330bde5 100644
+--- a/src/core/clock_posix.cpp
++++ b/src/core/clock_posix.cpp
+@@ -20,6 +20,19 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ 
+ namespace rex::chrono {
+ 
++#if REX_CLOCK_RAW_AVAILABLE && defined(__aarch64__)
++uint64_t Clock::host_tick_frequency_raw() {
++  uint64_t frequency;
++  __asm__ __volatile__("mrs %0, cntfrq_el0" : "=r"(frequency));
++  return frequency;
++}
++uint64_t Clock::host_tick_count_raw() {
++  uint64_t count;
++  __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(count)::"memory");
++  return count;
++}
++#endif
++
+ uint64_t Clock::host_tick_frequency_platform() {
+ #ifdef __APPLE__
+   mach_timebase_info_data_t info;

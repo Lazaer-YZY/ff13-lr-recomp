@@ -1,0 +1,640 @@
+From d247e2c2066c7b82bddfc93b8115904a063a8984 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 19:23:56 +0800
+Subject: [PATCH 089/108] gpu: texture sign specialization constants; shader
+ translation really on the creation threads
+
+Pixel shaders get one specialization constant per fetch constant they sample
+(SpecId 1000 + index) with the sign class of the bound texture: 0 = runtime
+(the system constant word, as before), 1 all unsigned, 2 gamma RGB + unsigned A,
+3 all gamma. Selects on the constant fold in the host compiler, so the sign and
+gamma branches of fetches whose textures are of a known class disappear. The
+command processor computes the classes of the first 8 fetch constants of the
+pixel shader's used texture mask from the texture cache's bindings; they are 16
+bits of PipelineDescription (zero = the old hash, so stored pipelines stay
+valid) and part of the fragment library key (VkSpecializationInfo on the
+fragment stage, monolithic or GPL). A specialized pipeline that is not ready is
+queued on the creation threads (or linked from cached libraries) and the draw
+uses the runtime variant meanwhile; stored descriptions preload the variants.
+Fragment library keys now include the translation switches; precompile marker
+version 4. Cvar spirv_texture_sign_specialization (default on). Yusnaan view at
+60 fps: 13.23 -> 11.97 Mcycles per frame (-9.5%), GPU 19.45 -> 17.60 ms.
+
+IssueDraw translated new shaders synchronously before ConfigurePipeline, so
+vulkan_async_shader_translation never ran (every log: 0 translations on the
+creation threads; 6-14 ms each on the GPU thread, the 70-180 ms frames on
+arrival). The command processor now leaves untranslated shaders to
+ConfigurePipeline when the pipeline cache translates on the creation threads,
+reading a shader's bindings only from a translation completed before the draw.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index ed7e8ee..1d8726d 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -26,6 +26,42 @@ namespace rex::graphics {
+ 
+ class SpirvShaderTranslator : public ShaderTranslator {
+  public:
++  // Texture sign specialization (pixel shaders): each of the first kTextureSignClassSlots fetch
++  // constants a pixel shader uses (in ascending fetch constant order of its used texture mask)
++  // gets a specialization constant (SpecId kTextureSignClassSpecIdBase + fetch constant index)
++  // holding the sign class of its swizzled signs. Class 0 (the default) reads the signs from the
++  // system constants as without specialization; the others fix the swizzled signs byte, so the
++  // host compiler drops the sign / gamma handling that doesn't apply.
++  static constexpr uint32_t kTextureSignClassSpecIdBase = 1000;
++  static constexpr uint32_t kTextureSignClassSlots = 8;
++  static constexpr uint32_t kTextureSignClassBits = 2;
++  enum TextureSignClass : uint32_t {
++    kTextureSignClassRuntime = 0,
++    // Swizzled signs 0b00000000.
++    kTextureSignClassUnsigned = 1,
++    // Components 0-2 gamma, 3 unsigned: 0b00111111.
++    kTextureSignClassGammaRgb = 2,
++    // 0b11111111.
++    kTextureSignClassGamma = 3,
++  };
++  static constexpr uint8_t kTextureSignClassSwizzledSigns[4] = {0, 0b00000000, 0b00111111,
++                                                                0b11111111};
++  static TextureSignClass GetTextureSignClass(uint8_t swizzled_signs) {
++    switch (swizzled_signs) {
++      case 0b00000000:
++        return kTextureSignClassUnsigned;
++      case 0b00111111:
++        return kTextureSignClassGammaRgb;
++      case 0b11111111:
++        return kTextureSignClassGamma;
++      default:
++        return kTextureSignClassRuntime;
++    }
++  }
++  // Whether pixel shaders are translated with the sign class specialization constants
++  // (spirv_texture_sign_specialization).
++  static bool IsTextureSignSpecializationEnabled();
++
+   union Modification {
+     // If anything in this is structure is changed in a way not compatible with
+     // the previous layout, invalidate the pipeline storages by increasing this
+@@ -826,6 +862,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     spv::Id type_float_vectors_[4];
+   };
+ 
++  // Sign class specialization constants by fetch constant index (pixel shaders), created on
++  // first use.
++  spv::Id texture_sign_class_spec_[32];
++
+   spv::Id const_int_0_;
+   spv::Id const_int4_0_;
+   spv::Id const_uint_0_;
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 72c1177..538a871 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -97,8 +97,29 @@ class VulkanPipelineCache {
+       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
+-      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
++      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr,
++      uint32_t texture_sign_classes = 0);
+   bool IsCreatingPipelines() const;
++  // Whether ConfigurePipeline translates new shaders on the creation threads
++  // (vulkan_async_shader_translation): the command processor must then not translate them first.
++  bool TranslatesShadersOnCreationThreads() const;
++  // Texture sign classes (2 bits per slot, SpirvShaderTranslator::kTextureSignClassSlots slots) of
++  // the textures bound to the first fetch constants of a pixel shader's used texture mask.
++  template <typename GetSwizzledSigns>
++  static uint32_t GetTextureSignClasses(uint32_t pixel_shader_used_texture_mask,
++                                        GetSwizzledSigns get_swizzled_signs) {
++    uint32_t classes = 0;
++    uint32_t remaining = pixel_shader_used_texture_mask;
++    for (uint32_t slot = 0; slot < SpirvShaderTranslator::kTextureSignClassSlots && remaining;
++         ++slot) {
++      uint32_t fetch_constant_index = uint32_t(__builtin_ctz(remaining));
++      remaining &= remaining - 1;
++      classes |= uint32_t(SpirvShaderTranslator::GetTextureSignClass(
++                     get_swizzled_signs(fetch_constant_index)))
++                 << (SpirvShaderTranslator::kTextureSignClassBits * slot);
++    }
++    return classes;
++  }
+   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
+                                     const PipelineLayoutProvider*& pipeline_layout_out,
+                                     bool* is_placeholder_out = nullptr) const;
+@@ -209,6 +230,10 @@ class VulkanPipelineCache {
+     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
+     xenos::CompareFunction stencil_back_compare_op : 3;  // 9
+     uint32_t sample_rate_shading : 1;                    // 10
++    // Pixel shader texture sign classes (see SpirvShaderTranslator::TextureSignClass), 2 bits per
++    // slot; 0 = all from the system constants at runtime (and the same hash as before this field
++    // existed, as the padding was zero).
++    uint32_t texture_sign_classes : 16;  // 26
+ 
+     // Filled only for the attachments present in the render pass object.
+     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
+@@ -459,6 +484,11 @@ class VulkanPipelineCache {
+     uint64_t pipelines_linked_us = 0;
+     uint32_t pipelines_linked_sync = 0;
+     uint64_t pipelines_linked_sync_us = 0;
++    // Texture sign specialization: draws with a specialized pipeline, draws with sign classes
++    // that used the runtime variant (specialized one pending or failed), variants created.
++    uint64_t sign_specialized_draws = 0;
++    uint64_t sign_runtime_draws = 0;
++    uint32_t sign_specialized_created = 0;
+   };
+   DrawTimeCounters TakeDrawTimeCounters();
+   // Pipelines are linked from per-stage libraries (VK_EXT_graphics_pipeline_library): shader
+@@ -502,7 +532,8 @@ class VulkanPipelineCache {
+   void PrecompileThread();
+   VkPipeline GetOrCreateFragmentLibrary(uint64_t key_hash, VkShaderModule fragment_module,
+                                         VkPipelineLayout layout,
+-                                        const VkPipelineMultisampleStateCreateInfo& multisample);
++                                        const VkPipelineMultisampleStateCreateInfo& multisample,
++                                        const VkSpecializationInfo* specialization = nullptr);
+   // Returns the library for the key (creating it with create_info on a miss), VK_NULL_HANDLE on
+   // failure.
+   VkPipeline GetOrCreatePipelineLibrary(const void* key, size_t key_size,
+@@ -515,6 +546,9 @@ class VulkanPipelineCache {
+                                               bool only_if_cached);
+   std::atomic<uint32_t> counter_pipelines_linked_sync_{0};
+   std::atomic<uint64_t> counter_pipelines_linked_sync_us_{0};
++  std::atomic<uint64_t> counter_sign_specialized_draws_{0};
++  std::atomic<uint64_t> counter_sign_runtime_draws_{0};
++  std::atomic<uint32_t> counter_sign_specialized_created_{0};
+   std::atomic<uint32_t> counter_pipelines_queued_{0};
+   std::atomic<uint32_t> counter_pipelines_sync_{0};
+   std::atomic<uint64_t> counter_pipelines_sync_us_{0};
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index d8aaf73..592e54d 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -213,6 +213,9 @@ void SpirvShaderTranslator::StartTranslation() {
+   }
+   const_int4_0_ = builder_->makeCompositeConstant(type_int4_, id_vector_temp_);
+   const_uint_0_ = builder_->makeUintConstant(0);
++  for (spv::Id& spec : texture_sign_class_spec_) {
++    spec = spv::NoResult;
++  }
+   id_vector_temp_.clear();
+   for (uint32_t i = 0; i < 4; ++i) {
+     id_vector_temp_.push_back(const_uint_0_);
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 5872a45..1323021 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -26,6 +26,13 @@
+ REXCVAR_DEFINE_BOOL(spirv_debug_texture_signs_unsigned, false, "GPU/Vulkan",
+                     "Diagnostic: translate every texture fetch as unsigned (no sign or gamma "
+                     "handling; wrong colours) to measure what sign specialization could save.");
++REXCVAR_DEFINE_BOOL(spirv_texture_sign_specialization, true, "GPU/Vulkan",
++                    "Pixel shaders get a specialization constant per fetch constant (the first "
++                    "8 used) with the bound texture's sign class (all unsigned / gamma RGB / all "
++                    "gamma), so pipelines drawing with such textures fold the sign and gamma "
++                    "handling away. Pipelines whose specialized variant is not compiled yet "
++                    "draw with the runtime variant meanwhile.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(spirv_texture_sign_branch, true, "GPU/Vulkan",
+                     "Texture fetch results: signed and biased components by selects, and the "
+                     "piecewise-linear gamma conversion only inside one uniform branch taken when "
+@@ -41,6 +48,10 @@ REXCVAR_DEFINE_BOOL(vulkan_texture_fetch_implicit_lod, true, "GPU/Vulkan",
+ 
+ namespace rex::graphics {
+ 
++bool SpirvShaderTranslator::IsTextureSignSpecializationEnabled() {
++  return REXCVAR_GET(spirv_texture_sign_specialization);
++}
++
+ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
+     const ParsedVertexFetchInstruction& instr) {
+   UpdateInstructionPredication(instr.is_predicated, instr.predicate_condition);
+@@ -1331,6 +1342,39 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         swizzled_signs_word = const_uint_0_;
+       }
+       uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
++      if (is_pixel_shader() && IsTextureSignSpecializationEnabled() &&
++          !REXCVAR_GET(spirv_debug_texture_signs_unsigned)) {
++        // Sign class of this fetch constant from a specialization constant (0 = runtime, the
++        // default). The pipeline gives classes 1-3 for the first kTextureSignClassSlots fetch
++        // constants when their bound textures match; the selects then fold to a constant byte
++        // in the host compiler, and the sign / gamma branches below with them.
++        spv::Id& sign_class = texture_sign_class_spec_[fetch_constant_index];
++        if (sign_class == spv::NoResult) {
++          sign_class = builder_->makeUintConstant(0, true);
++          builder_->addDecoration(sign_class, spv::DecorationSpecId,
++                                  int(kTextureSignClassSpecIdBase + fetch_constant_index));
++        }
++        spv::Id fixed_word = builder_->createTriOp(
++            spv::OpSelect, type_uint_,
++            builder_->createBinOp(spv::OpIEqual, type_bool_, sign_class,
++                                  builder_->makeUintConstant(kTextureSignClassGammaRgb)),
++            builder_->makeUintConstant(
++                uint32_t(kTextureSignClassSwizzledSigns[kTextureSignClassGammaRgb])
++                << swizzled_signs_word_offset),
++            builder_->makeUintConstant(
++                uint32_t(kTextureSignClassSwizzledSigns[kTextureSignClassGamma])
++                << swizzled_signs_word_offset));
++        fixed_word = builder_->createTriOp(
++            spv::OpSelect, type_uint_,
++            builder_->createBinOp(spv::OpIEqual, type_bool_, sign_class,
++                                  builder_->makeUintConstant(kTextureSignClassUnsigned)),
++            const_uint_0_, fixed_word);
++        swizzled_signs_word = builder_->createTriOp(
++            spv::OpSelect, type_uint_,
++            builder_->createBinOp(spv::OpIEqual, type_bool_, sign_class,
++                                  builder_->makeUintConstant(kTextureSignClassRuntime)),
++            swizzled_signs_word, fixed_word);
++      }
+ 
+       spv::Builder::TextureParameters texture_parameters = {};
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 3216aa6..5658725 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -755,6 +755,14 @@ void VulkanCommandProcessor::LogPipelineCountersIfDue() {
+         counters.pipelines_linked, double(counters.pipelines_linked_us) / 1000.0,
+         counters.pipelines_linked_sync, double(counters.pipelines_linked_sync_us) / 1000.0);
+   }
++  if (counters.sign_specialized_draws || counters.sign_runtime_draws ||
++      counters.sign_specialized_created) {
++    REXGPU_INFO(
++        "Texture sign specialization (10 s): {} draws specialized, {} with the runtime variant "
++        "while theirs was pending or failed, {} variants created",
++        counters.sign_specialized_draws, counters.sign_runtime_draws,
++        counters.sign_specialized_created);
++  }
+   counter_draws_skipped_pending_ = 0;
+   counter_frames_held_ = 0;
+   counter_frames_presented_ = 0;
+@@ -4846,6 +4854,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   SpirvShaderTranslator::Modification pixel_shader_modification;
+   VulkanShader::VulkanTranslation* vertex_shader_translation;
+   VulkanShader::VulkanTranslation* pixel_shader_translation;
++  // With shader translation on the pipeline creation threads, a shader's bindings are read only
++  // once its translation is complete (snapshot per draw: a creation thread may publish it at
++  // any moment, and the bindings must not be read while it writes them).
++  const bool translate_on_creation_threads =
++      pipeline_cache_->TranslatesShadersOnCreationThreads();
++  bool vertex_shader_translated = false;
++  bool pixel_shader_translated = false;
+   bool memexport_writes_possible = memexport_used_vertex || memexport_used_pixel;
+ 
+   // Two iterations because a submission (even the current one - in which case
+@@ -4905,9 +4920,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         pixel_shader ? static_cast<VulkanShader::VulkanTranslation*>(
+                            pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
+                      : nullptr;
+-    if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
+-                                                  pixel_shader_translation)) {
+-      return draw_fail("shader_translation");
++    if (translate_on_creation_threads) {
++      // ConfigurePipeline analyses the ucode and queues the translation with the pipeline.
++      vertex_shader_translated = vertex_shader_translation->is_translated();
++      pixel_shader_translated =
++          pixel_shader_translation != nullptr && pixel_shader_translation->is_translated();
++      if ((vertex_shader_translated && !vertex_shader_translation->is_valid()) ||
++          (pixel_shader_translated && !pixel_shader_translation->is_valid())) {
++        return draw_fail("shader_translation");
++      }
++    } else {
++      if (!pipeline_cache_->EnsureShadersTranslated(vertex_shader_translation,
++                                                    pixel_shader_translation)) {
++        return draw_fail("shader_translation");
++      }
++      vertex_shader_translated = true;
++      pixel_shader_translated = pixel_shader_translation != nullptr;
+     }
+ 
+     // Obtain the samplers. Note that the bindings don't depend on the shader
+@@ -4925,7 +4953,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         shader_samplers.clear();
+       }
+       const VulkanShader* shader = j ? pixel_shader : vertex_shader;
+-      if (!shader) {
++      if (!shader || !(j ? pixel_shader_translated : vertex_shader_translated)) {
+         continue;
+       }
+       const std::vector<VulkanShader::SamplerBinding>& shader_sampler_bindings =
+@@ -4989,11 +5017,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // not translated yet are empty; if its pipeline gets published before this draw binds, the
+   // draw is skipped below like a pending one.
+   const bool shaders_pending_translation =
+-      !vertex_shader_translation->is_translated() ||
+-      (pixel_shader_translation != nullptr && !pixel_shader_translation->is_translated());
++      !vertex_shader_translated || (pixel_shader_translation != nullptr && !pixel_shader_translated);
+   uint32_t used_texture_mask =
+-      vertex_shader->GetUsedTextureMaskAfterTranslation() |
+-      (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
++      (vertex_shader_translated ? vertex_shader->GetUsedTextureMaskAfterTranslation() : 0) |
++      (pixel_shader_translated ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+   texture_cache_->RequestTextures(used_texture_mask);
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+@@ -5009,11 +5036,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // textures.
+   VkPipeline pipeline;
+   void* pipeline_handle = nullptr;
++  // Sign classes of the pixel shader's textures (texture sign specialization), from the bindings
++  // RequestTextures has just updated - the same signs the system constants get.
++  uint32_t texture_sign_classes = 0;
++  if (pixel_shader && !shaders_pending_translation &&
++      SpirvShaderTranslator::IsTextureSignSpecializationEnabled()) {
++    texture_sign_classes = VulkanPipelineCache::GetTextureSignClasses(
++        pixel_shader->GetUsedTextureMaskAfterTranslation(), [this](uint32_t fetch_constant_index) {
++          return texture_cache_->GetActiveTextureSwizzledSigns(fetch_constant_index);
++        });
++  }
+   if (!pipeline_cache_->ConfigurePipeline(vertex_shader_translation, pixel_shader_translation,
+                                           primitive_processing_result, normalized_depth_control,
+                                           normalized_color_mask,
+                                           render_target_cache_->last_update_render_pass_key(),
+-                                          pipeline, pipeline_layout_provider, &pipeline_handle)) {
++                                          pipeline, pipeline_layout_provider, &pipeline_handle,
++                                          texture_sign_classes)) {
+     return draw_fail("configure_pipeline");
+   }
+   bool pipeline_is_placeholder = false;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 299cab0..5ab101f 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -1691,7 +1691,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+     VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
+-    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out) {
++    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out,
++    uint32_t texture_sign_classes) {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -1760,7 +1761,16 @@ bool VulkanPipelineCache::ConfigurePipeline(
+         uint32_t(primitive_processing_result.host_primitive_reset_enabled), render_pass_key.key);
+     return false;
+   }
+-  if (last_pipeline_ && last_pipeline_->first == description) {
++  const bool try_sign_specialization =
++      texture_sign_classes && pixel_shader && !translate_async && use_async && never_block &&
++      SpirvShaderTranslator::IsTextureSignSpecializationEnabled();
++  // The fast path only for the variant that is preferred (with sign classes: the specialized one;
++  // while it's pending, the lookups below run and fall back to the runtime variant).
++  PipelineDescription preferred_description = description;
++  if (try_sign_specialization) {
++    preferred_description.texture_sign_classes = texture_sign_classes;
++  }
++  if (last_pipeline_ && last_pipeline_->first == preferred_description) {
+     VkPipeline last_pipeline = last_pipeline_->second.pipeline.load(std::memory_order_acquire);
+     const PipelineLayoutProvider* last_pipeline_layout =
+         last_pipeline_->second.pipeline_layout.load(std::memory_order_acquire);
+@@ -1794,6 +1804,74 @@ bool VulkanPipelineCache::ConfigurePipeline(
+         bound_rts, shader_writes_color_targets, shader_writes_depth);
+   }
+ 
++  // Texture sign specialization: use the variant with the bound textures' sign classes when it's
++  // ready; otherwise queue it on the creation threads (or link it right here from cached
++  // libraries) and draw with the runtime variant meanwhile, so it never holds a draw.
++  if (try_sign_specialization) {
++    const PipelineDescription& specialized_description = preferred_description;
++    auto use_specialized = [&](std::pair<const PipelineDescription, Pipeline>& entry) {
++      VkPipeline entry_pipeline = entry.second.pipeline.load(std::memory_order_acquire);
++      const PipelineLayoutProvider* entry_layout =
++          entry.second.pipeline_layout.load(std::memory_order_acquire);
++      if (entry_pipeline == VK_NULL_HANDLE || entry_layout == nullptr) {
++        return false;
++      }
++      last_pipeline_ = &entry;
++      pipeline_out = entry_pipeline;
++      pipeline_layout_out = entry_layout;
++      if (pipeline_handle_out) {
++        *pipeline_handle_out = &entry.second;
++      }
++      counter_sign_specialized_draws_.fetch_add(1, std::memory_order_relaxed);
++      return true;
++    };
++    auto specialized_it = pipelines_.find(specialized_description);
++    if (specialized_it != pipelines_.end()) {
++      // Pending or failed: the runtime variant below.
++      if (use_specialized(*specialized_it)) {
++        return true;
++      }
++    } else {
++      auto& specialized = *pipelines_.emplace(specialized_description, Pipeline()).first;
++      PipelineCreationArguments specialized_arguments;
++      // On failure the entry stays with a null pipeline (not a placeholder): the runtime variant
++      // is used for this state from now on.
++      if (TryGetPipelineCreationArgumentsForDescription(specialized_description, &specialized,
++                                                        specialized_arguments)) {
++        bool linked = uses_pipeline_libraries_ &&
++                      EnsurePipelineCreatedFromLibraries(specialized_arguments, true);
++        if (!linked) {
++          specialized_arguments.priority = pipeline_util::kPriorityLowest;
++          specialized.second.is_placeholder.store(true, std::memory_order_release);
++          {
++            std::lock_guard<std::mutex> lock(creation_request_lock_);
++            creation_queue_.push(specialized_arguments);
++          }
++          creation_request_cond_.notify_one();
++          counter_pipelines_queued_.fetch_add(1, std::memory_order_relaxed);
++        }
++        counter_sign_specialized_created_.fetch_add(1, std::memory_order_relaxed);
++        if (pipeline_storage_file_) {
++          assert_not_null(storage_write_thread_);
++          pipeline_storage_file_flush_needed_ = true;
++          {
++            std::lock_guard<std::mutex> lock(storage_write_request_lock_);
++            storage_write_pipeline_queue_.emplace_back();
++            PipelineStoredDescription& stored_description = storage_write_pipeline_queue_.back();
++            stored_description.description_hash = specialized_description.GetHash();
++            std::memcpy(&stored_description.description, &specialized_description,
++                        sizeof(specialized_description));
++          }
++          storage_write_request_cond_.notify_all();
++        }
++        if (linked && use_specialized(specialized)) {
++          return true;
++        }
++      }
++    }
++    counter_sign_runtime_draws_.fetch_add(1, std::memory_order_relaxed);
++  }
++
+   auto it = pipelines_.find(description);
+   if (it != pipelines_.end()) {
+     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+@@ -1943,6 +2021,11 @@ VulkanPipelineCache::DrawTimeCounters VulkanPipelineCache::TakeDrawTimeCounters(
+       counter_pipelines_linked_sync_.exchange(0, std::memory_order_relaxed);
+   counters.pipelines_linked_sync_us =
+       counter_pipelines_linked_sync_us_.exchange(0, std::memory_order_relaxed);
++  counters.sign_specialized_draws =
++      counter_sign_specialized_draws_.exchange(0, std::memory_order_relaxed);
++  counters.sign_runtime_draws = counter_sign_runtime_draws_.exchange(0, std::memory_order_relaxed);
++  counters.sign_specialized_created =
++      counter_sign_specialized_created_.exchange(0, std::memory_order_relaxed);
+   return counters;
+ }
+ 
+@@ -1956,6 +2039,12 @@ const VulkanPipelineCache::PipelineDynamicState* VulkanPipelineCache::GetPipelin
+                                                                        : nullptr;
+ }
+ 
++bool VulkanPipelineCache::TranslatesShadersOnCreationThreads() const {
++  return REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
++         REXCVAR_GET(vulkan_pipeline_compile_never_blocks) && async_shader_translator_ &&
++         REXCVAR_GET(vulkan_async_shader_translation);
++}
++
+ bool VulkanPipelineCache::IsCreatingPipelines() const {
+   std::lock_guard<std::mutex> lock(creation_request_lock_);
+   if (creation_threads_.empty()) {
+@@ -3800,7 +3889,8 @@ bool VulkanPipelineCache::TryGetPipelineCreationArgumentsForDescription(
+ 
+ namespace {
+ uint64_t FragmentLibraryKeyHash(uint64_t pixel_shader_hash, uint64_t pixel_shader_variant,
+-                                const VkPipelineMultisampleStateCreateInfo& multisample) {
++                                const VkPipelineMultisampleStateCreateInfo& multisample,
++                                uint32_t texture_sign_classes = 0) {
+   struct {
+     uint32_t kind = 3;
+     uint32_t samples;
+@@ -3808,14 +3898,69 @@ uint64_t FragmentLibraryKeyHash(uint64_t pixel_shader_hash, uint64_t pixel_shade
+     uint32_t sample_shading;
+     uint64_t pixel_shader_hash;
+     uint64_t pixel_shader_variant;
++    // The pixel shader SPIR-V depends on translator switches (the driver cache is keyed by it):
++    // part of the key, so a library list entry never claims a library of another translation.
++    uint32_t translation_switches;
++    uint32_t texture_sign_classes;
+   } key;
+   key.samples = uint32_t(multisample.rasterizationSamples);
+   key.sample_mask = multisample.pSampleMask ? *multisample.pSampleMask : UINT32_MAX;
+   key.sample_shading = multisample.sampleShadingEnable;
+   key.pixel_shader_hash = pixel_shader_hash;
+   key.pixel_shader_variant = pixel_shader_variant;
++  key.translation_switches =
++      uint32_t(REXCVAR_GET(spirv_texture_sign_branch)) |
++      (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply)) << 1) |
++      (uint32_t(REXCVAR_GET(vulkan_texture_fetch_implicit_lod)) << 2) |
++      (uint32_t(SpirvShaderTranslator::IsTextureSignSpecializationEnabled()) << 3);
++  key.texture_sign_classes = texture_sign_classes;
+   return XXH3_64bits(&key, sizeof(key));
+ }
++
++// Specialization constants of a pixel shader for its texture sign classes (see
++// SpirvShaderTranslator::kTextureSignClassSpecIdBase); nullptr when all are runtime.
++struct TextureSignSpecialization {
++  VkSpecializationMapEntry entries[SpirvShaderTranslator::kTextureSignClassSlots];
++  uint32_t data[SpirvShaderTranslator::kTextureSignClassSlots];
++  VkSpecializationInfo info;
++  const VkSpecializationInfo* Build(uint32_t texture_sign_classes,
++                                    uint32_t pixel_shader_used_texture_mask) {
++    uint32_t count = 0;
++    uint32_t remaining = pixel_shader_used_texture_mask;
++    for (uint32_t slot = 0; slot < SpirvShaderTranslator::kTextureSignClassSlots && remaining;
++         ++slot) {
++      uint32_t fetch_constant_index = uint32_t(__builtin_ctz(remaining));
++      remaining &= remaining - 1;
++      uint32_t sign_class =
++          (texture_sign_classes >> (SpirvShaderTranslator::kTextureSignClassBits * slot)) &
++          ((UINT32_C(1) << SpirvShaderTranslator::kTextureSignClassBits) - 1);
++      if (!sign_class) {
++        continue;
++      }
++      entries[count].constantID =
++          SpirvShaderTranslator::kTextureSignClassSpecIdBase + fetch_constant_index;
++      entries[count].offset = uint32_t(sizeof(uint32_t) * count);
++      entries[count].size = sizeof(uint32_t);
++      data[count] = sign_class;
++      ++count;
++    }
++    if (!count) {
++      return nullptr;
++    }
++    info.mapEntryCount = count;
++    info.pMapEntries = entries;
++    info.dataSize = sizeof(uint32_t) * count;
++    info.pData = data;
++    return &info;
++  }
++};
++
++uint32_t GetPixelShaderUsedTextureMask(const VulkanShader::VulkanTranslation* translation) {
++  return translation
++             ? static_cast<const VulkanShader&>(translation->shader())
++                   .GetUsedTextureMaskAfterTranslation()
++             : 0;
++}
+ }  // namespace
+ 
+ bool VulkanPipelineCache::IsLibraryAvailable(uint64_t key_hash) {
+@@ -3927,13 +4072,15 @@ VkPipeline VulkanPipelineCache::GetOrCreatePipelineLibraryByHash(
+ 
+ VkPipeline VulkanPipelineCache::GetOrCreateFragmentLibrary(
+     uint64_t key_hash, VkShaderModule fragment_module, VkPipelineLayout layout,
+-    const VkPipelineMultisampleStateCreateInfo& multisample) {
++    const VkPipelineMultisampleStateCreateInfo& multisample,
++    const VkSpecializationInfo* specialization) {
+   VkPipelineRenderingCreateInfo view_mask_rendering = {
+       VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+   VkPipelineShaderStageCreateInfo stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+   stage.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+   stage.module = fragment_module;
+   stage.pName = "main";
++  stage.pSpecializationInfo = specialization;
+   VkPipelineDepthStencilStateCreateInfo depth_stencil_state = {
+       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+   static const VkDynamicState kDynamicStates[] = {
+@@ -4178,13 +4325,20 @@ bool VulkanPipelineCache::EnsurePipelineCreatedFromLibraries(
+         : fragment_module == VK_NULL_HANDLE ? 0
+         : fragment_module == depth_float24_round_fragment_shader_ ? 1
+                                                                  : 2,
+-        multisample_state);
++        multisample_state,
++        creation_arguments.pixel_shader ? description.texture_sign_classes : 0);
+     if (only_if_cached && !IsLibraryAvailable(fragment_key_hash)) {
+       return false;
+     }
++    TextureSignSpecialization sign_specialization;
++    const VkSpecializationInfo* fragment_specialization =
++        creation_arguments.pixel_shader
++            ? sign_specialization.Build(description.texture_sign_classes,
++                                        GetPixelShaderUsedTextureMask(creation_arguments.pixel_shader))
++            : nullptr;
+     fragment_library =
+         GetOrCreateFragmentLibrary(fragment_key_hash, fragment_module, fragment_layout,
+-                                   multisample_state);
++                                   multisample_state, fragment_specialization);
+     if (fragment_library == VK_NULL_HANDLE) {
+       return false;
+     }
+@@ -4501,6 +4655,8 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     shader_stage_geometry.pSpecializationInfo = nullptr;
+   }
+   // Fragment shader.
++  // Outlives the vkCreateGraphicsPipelines call below.
++  TextureSignSpecialization fragment_sign_specialization;
+   VkPipelineShaderStageCreateInfo& shader_stage_fragment = shader_stages[shader_stage_count++];
+   shader_stage_fragment.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+   shader_stage_fragment.pNext = nullptr;
+@@ -4518,6 +4674,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     }
+     shader_stage_fragment.module = creation_arguments.pixel_shader->shader_module();
+     assert_true(shader_stage_fragment.module != VK_NULL_HANDLE);
++    shader_stage_fragment.pSpecializationInfo = fragment_sign_specialization.Build(
++        description.texture_sign_classes,
++        GetPixelShaderUsedTextureMask(creation_arguments.pixel_shader));
+   } else {
+     if (edram_fragment_shader_interlock) {
+       shader_stage_fragment.module = depth_only_fragment_shader_;
+@@ -5033,7 +5192,10 @@ void VulkanPipelineCache::PrecompileThread() {
+   // 2: 1x only (the game draws its pixel shaders at 1x). 3+: the translation switches are part of
+   // the marker - a change rebuilds the libraries here, in the background, instead of compiling
+   // them while the game runs (the driver cache is keyed by the SPIR-V).
+-  uint32_t precompile_version = 3 | (uint32_t(REXCVAR_GET(spirv_texture_sign_branch)) << 8) |
++  // 4: fragment library keys include the translation switches and texture sign classes.
++  uint32_t precompile_version = 4 | (uint32_t(REXCVAR_GET(spirv_texture_sign_branch)) << 8) |
++                                (uint32_t(SpirvShaderTranslator::IsTextureSignSpecializationEnabled())
++                                 << 12) |
+                                 (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply)) << 9) |
+                                 (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply_vertex)) << 10) |
+                                 (uint32_t(REXCVAR_GET(vulkan_texture_fetch_implicit_lod)) << 11);

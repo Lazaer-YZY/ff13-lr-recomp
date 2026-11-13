@@ -1,0 +1,83 @@
+From 96bbc7254dac86f80e684b14b8ec90dcd3878a0f Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 21:16:43 +0800
+Subject: [PATCH 035/108] ui: repaint continuously only for dialogs that want
+ it
+
+The achievement toast dialog exists for the whole session, so ImGuiDrawer
+requested a UI repaint every display refresh even with nothing on screen.
+On a 60 Hz handheld that doubled the UI thread's paints over the guest's
+30 fps. Dialogs now say whether they need continuous painting (default yes);
+the toast only while a toast is queued.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/ui/imgui_dialog.h b/include/rex/ui/imgui_dialog.h
+index a7ab6b3..c2af675 100644
+--- a/include/rex/ui/imgui_dialog.h
++++ b/include/rex/ui/imgui_dialog.h
+@@ -39,6 +39,12 @@ class ImGuiDialog {
+ 
+   void Draw();
+ 
++  // Whether the drawer should keep repainting every display refresh while this
++  // dialog exists (animations, live data, input). A dialog that is idle until
++  // something happens returns false; the UI is then repainted only when the guest
++  // presents a frame, which is what keeps the UI thread off the CPU on handhelds.
++  virtual bool WantsContinuousPaint() { return true; }
++
+  protected:
+   ImGuiDialog(ImGuiDrawer* imgui_drawer);
+ 
+diff --git a/include/rex/ui/overlay/achievement_toast.h b/include/rex/ui/overlay/achievement_toast.h
+index 7642601..37fd586 100644
+--- a/include/rex/ui/overlay/achievement_toast.h
++++ b/include/rex/ui/overlay/achievement_toast.h
+@@ -34,6 +34,8 @@ class AchievementToastDialog : public AchievementNotificationDialog {
+ 
+   // Thread-safe: safe to call from any thread, including guest threads.
+   void Push(const rex::system::AchievementEvent& event) override;
++  // Only while a toast is queued or on screen.
++  bool WantsContinuousPaint() override;
+ 
+  protected:
+   void OnDraw(ImGuiIO& io) override;
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index f270f3c..b216622 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -439,7 +439,17 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   if (!dialogs_.empty()) {
+     // Repaint (and handle input) continuously if still active. In detached mode
+     // there is no presenter; the app drives repaint via its own present loop.
+-    if (presenter_) {
++    // Idle dialogs (e.g. the always-present achievement toast with nothing
++    // queued) don't count: guest frames still trigger paints, and repainting at
++    // the display rate on top of that doubles the UI thread's CPU time.
++    bool continuous = false;
++    for (ImGuiDialog* dialog : dialogs_) {
++      if (dialog->WantsContinuousPaint()) {
++        continuous = true;
++        break;
++      }
++    }
++    if (presenter_ && continuous) {
+       presenter_->RequestUIPaintFromUIThread();
+     }
+   }
+diff --git a/src/ui/overlay/achievement_toast.cpp b/src/ui/overlay/achievement_toast.cpp
+index 53b8c0b..c685b54 100644
+--- a/src/ui/overlay/achievement_toast.cpp
++++ b/src/ui/overlay/achievement_toast.cpp
+@@ -29,6 +29,11 @@ void AchievementToastDialog::Push(const rex::system::AchievementEvent& event) {
+   queue_.push_back({event, std::chrono::steady_clock::now()});
+ }
+ 
++bool AchievementToastDialog::WantsContinuousPaint() {
++  std::lock_guard<std::mutex> lock(mutex_);
++  return !queue_.empty();
++}
++
+ void AchievementToastDialog::OnDraw(ImGuiIO& io) {
+   auto now = std::chrono::steady_clock::now();
+ 

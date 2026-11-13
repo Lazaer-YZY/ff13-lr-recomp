@@ -1,0 +1,7 @@
+# Paths left out of the public copy (tools/export_public.sh). One per line.
+# Agent operating manual and handoff log: internal.
+CLAUDE.md
+PROGRESS.md
+# Scripted-play fallbacks, superseded by tools/thor_pad.sh (referenced only by CLAUDE.md).
+tools/thor_drive.py
+tools/thor_play.py

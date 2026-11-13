@@ -1,0 +1,124 @@
+From 2a21e70228ffb89633142b3e466888d3a2776f56 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:46:11 +0800
+Subject: [PATCH 024/108] core: fix heap corruption from concurrent thread
+ naming
+
+A new XThread names itself on start (thread_->set_name(thread_name_)) while
+its creator may rename it at the same moment (guest SetThreadName right after
+CreateThread -> XThread::set_name). Both paths assigned Thread::name_ and the
+lambda copied thread_name_ while it was being reassigned, without a common
+lock. On Android this aborted the guest main thread with Scudo
+'invalid chunk state when deallocating' in PosixThread::set_name.
+
+- PosixThread/Win32Thread::set_name are serialised by a per-thread mutex.
+- The start lambda copies thread_name_ under thread_lock_ (the lock
+  XThread::set_name already holds) before naming itself.
+- POSIX names are truncated with resize(15) (16 bytes incl. NUL limit).
+- HandleSetThreadName reads the guest name with strnlen(256) instead of an
+  unbounded C string.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 4c35d9b..6989cb9 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -1449,9 +1449,16 @@ class PosixThread : public PosixConditionHandle<Thread> {
+ 
+   void set_name(std::string name) override {
+     handle_.WaitStarted();
++    // Callers race: the new thread names itself on start while its creator
++    // (e.g. a guest SetThreadName right after CreateThread) names it too.
++    // Unsynchronised assignment of Thread::name_ corrupted the heap (Scudo
++    // "invalid chunk state" on Android).
++    std::lock_guard<std::mutex> lock(name_mutex_);
+     Thread::set_name(name);
++    // Linux/Bionic pthread names are limited to 16 bytes including the NUL
++    // (ERANGE otherwise).
+     if (name.length() > 15) {
+-      name = name.substr(0, 15);
++      name.resize(15);
+     }
+     handle_.set_name(name);
+   }
+@@ -1479,6 +1486,9 @@ class PosixThread : public PosixConditionHandle<Thread> {
+   void Terminate(int exit_code) override { handle_.Terminate(exit_code); }
+ 
+   void WaitSuspended() { handle_.WaitSuspended(); }
++
++ private:
++  std::mutex name_mutex_;  // Serialises set_name (see above).
+ };
+ 
+ thread_local PosixThread* current_thread_ = nullptr;
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 896dfec..b821257 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -368,6 +368,8 @@ class Win32Thread : public Win32Handle<Thread> {
+   ~Win32Thread() = default;
+ 
+   void set_name(std::string name) override {
++    // A thread may be named by itself and by its creator concurrently.
++    std::lock_guard<std::mutex> lock(name_mutex_);
+     set_thread_name_impl(handle_, name);
+     Thread::set_name(name);
+   }
+@@ -435,6 +437,7 @@ class Win32Thread : public Win32Handle<Thread> {
+ 
+  private:
+   void AssertCallingThread() { assert_true(GetCurrentThreadId() == GetThreadId(handle_)); }
++  std::mutex name_mutex_;  // Serialises set_name.
+ };
+ 
+ thread_local std::unique_ptr<Win32Thread> current_thread_ = nullptr;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp b/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
+index 670c446..a2589a8 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_debug.cpp
+@@ -12,6 +12,8 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <cstring>
++
+ #include <rex/dbg.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -58,8 +60,9 @@ void HandleSetThreadName(ppc_ptr_t<X_EXCEPTION_RECORD> record) {
+ 
+   // TODO(gibbed): cvar for thread name encoding for conversion, some games use
+   // SJIS and there's no way to automatically know this.
+-  auto name =
+-      std::string(REX_KERNEL_MEMORY()->TranslateVirtual<const char*>(thread_info->name_ptr));
++  // Bounded read: a junk or unterminated name must not run off into memory.
++  const char* name_chars = REX_KERNEL_MEMORY()->TranslateVirtual<const char*>(thread_info->name_ptr);
++  auto name = std::string(name_chars, strnlen(name_chars, 256));
+   std::replace_if(name.begin(), name.end(), [](auto c) { return c < 32 || c > 127; }, '?');
+ 
+   object_ref<XThread> thread;
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 091c738..510c0c0 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -460,10 +460,16 @@ X_STATUS XThread::Create() {
+     // Set thread ID override. This is used by logging.
+     rex::thread::set_current_thread_id(handle());
+ 
+-    // Set name immediately, if we have one.
+-    thread_->set_name(thread_name_);
++    // Set name immediately, if we have one. Copy under thread_lock_: the
++    // creator may be renaming this thread (XThread::set_name) concurrently.
++    std::string initial_name;
++    {
++      std::lock_guard<std::mutex> name_lock(thread_lock_);
++      initial_name = thread_name_;
++    }
++    thread_->set_name(initial_name);
+ 
+-    PROFILE_THREAD_ENTER(thread_name_.c_str());
++    PROFILE_THREAD_ENTER(initial_name.c_str());
+     PROFILE_THREAD_CREATED();
+ 
+     // Execute user code.

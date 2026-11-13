@@ -1,0 +1,58 @@
+From c9ea4ce730e5113e55b02ec3a3f644b3fe4ba115 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Wed, 11 Nov 2026 02:31:56 +0800
+Subject: [PATCH 095/108] gpu: vulkan_pipeline_creation_little_cores option
+ (creation threads on the slowest cluster)
+
+Off by default: on the cold-cache warp bench it made no difference (1% low 30.0 /
+30.4 vs 33.0 / 30.3 fps); kept for the first-visit tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index dc2a8e1..2c91df8 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -109,6 +109,12 @@ REXCVAR_DEFINE_INT32(
+     .range(-1, 32)
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_pipeline_creation_little_cores, false, "GPU/Vulkan",
++                    "Android: run the pipeline creation threads (compiles during gameplay) on the "
++                    "slowest CPU cluster only, so first-visit compiles don't compete with the "
++                    "game's threads on the fast cores (the boot precompile keeps the fast cores)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -5178,7 +5184,10 @@ namespace {
+ // stretched the game's frames during a burst. They now run at a lower priority (the game's threads
+ // win any contended core, the compiles use the idle time) and may also use the prime core, but
+ // not the slowest cluster (where a compile takes several times longer).
+-void LowerPipelineCreationThreadPriority() {
++// little_cores: run on the slowest cluster only (the creation threads during gameplay, so first-visit
++// compiles don't take the cores the game's main / GPU / worker threads run on); otherwise on the
++// faster clusters (the boot precompile at the title, where speed matters and the game is idle).
++void LowerPipelineCreationThreadPriority(bool little_cores = false) {
+   setpriority(PRIO_PROCESS, 0, 10);  // The calling thread only on Linux.
+   long cpu_count = sysconf(_SC_NPROCESSORS_CONF);
+   if (cpu_count <= 0 || cpu_count > CPU_SETSIZE) {
+@@ -5205,7 +5214,7 @@ void LowerPipelineCreationThreadPriority() {
+   cpu_set_t set;
+   CPU_ZERO(&set);
+   for (long cpu = 0; cpu < cpu_count; ++cpu) {
+-    if (max_khz[size_t(cpu)] > slowest) {
++    if (little_cores ? max_khz[size_t(cpu)] == slowest : max_khz[size_t(cpu)] > slowest) {
+       CPU_SET(int(cpu), &set);
+     }
+   }
+@@ -5450,7 +5459,7 @@ bool VulkanPipelineCache::TranslateShadersForCreation(
+ 
+ void VulkanPipelineCache::CreationThread(size_t thread_index) {
+ #if defined(__ANDROID__)
+-  LowerPipelineCreationThreadPriority();
++  LowerPipelineCreationThreadPriority(REXCVAR_GET(vulkan_pipeline_creation_little_cores));
+ #endif
+   while (true) {
+     PipelineCreationArguments creation_arguments;

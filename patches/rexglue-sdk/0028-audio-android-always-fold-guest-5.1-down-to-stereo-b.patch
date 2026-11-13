@@ -1,0 +1,28 @@
+From 57859165c17304319f2f23887d02a2b19adabb22 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:47:42 +0800
+Subject: [PATCH 028/108] audio(android): always fold guest 5.1 down to stereo
+ (behaviour informed by lr-ffxiii-port's Android patch, re-implemented)
+
+Android reports 6 output channels for phone speakers and headsets alike, and a
+6-channel AAudio stream can stay silent; use the driver's stereo fold-down.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 20a2cd8..4d5397a 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -75,6 +75,12 @@ bool SDLAudioDriver::Initialize() {
+ 
+   // A 1-channel device gets the stereo fold too, then SDL collapses to mono.
+   // Handing it a 6ch stream instead would use SDL's own downmix.
++#if REX_PLATFORM_ANDROID
++  // Android reports the requested 6 channels for phone speakers and headsets
++  // alike, and a 6-channel AAudio stream can stay silent there: always use
++  // our stereo fold-down.
++  obtained_spec.channels = 2;
++#endif
+   if (obtained_spec.channels <= 2) {
+     SDL_DestroyAudioStream(sdl_stream_);
+     sdl_stream_ = nullptr;

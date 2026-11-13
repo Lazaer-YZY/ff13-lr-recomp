@@ -1,0 +1,52 @@
+From 217b52d5a978c46058a4d1898b74ed97e56b7424 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:34:33 +0800
+Subject: [PATCH 011/108] ui(android): SDL_main entry point for libmain.so
+
+On Android the game target is a SHARED library named libmain.so; SDLActivity
+dlsym()s SDL_main from it. The new REX_PLATFORM_ANDROID branch exports
+extern "C" SDL_main with default visibility, calls
+rex::InitializeAndroidSystemForApplicationContext() and then RunWindowedApp.
+Windows (wWinMain) and desktop POSIX (main) are unchanged.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
+index 77bb1dc..b615dd9 100644
+--- a/src/ui/windowed_app_main_sdl.cpp
++++ b/src/ui/windowed_app_main_sdl.cpp
+@@ -32,6 +32,9 @@
+ #include <windows.h>
+ #include <objbase.h>
+ #include <shellapi.h>
++#elif REX_PLATFORM_ANDROID
++#include <rex/main_android.h>
++#include <rex/system.h>
+ #endif
+ 
+ namespace {
+@@ -124,6 +127,24 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+   return RunWindowedApp(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
+ }
+ 
++#elif REX_PLATFORM_ANDROID
++
++// Android entry contract:
++// - The game target is a SHARED library with OUTPUT_NAME "main" (libmain.so),
++//   packaged with libSDL3.so, librexruntime.so, librexgpu-xenos.so and
++//   libc++_shared.so. SDL3's SDLActivity loads them, sets up JNI (which also
++//   calls SDL_SetMainReady) and then dlsym()s "SDL_main" from libmain.so on
++//   the SDL main thread, so this symbol must stay exported (default
++//   visibility, C linkage) even if the game builds with -fvisibility=hidden.
++//   Game-defined JNI entry points (Java_*) need JNIEXPORT for the same reason.
++// - Android system glue (API level, ashmem/pthread lookups) is initialised
++//   here, before cvars/logging and before any guest memory is reserved.
++// - argv comes from SDLActivity.getArguments() (argv[0] is "app_process").
++extern "C" __attribute__((visibility("default"))) int SDL_main(int argc, char* argv[]) {
++  rex::InitializeAndroidSystemForApplicationContext();
++  return RunWindowedApp(argc, argv);
++}
++
+ #else
+ 
+ int main(int argc, char* argv[]) {

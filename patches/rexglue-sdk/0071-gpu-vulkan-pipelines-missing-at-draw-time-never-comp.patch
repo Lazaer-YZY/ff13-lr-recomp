@@ -1,0 +1,309 @@
+From 2aa810af308a5fe6d6a0302a6ee02db893179f43 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 23:47:42 +0800
+Subject: [PATCH 071/108] gpu: vulkan: pipelines missing at draw time never
+ compile on the GPU thread
+
+With async_shader_compilation, a pipeline missing at draw time was given a
+placeholder pipeline compiled synchronously (vertex shader included), draws
+without a pixel shader compiled synchronously, and every EndSubmission drained
+the creation queue on the GPU thread and waited for the creation threads (a
+Direct3D 12 heritage). On the Thor a compile costs ~170 ms of CPU, so a burst
+stalled the GPU thread and with it the game.
+
+vulkan_pipeline_compile_never_blocks (default on): a miss marks the entry
+pending and queues it for the creation threads; its draws are skipped (and the
+frame held, vulkan_async_skip_incomplete_frames) until it is published; no
+placeholder, no drain or wait at submission end; a failed background creation
+clears the pending state. Counters every 10 s: pipelines queued / created
+synchronously (ms) / shader translations on the GPU thread (ms) / draws skipped
+/ frames held. Cache-off boot: 0 synchronous creations, 21 queued, game frames
+over 45 ms 6 then 0-2 per 10 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 9904115..4392f43 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -647,6 +647,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Tracks whether any draw in the current frame used an async placeholder
+   // graphics pipeline and may have produced incomplete output.
+   bool frame_used_async_placeholder_pipeline_ = false;
++  // Pipeline / shader work at draw time, logged every 10 s ("Pipelines (10 s)").
++  uint32_t counter_draws_skipped_pending_ = 0;
++  uint32_t counter_frames_held_ = 0;
++  uint32_t counter_frames_presented_ = 0;
++  uint64_t pipeline_counters_last_log_ns_ = 0;
++  void LogPipelineCountersIfDue();
+   // Guest frame index, since some transient resources can be reused across
+   // submissions. Values updated in the beginning of a frame.
+   uint64_t frame_current_ = 1;
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index f3d643b..262930f 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -392,6 +392,27 @@ class VulkanPipelineCache {
+   // loading calls from several threads.
+   std::mutex texture_binding_layouts_mutex_;
+ 
++ public:
++  // Counters of pipeline and shader work at draw time (after the startup preload), read and
++  // reset by the command processor every 10 s: pipelines queued for the creation threads,
++  // pipelines created synchronously on the GPU command thread (with their time), and shader
++  // translations done on the GPU command thread (with their time).
++  struct DrawTimeCounters {
++    uint32_t pipelines_queued = 0;
++    uint32_t pipelines_sync = 0;
++    uint64_t pipelines_sync_us = 0;
++    uint32_t translations = 0;
++    uint64_t translations_us = 0;
++  };
++  DrawTimeCounters TakeDrawTimeCounters();
++
++ private:
++  std::atomic<uint32_t> counter_pipelines_queued_{0};
++  std::atomic<uint32_t> counter_pipelines_sync_{0};
++  std::atomic<uint64_t> counter_pipelines_sync_us_{0};
++  std::atomic<uint32_t> counter_translations_{0};
++  std::atomic<uint64_t> counter_translations_us_{0};
++
+   struct LayoutUID {
+     size_t uid;
+     size_t vector_span_offset;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 4916c7c..403055f 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -691,6 +691,35 @@ void VulkanCommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first
+   }
+ }
+ 
++void VulkanCommandProcessor::LogPipelineCountersIfDue() {
++  uint64_t now_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                 std::chrono::steady_clock::now().time_since_epoch())
++                                 .count());
++  if (!pipeline_counters_last_log_ns_) {
++    pipeline_counters_last_log_ns_ = now_ns;
++    return;
++  }
++  if (now_ns - pipeline_counters_last_log_ns_ < uint64_t(10) * 1000000000) {
++    return;
++  }
++  pipeline_counters_last_log_ns_ = now_ns;
++  VulkanPipelineCache::DrawTimeCounters counters = pipeline_cache_->TakeDrawTimeCounters();
++  if (counters.pipelines_queued || counters.pipelines_sync || counters.translations ||
++      counter_draws_skipped_pending_ || counter_frames_held_) {
++    REXGPU_INFO(
++        "Pipelines (10 s): {} queued for the creation threads, {} created synchronously on the "
++        "GPU thread ({:.1f} ms), {} shader translations on the GPU thread ({:.1f} ms), {} draws "
++        "skipped while pending, {} of {} frames held",
++        counters.pipelines_queued, counters.pipelines_sync,
++        double(counters.pipelines_sync_us) / 1000.0, counters.translations,
++        double(counters.translations_us) / 1000.0, counter_draws_skipped_pending_,
++        counter_frames_held_, counter_frames_held_ + counter_frames_presented_);
++  }
++  counter_draws_skipped_pending_ = 0;
++  counter_frames_held_ = 0;
++  counter_frames_presented_ = 0;
++}
++
+ void VulkanCommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                      uint32_t title_id, bool blocking) {
+   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
+@@ -2405,6 +2434,12 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                             frame_used_async_placeholder_pipeline_;
++  LogPipelineCountersIfDue();
++  if (skip_present_due_async_placeholder) {
++    ++counter_frames_held_;
++  } else {
++    ++counter_frames_presented_;
++  }
+   if (skip_present_due_async_placeholder) {
+     static bool skipped_incomplete_frame_logged = false;
+     if (!skipped_incomplete_frame_logged) {
+@@ -4678,6 +4713,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                                                 &pipeline_is_placeholder);
+   if (REXCVAR_GET(async_shader_compilation) && pipeline_is_placeholder) {
+     frame_used_async_placeholder_pipeline_ = true;
++    ++counter_draws_skipped_pending_;
+     return true;
+   }
+   if (pipeline == VK_NULL_HANDLE || pipeline_layout_provider == nullptr) {
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 2ddeb2d..6cd3429 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -65,6 +65,14 @@ REXCVAR_DECLARE(std::string, vulkan_fragment_shading_rate);
+ #endif
+ #endif
+ 
++REXCVAR_DEFINE_BOOL(vulkan_pipeline_compile_never_blocks, true, "GPU/Vulkan",
++                    "With async_shader_compilation, a pipeline missing at draw time is only "
++                    "created by the background creation threads: its draws are skipped until it "
++                    "is ready (no placeholder pipeline compiled on the GPU thread, also for draws "
++                    "without a pixel shader, and no wait for the creation threads at the end of "
++                    "each submission).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ REXCVAR_DEFINE_INT32(vulkan_storage_translation_threads, -1, "GPU/Vulkan",
+                      "Threads translating the stored shaders at startup: -1 = as many as the "
+                      "pipeline creation threads, 1 = on the GPU thread only.")
+@@ -1169,7 +1177,7 @@ void VulkanPipelineCache::EndSubmission() {
+       std::lock_guard<std::mutex> lock(creation_request_lock_);
+       startup_loading = startup_loading_;
+     }
+-    if (startup_loading) {
++    if (startup_loading || REXCVAR_GET(vulkan_pipeline_compile_never_blocks)) {
+       creation_request_cond_.notify_one();
+     } else {
+       // Help worker threads on the processor thread to reduce warm-up latency.
+@@ -1422,7 +1430,25 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
+               register_file_.Get<reg::SQ_PROGRAM_CNTL>().vs_export_mode !=
+                   xenos::VertexShaderExportMode::kPosition2VectorsEdgeKill);
+   assert_false(register_file_.Get<reg::SQ_PROGRAM_CNTL>().gen_index_vtx);
++  auto translation_start = std::chrono::steady_clock::now();
++  bool translated_any = false;
++  struct TranslationCounter {
++    VulkanPipelineCache* cache;
++    std::chrono::steady_clock::time_point start;
++    bool* translated_any;
++    ~TranslationCounter() {
++      if (*translated_any) {
++        cache->counter_translations_.fetch_add(1, std::memory_order_relaxed);
++        cache->counter_translations_us_.fetch_add(
++            uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                         std::chrono::steady_clock::now() - start)
++                         .count()),
++            std::memory_order_relaxed);
++      }
++    }
++  } translation_counter{this, translation_start, &translated_any};
+   if (!vertex_shader->is_translated()) {
++    translated_any = true;
+     vertex_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+     if (!TranslateAnalyzedShader(*shader_translator_, *vertex_shader)) {
+       REXGPU_ERROR("Failed to translate the vertex shader!");
+@@ -1435,6 +1461,7 @@ bool VulkanPipelineCache::EnsureShadersTranslated(VulkanShader::VulkanTranslatio
+   }
+   if (pixel_shader != nullptr) {
+     if (!pixel_shader->is_translated()) {
++      translated_any = true;
+       pixel_shader->shader().AnalyzeUcode(ucode_disasm_buffer_);
+       if (!TranslateAnalyzedShader(*shader_translator_, *pixel_shader)) {
+         REXGPU_ERROR("Failed to translate the pixel shader!");
+@@ -1515,8 +1542,17 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     }
+   }
+ 
++  const bool never_block = REXCVAR_GET(vulkan_pipeline_compile_never_blocks);
+   bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
+-                   pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
++                   (never_block || (pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE));
++  auto count_sync_creation = [this](std::chrono::steady_clock::time_point start) {
++    counter_pipelines_sync_.fetch_add(1, std::memory_order_relaxed);
++    counter_pipelines_sync_us_.fetch_add(
++        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                     std::chrono::steady_clock::now() - start)
++                     .count()),
++        std::memory_order_relaxed);
++  };
+   uint8_t async_priority = pipeline_util::kPriorityLowest;
+   if (use_async) {
+     uint32_t bound_rts =
+@@ -1533,11 +1569,22 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   if (it != pipelines_.end()) {
+     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+     if (found_pipeline == VK_NULL_HANDLE) {
++      if (it->second.is_placeholder.load(std::memory_order_acquire)) {
++        // Still being created by the background threads: the caller skips the draw.
++        pipeline_out = VK_NULL_HANDLE;
++        pipeline_layout_out = nullptr;
++        if (pipeline_handle_out) {
++          *pipeline_handle_out = &it->second;
++        }
++        return true;
++      }
+       PipelineCreationArguments creation_arguments;
++      auto sync_start = std::chrono::steady_clock::now();
+       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
+           !EnsurePipelineCreated(creation_arguments)) {
+         return false;
+       }
++      count_sync_creation(sync_start);
+       found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+     }
+     const PipelineLayoutProvider* found_pipeline_layout =
+@@ -1561,7 +1608,18 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   }
+ 
+   bool queued_async_creation = false;
+-  if (use_async) {
++  if (use_async && never_block) {
++    // Pending until a creation thread publishes it (is_placeholder with a null pipeline).
++    creation_arguments_real.priority = async_priority;
++    pipeline.second.is_placeholder.store(true, std::memory_order_release);
++    {
++      std::lock_guard<std::mutex> lock(creation_request_lock_);
++      creation_queue_.push(creation_arguments_real);
++    }
++    creation_request_cond_.notify_one();
++    queued_async_creation = true;
++    counter_pipelines_queued_.fetch_add(1, std::memory_order_relaxed);
++  } else if (use_async) {
+     creation_arguments_real.priority = async_priority;
+     PipelineCreationArguments creation_arguments_placeholder;
+     if (TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
+@@ -1580,9 +1638,13 @@ bool VulkanPipelineCache::ConfigurePipeline(
+     }
+   }
+ 
+-  if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
+-    pipelines_.erase(description);
+-    return false;
++  if (!queued_async_creation) {
++    auto sync_start = std::chrono::steady_clock::now();
++    if (!EnsurePipelineCreated(creation_arguments_real)) {
++      pipelines_.erase(description);
++      return false;
++    }
++    count_sync_creation(sync_start);
+   }
+   if (!queued_async_creation) {
+     pipeline.second.is_placeholder.store(false, std::memory_order_release);
+@@ -1606,9 +1668,24 @@ bool VulkanPipelineCache::ConfigurePipeline(
+   if (pipeline_handle_out) {
+     *pipeline_handle_out = &pipeline.second;
+   }
++  if (pipeline_out == VK_NULL_HANDLE && queued_async_creation &&
++      pipeline.second.is_placeholder.load(std::memory_order_acquire)) {
++    // Pending: the caller skips the draw.
++    return true;
++  }
+   return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
+ }
+ 
++VulkanPipelineCache::DrawTimeCounters VulkanPipelineCache::TakeDrawTimeCounters() {
++  DrawTimeCounters counters;
++  counters.pipelines_queued = counter_pipelines_queued_.exchange(0, std::memory_order_relaxed);
++  counters.pipelines_sync = counter_pipelines_sync_.exchange(0, std::memory_order_relaxed);
++  counters.pipelines_sync_us = counter_pipelines_sync_us_.exchange(0, std::memory_order_relaxed);
++  counters.translations = counter_translations_.exchange(0, std::memory_order_relaxed);
++  counters.translations_us = counter_translations_us_.exchange(0, std::memory_order_relaxed);
++  return counters;
++}
++
+ bool VulkanPipelineCache::IsCreatingPipelines() const {
+   std::lock_guard<std::mutex> lock(creation_request_lock_);
+   if (creation_threads_.empty()) {
+@@ -4113,6 +4190,8 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
+       } else {
+         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
+                                                            std::memory_order_release);
++        // A pending entry (no placeholder pipeline) must not keep its draws skipped forever.
++        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
+       }
+     }
+   }

@@ -1,0 +1,74 @@
+From 7981932d2539443d65f0e4f1650480ca1eedea4c Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 11:16:55 +0800
+Subject: [PATCH 060/108] gpu: vulkan: GPU timing also logs the average GPU
+ clock and Mcycles per frame
+
+The governor scales the GPU clock with load, so GPU time per frame alone hides
+changes in work (removing work lowers the clock and the time stays similar).
+Samples the Adreno kgsl clock once per frame.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index dd75007..b04f475 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -1052,6 +1052,10 @@ class VulkanCommandProcessor : public CommandProcessor {
+   uint64_t gpu_timing_submissions_measured_ = 0;
+   uint64_t gpu_timing_overflows_ = 0;
+   uint64_t gpu_timing_frames_ = 0;
++  // GPU clock (Adreno kgsl, sampled once per frame) over the window: GPU time
++  // alone hides work changes when the governor scales the clock.
++  double gpu_timing_clock_mhz_sum_ = 0.0;
++  uint64_t gpu_timing_clock_samples_ = 0;
+   uint64_t gpu_timing_window_start_ns_ = 0;
+   GpuTimingCounters gpu_timing_counters_;
+ };
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index d25e93d..0c17e4d 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3668,6 +3668,20 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+     return;
+   }
+   ++gpu_timing_frames_;
++#if REX_PLATFORM_ANDROID || REX_PLATFORM_LINUX
++  {
++    static FILE* gpu_clock_file = std::fopen("/sys/class/kgsl/kgsl-3d0/gpuclk", "r");
++    if (gpu_clock_file) {
++      unsigned long long hz = 0;
++      std::rewind(gpu_clock_file);
++      std::fflush(gpu_clock_file);
++      if (std::fscanf(gpu_clock_file, "%llu", &hz) == 1 && hz) {
++        gpu_timing_clock_mhz_sum_ += double(hz) * 1.0e-6;
++        ++gpu_timing_clock_samples_;
++      }
++    }
++  }
++#endif
+   uint64_t elapsed_ns = now_ns - gpu_timing_window_start_ns_;
+   if (elapsed_ns < UINT64_C(10000000000)) {
+     return;
+@@ -3721,6 +3735,12 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+         double(c.texture_loads) / frames, double(c.uploads) / frames, double(c.draws) / frames,
+         double(c.submissions) / frames, gpu_timing_submissions_measured_, gpu_timing_overflows_,
+         render_area_info);
++    if (gpu_timing_clock_samples_) {
++      double clock_mhz = gpu_timing_clock_mhz_sum_ / double(gpu_timing_clock_samples_);
++      REXGPU_INFO("GPU work: average clock {:.0f} MHz, {:.2f} Mcycles per frame (total time x "
++                  "clock)",
++                  clock_mhz, ms(total_ns) * clock_mhz * 1.0e-3);
++    }
+     GpuTimingLogPasses(frames);
+     GpuTraceLogDraws();
+     gpu_trace_armed_ = REXCVAR_GET(vulkan_gpu_trace_frame);
+@@ -3744,6 +3764,8 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+   gpu_timing_tag_stats_.clear();
+   gpu_timing_op_stats_.clear();
+   gpu_timing_transfer_pairs_.clear();
++  gpu_timing_clock_mhz_sum_ = 0.0;
++  gpu_timing_clock_samples_ = 0;
+ }
+ 
+ std::string VulkanCommandProcessor::GpuTimingDescribeTag(uint64_t tag) {

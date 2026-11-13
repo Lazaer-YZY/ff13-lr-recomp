@@ -1,0 +1,114 @@
+From 2d6c053a3004aaa768cfe47b0e272e0963cfc17a Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 23:58:34 +0800
+Subject: [PATCH 072/108] gpu: vulkan: vulkan_storage_translate_all -
+ translation report for every stored shader
+
+Translates every shader in the storage with its default modification at startup
+(vertex: every written interpolator exported; pixel: all 16 read) on the
+storage translation threads and logs the count and each failure. Used with the
+offline-extracted shader set: 7,711 shaders, 0 failed, 10.3 s on the Thor.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 6cd3429..b6be4e5 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -73,6 +73,12 @@ REXCVAR_DEFINE_BOOL(vulkan_pipeline_compile_never_blocks, true, "GPU/Vulkan",
+                     "each submission).")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_storage_translate_all, false, "GPU/Vulkan",
++                    "At startup, translate every shader in the shader storage with its default "
++                    "modification (vertex shaders exporting every interpolator they write, pixel "
++                    "shaders reading all 16) and log how many failed: the translation report for "
++                    "an offline-extracted shader set (tools/lr_shader_scan.py).");
++
+ REXCVAR_DEFINE_INT32(vulkan_storage_translation_threads, -1, "GPU/Vulkan",
+                      "Threads translating the stored shaders at startup: -1 = as many as the "
+                      "pipeline creation threads, 1 = on the GPU thread only.")
+@@ -786,6 +792,83 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+   }
+   const double storage_ms_translated = storage_ms_since_start();
+ 
++  if (REXCVAR_GET(vulkan_storage_translate_all)) {
++    std::vector<VulkanShader*> all_shaders;
++    all_shaders.reserve(shaders_.size());
++    for (auto& shader_pair : shaders_) {
++      all_shaders.push_back(shader_pair.second);
++    }
++    std::atomic<size_t> all_next(0), all_ok(0), all_failed(0);
++    std::mutex all_failed_lock;
++    std::vector<std::pair<uint64_t, xenos::ShaderType>> all_failed_list;
++    auto all_worker = [&](SpirvShaderTranslator& translator,
++                          string::StringBuffer& ucode_disasm_buffer) {
++      while (true) {
++        size_t index = all_next.fetch_add(1);
++        if (index >= all_shaders.size()) {
++          break;
++        }
++        VulkanShader* shader = all_shaders[index];
++        if (!shader->is_ucode_analyzed()) {
++          shader->AnalyzeUcode(ucode_disasm_buffer);
++        }
++        uint64_t modification_value;
++        if (shader->type() == xenos::ShaderType::kVertex) {
++          SpirvShaderTranslator::Modification modification(
++              translator.GetDefaultVertexShaderModification(
++                  shader->GetDynamicAddressableRegisterCount(127)));
++          modification.vertex.interpolator_mask = shader->writes_interpolators();
++          modification_value = modification.value;
++        } else {
++          SpirvShaderTranslator::Modification modification(
++              translator.GetDefaultPixelShaderModification(
++                  shader->GetDynamicAddressableRegisterCount(127)));
++          modification.pixel.interpolator_mask = 0xFFFF;
++          modification_value = modification.value;
++        }
++        bool translation_is_new = false;
++        auto* translation = static_cast<VulkanShader::VulkanTranslation*>(
++            shader->GetOrCreateTranslation(modification_value, &translation_is_new));
++        if (translation->is_translated() || TranslateAnalyzedShader(translator, *translation)) {
++          all_ok.fetch_add(1, std::memory_order_relaxed);
++        } else {
++          all_failed.fetch_add(1, std::memory_order_relaxed);
++          std::lock_guard<std::mutex> lock(all_failed_lock);
++          all_failed_list.emplace_back(shader->ucode_data_hash(), shader->type());
++        }
++      }
++    };
++    const ui::vulkan::VulkanDevice* const all_vulkan_device = command_processor_.GetVulkanDevice();
++    std::vector<std::unique_ptr<rex::thread::Thread>> all_threads;
++    size_t all_thread_count = std::max(storage_translation_thread_count, size_t(1));
++    for (size_t i = 0; i < all_thread_count; ++i) {
++      all_threads.push_back(rex::thread::Thread::Create(
++          {}, [this, all_vulkan_device, edram_fragment_shader_interlock, &all_worker]() {
++            SpirvShaderTranslator translator(
++                SpirvShaderTranslator::Features(all_vulkan_device),
++                render_target_cache_.msaa_2x_attachments_supported(),
++                render_target_cache_.msaa_2x_no_attachments_supported(),
++                edram_fragment_shader_interlock, render_target_cache_.draw_resolution_scale_x(),
++                render_target_cache_.draw_resolution_scale_y());
++            string::StringBuffer ucode_disasm_buffer;
++            all_worker(translator, ucode_disasm_buffer);
++          }));
++    }
++    for (const auto& thread : all_threads) {
++      rex::thread::Wait(thread.get(), false);
++    }
++    REXGPU_INFO(
++        "Translated every stored shader (vulkan_storage_translate_all): {} shaders, {} ok, {} "
++        "failed, {:.0f} ms on {} threads",
++        all_shaders.size(), all_ok.load(), all_failed.load(),
++        storage_ms_since_start() - storage_ms_translated, all_thread_count);
++    for (size_t i = 0; i < all_failed_list.size(); ++i) {
++      REXGPU_INFO("Translation failed: {} shader {:016X}",
++                  all_failed_list[i].second == xenos::ShaderType::kVertex ? "vertex" : "pixel",
++                  all_failed_list[i].first);
++    }
++  }
++
+   // Create the pipelines.
+   std::vector<PipelineCreationArguments> pipeline_creations;
+   pipeline_creations.reserve(pipeline_stored_descriptions.size());

@@ -1,0 +1,21 @@
+From ea388d18cdfe766fbfc47fe267bb1f936c745695 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 13:02:13 +0800
+Subject: [PATCH 083/108] gpu: vulkan_submit_before_wait_min_draws description:
+ the wait is on a guest counter
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 55c8e0d..3b689f5 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -79,7 +79,7 @@ REXCVAR_DEFINE_UINT32(vulkan_submit_before_wait_min_draws, 1, "GPU/Vulkan",
+                       "Before the GPU command thread waits (out of commands, or a WAIT_REG_MEM "
+                       "packet polling memory or a register), submit the commands recorded so far "
+                       "if they hold at least this many draws, so the GPU works while the thread "
+-                      "sleeps. LR's command stream waits for the vertical blank in mid-frame; "
++                      "sleeps. Lightning Returns waits once per frame for a guest memory counter; "
+                       "without this the GPU idled until the wait ended. 0 = never.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_UINT32(vulkan_fence_wait_sleep_us, 0, "GPU/Vulkan",

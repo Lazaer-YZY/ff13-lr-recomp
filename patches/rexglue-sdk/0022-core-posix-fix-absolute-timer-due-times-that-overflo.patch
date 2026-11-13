@@ -1,0 +1,64 @@
+From acc54472ebf0515830570f4f96f69a4718ec7946 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:40:48 +0800
+Subject: [PATCH 022/108] core(posix): fix absolute timer due times that
+ overflowed clock_cast (behaviour informed by lr-ffxiii-port's Android patch,
+ re-implemented)
+
+PosixTimer converted FILETIME due times with clock_cast<steady_clock>; a due
+time of 0 ("start now", used for periodic timers) overflowed int64
+nanoseconds and the timer never fired. Convert via the 100 ns delta from now,
+firing past due times immediately and clamping at 100 years.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index ba03f47..aa2a136 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -1315,7 +1315,7 @@ class PosixTimer : public PosixConditionHandle<Timer> {
+   }
+   bool SetOnceAt(WClock_::time_point due_time,
+                  std::function<void()> opt_callback = nullptr) override {
+-    return SetOnceAt(std::chrono::clock_cast<GClock_>(due_time), std::move(opt_callback));
++    return SetOnceAt(ToSteady(due_time), std::move(opt_callback));
+   };
+   bool SetOnceAt(GClock_::time_point due_time,
+                  std::function<void()> opt_callback = nullptr) override {
+@@ -1329,8 +1329,7 @@ class PosixTimer : public PosixConditionHandle<Timer> {
+   }
+   bool SetRepeatingAt(WClock_::time_point due_time, std::chrono::milliseconds period,
+                       std::function<void()> opt_callback = nullptr) override {
+-    return SetRepeatingAt(std::chrono::clock_cast<GClock_>(due_time), period,
+-                          std::move(opt_callback));
++    return SetRepeatingAt(ToSteady(due_time), period, std::move(opt_callback));
+   }
+   bool SetRepeatingAt(GClock_::time_point due_time, std::chrono::milliseconds period,
+                       std::function<void()> opt_callback = nullptr) override {
+@@ -1341,6 +1340,26 @@ class PosixTimer : public PosixConditionHandle<Timer> {
+     handle_.Cancel();
+     return true;
+   }
++
++ private:
++  // Absolute (FILETIME) due time -> steady_clock. Titles pass 0 (year 1601) to
++  // start a periodic timer immediately; clock_cast of that is ~-1.3e19 ns,
++  // which overflows steady_clock's int64 nanoseconds and lands far in the
++  // future, so the timer never fired. Work on the delta in 100 ns units
++  // instead: past due times fire now, far-future ones are clamped.
++  static GClock_::time_point ToSteady(WClock_::time_point due_time) {
++    const auto steady_now = GClock_::now();
++    auto delta = due_time - WClock_::now();
++    if (delta.count() <= 0) {
++      return steady_now;
++    }
++    constexpr auto kMaxDelta =
++        std::chrono::duration_cast<WClock_::duration>(std::chrono::hours(24 * 365 * 100));
++    if (delta > kMaxDelta) {
++      delta = kMaxDelta;
++    }
++    return steady_now + std::chrono::duration_cast<GClock_::duration>(delta);
++  }
+ };
+ 
+ std::unique_ptr<Timer> Timer::CreateManualResetTimer() {

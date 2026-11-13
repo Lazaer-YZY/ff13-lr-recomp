@@ -1,0 +1,179 @@
+From b69bb394f6ae0834f5ab734173993046464361eb Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 07:53:10 +0800
+Subject: [PATCH 046/108] gpu: vulkan: GPU time per resolve and texture load
+ size and format
+
+With vulkan_gpu_timing, resolve and texture load segments are split by
+operation (kind, depth, format, size) and the 10-s log lists their GPU time
+and count per frame. Also fixes the frame trace end-reason letters and
+resets the per-pass draw count when a trace starts.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 35c9473..eb181b7 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -245,6 +245,14 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // breakdown: RenderPassKey | pitch tiles at 32bpp << 32; bit 63 marks an
+   // ownership transfer pass, bit 62 a resolve clear pass.
+   void GpuTimingSetPassTag(uint64_t tag) { gpu_timing_pass_tag_ = tag; }
++  // Resolve / texture load being recorded, for GPU time by operation and size:
++  // kind ('R' or 'T') << 56 | is depth << 55 | format << 48 | width << 24 | height.
++  void GpuTimingSetOpTag(uint64_t tag) {
++    gpu_timing_op_tag_ = tag;
++    if (gpu_timing_enabled_) {
++      ++gpu_timing_op_stats_[tag].passes;
++    }
++  }
+   // vulkan_gpu_trace_frame: the command sequence of one frame per timing window.
+   bool gpu_trace_active() const { return gpu_trace_active_; }
+   void GpuTrace(std::string_view event) {
+@@ -981,12 +989,14 @@ class VulkanCommandProcessor : public CommandProcessor {
+   GpuTimingCategory gpu_timing_segment_category_ = GpuTimingCategory::kCount;
+   uint64_t gpu_timing_pass_tag_ = 0;
+   uint64_t gpu_timing_segment_tag_ = 0;
++  uint64_t gpu_timing_op_tag_ = 0;
+   struct GpuTimingTagStats {
+     uint64_t passes = 0;
+     uint64_t draws = 0;
+     double ns = 0.0;
+   };
+   std::unordered_map<uint64_t, GpuTimingTagStats> gpu_timing_tag_stats_;
++  std::unordered_map<uint64_t, GpuTimingTagStats> gpu_timing_op_stats_;
+   std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> gpu_timing_transfer_pairs_;
+   enum PassEndReason : uint32_t {
+     kPassEndOther,
+@@ -1005,7 +1015,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+     if (gpu_trace_active_) {
+       gpu_trace_ += ")";
+       gpu_trace_ += std::to_string(gpu_trace_pass_draws_);
+-      gpu_trace_ += "ofrRagtb"[reason];
++      gpu_trace_ += "ofFRagtb"[reason];
+       gpu_trace_ += ' ';
+     }
+   }
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 1824032..4c32648 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3459,10 +3459,13 @@ void VulkanCommandProcessor::RenderPassAreaEnd() {
+ void VulkanCommandProcessor::GpuTimingWriteTimestamp(GpuTimingCategory category) {
+   // Never inside a render pass; consecutive work of one category stays in one
+   // segment.
+-  uint64_t tag =
+-      (category == GpuTimingCategory::kDraws || category == GpuTimingCategory::kTransfers)
+-          ? gpu_timing_pass_tag_
+-          : 0;
++  uint64_t tag = 0;
++  if (category == GpuTimingCategory::kDraws || category == GpuTimingCategory::kTransfers) {
++    tag = gpu_timing_pass_tag_;
++  } else if (category == GpuTimingCategory::kResolves ||
++             category == GpuTimingCategory::kTextureLoads) {
++    tag = gpu_timing_op_tag_;
++  }
+   if (in_render_pass_ || gpu_timing_current_.closed ||
+       (category == gpu_timing_segment_category_ && tag == gpu_timing_segment_tag_)) {
+     return;
+@@ -3584,6 +3587,9 @@ void VulkanCommandProcessor::GpuTimingReadCompleted() {
+           if (category == uint8_t(GpuTimingCategory::kDraws) ||
+               category == uint8_t(GpuTimingCategory::kTransfers)) {
+             gpu_timing_tag_stats_[submission.tags[i]].ns += double(ticks) * gpu_timing_period_ns_;
++          } else if (category == uint8_t(GpuTimingCategory::kResolves) ||
++                     category == uint8_t(GpuTimingCategory::kTextureLoads)) {
++            gpu_timing_op_stats_[submission.tags[i]].ns += double(ticks) * gpu_timing_period_ns_;
+           }
+         }
+         ++gpu_timing_submissions_measured_;
+@@ -3605,8 +3611,8 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+   uint64_t paint_ns = 0, paint_count = 0;
+   if (gpu_trace_active_) {
+     gpu_trace_active_ = false;
+-    REXGPU_INFO("GPU frame trace ({} chars; P = pass begin, )N + end reason f/r/a/g/t/b/F/o = "
+-                "framebuffer change / barrier before read / attachment / general / transfer / "
++    REXGPU_INFO("GPU frame trace ({} chars; P = pass begin, )N + end reason f/R/a/g/t/b/F/o = "
++                "framebuffer change / barrier before read (R) / attachment / general / transfer / "
+                 "buffer / forced / other, R = resolve, T = texture load, U = upload):",
+                 gpu_trace_.size());
+     for (size_t offset = 0; offset < gpu_trace_.size(); offset += 1500) {
+@@ -3617,6 +3623,7 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+   if (gpu_trace_armed_) {
+     gpu_trace_armed_ = false;
+     gpu_trace_active_ = true;
++    gpu_trace_pass_draws_ = 0;
+     gpu_trace_.clear();
+   }
+   if (!gpu_timing_window_start_ns_) {
+@@ -3628,6 +3635,7 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+     gpu_timing_frames_ = 0;
+     gpu_timing_counters_ = GpuTimingCounters();
+     gpu_timing_tag_stats_.clear();
++    gpu_timing_op_stats_.clear();
+     gpu_timing_transfer_pairs_.clear();
+     if (presenter) {
+       presenter->SetPaintGpuTimingEnabled(true);
+@@ -3709,6 +3717,7 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+   gpu_timing_frames_ = 0;
+   gpu_timing_counters_ = GpuTimingCounters();
+   gpu_timing_tag_stats_.clear();
++  gpu_timing_op_stats_.clear();
+   gpu_timing_transfer_pairs_.clear();
+ }
+ 
+@@ -3778,6 +3787,24 @@ void VulkanCommandProcessor::GpuTimingLogPasses(double frames) {
+   }
+   REXGPU_INFO("GPU transfers per frame (source -> destination, count x average tiles):{}",
+               pairs_info);
++  std::vector<std::pair<uint64_t, GpuTimingTagStats>> ops(gpu_timing_op_stats_.begin(),
++                                                          gpu_timing_op_stats_.end());
++  std::sort(ops.begin(), ops.end(),
++            [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
++  std::string ops_info;
++  for (size_t i = 0; i < ops.size() && i < 16; ++i) {
++    uint64_t tag = ops[i].first;
++    if (!tag) {
++      continue;
++    }
++    ops_info += fmt::format(" | {}{} {}x{} f{}: {:.2f} ms / {:.1f}", char(tag >> 56),
++                            (tag >> 55) & 1 ? "d" : "", uint32_t(tag >> 24) & 0xFFFFFF,
++                            uint32_t(tag) & 0xFFFFFF, uint32_t(tag >> 48) & 0x7F,
++                            ops[i].second.ns / frames * 1.0e-6, per_frame(ops[i].second.passes));
++  }
++  REXGPU_INFO("GPU resolves (R, d = depth) and texture loads (T) per frame by size and format, "
++              "ms / count:{}",
++              ops_info);
+ }
+ 
+ void VulkanCommandProcessor::GpuTimingShutdown() {
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 4ea9965..d489905 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1144,6 +1144,11 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
+     return true;
+   }
++  command_processor_.GpuTimingSetOpTag(
++      uint64_t('R') << 56 | uint64_t(resolve_info.IsCopyingDepth()) << 55 |
++      uint64_t(uint32_t(resolve_info.copy_dest_info.copy_dest_format) & 0x7F) << 48 |
++      uint64_t(resolve_info.coordinate_info.width_div_8 * 8) << 24 |
++      (resolve_info.height_div_8 * 8));
+   if (command_processor_.gpu_trace_active()) {
+     command_processor_.GpuTrace(fmt::format(
+         "R{}{}{}{} {}x{} f{} @{:X}", resolve_info.IsCopyingDepth() ? "d" : "c",
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index b7086a2..28d8e5c 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -1238,6 +1238,10 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+     return false;
+   }
+   ++command_processor_.gpu_timing_counters().texture_loads;
++  command_processor_.GpuTimingSetOpTag(uint64_t('T') << 56 |
++                                       uint64_t(uint32_t(texture_key.format) & 0x7F) << 48 |
++                                       uint64_t(texture_key.width_minus_1 + 1) << 24 |
++                                       (texture_key.height_minus_1 + 1));
+   if (command_processor_.gpu_trace_active()) {
+     command_processor_.GpuTrace(fmt::format("T{}x{} f{} @{:X}", texture_key.width_minus_1 + 1,
+                                             texture_key.height_minus_1 + 1,

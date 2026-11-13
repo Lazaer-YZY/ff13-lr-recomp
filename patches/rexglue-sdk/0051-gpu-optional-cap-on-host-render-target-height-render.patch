@@ -1,0 +1,47 @@
+From db77cd1e2967d42a6fb842131be2689d7329411a Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 09:10:35 +0800
+Subject: [PATCH 051/108] gpu: optional cap on host render target height
+ (render_target_max_height)
+
+Experiment: host render targets cover the EDRAM down to the next addressing
+period (1280x2048 for a 1280x720 surface); a positive value caps their height
+in pixels. Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 953c5fd..16809c7 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -37,6 +37,12 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
+ REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
+                     "Use full range for SNORM16 render targets");
+ 
++REXCVAR_DEFINE_INT32(render_target_max_height, 0, "GPU",
++                     "If above 0, host render targets are at most this many pixels tall (rounded "
++                     "up to whole EDRAM tiles) instead of covering the EDRAM down to the next "
++                     "addressing period. Experimental: content drawn below is lost.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
+                     "Resolve from host render targets directly to shared memory when possible")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -806,6 +812,17 @@ uint32_t RenderTargetCache::GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
+   uint32_t tile_height_samples_scaled = xenos::kEdramTileHeightSamples * draw_resolution_scale_y();
+   tile_rows =
+       std::min(tile_rows, (max_height_scaled << msaa_samples_y_log2) / tile_height_samples_scaled);
++  // Optional cap for hosts that load / store whole attachments per render pass
++  // (render_target_max_height): host images this tall at most, in pixels.
++  int32_t max_height_cvar = REXCVAR_GET(render_target_max_height);
++  if (max_height_cvar > 0) {
++    uint32_t max_rows = std::max(
++        ((uint32_t(max_height_cvar) * draw_resolution_scale_y() << msaa_samples_y_log2) +
++         (tile_height_samples_scaled - 1)) /
++            tile_height_samples_scaled,
++        uint32_t(1));
++    tile_rows = std::min(tile_rows, max_rows);
++  }
+   assert_not_zero(tile_rows);
+   return tile_rows * (xenos::kEdramTileHeightSamples >> msaa_samples_y_log2);
+ }

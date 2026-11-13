@@ -1,0 +1,4 @@
+# From leftisthominid/lr-ffxiii-port (GPL-3.0), project/analysis/lr_gpu_dispatch_82D71400.toml, unmodified.
+# Lightning Returns PowerPC dispatch function. Exact length excludes four-byte padding.
+[functions]
+0x82D71400 = { size = 244 }

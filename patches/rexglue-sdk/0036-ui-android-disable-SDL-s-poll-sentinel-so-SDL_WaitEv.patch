@@ -1,0 +1,35 @@
+From 5370e4ff71d5be8993006068539c0db6b02ad73f Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 21:30:56 +0800
+Subject: [PATCH 036/108] ui: android: disable SDL's poll sentinel so
+ SDL_WaitEvent blocks
+
+SDL 3.4's Android SDL_WaitEventTimeoutNS loop pumps with a poll sentinel on
+every pass; pushing the sentinel posts the lifecycle semaphore the loop then
+waits on, so the UI thread never slept (70-80% of a core in clock_gettime,
+joystick and audio maintenance). The UI loop only uses SDL_WaitEvent, so the
+sentinel is not needed. Thor title menu: UI thread 81% -> 25%, prime core
+2640 -> 1843 MHz, peak 70.2 -> 54.8 C.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index e0a8e70..b243e31 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -50,6 +50,15 @@ bool SDLWindowedAppContext::Initialize() {
+   if (!requested_driver.empty()) {
+     SDL_SetHint(SDL_HINT_VIDEO_DRIVER, requested_driver.c_str());
+   }
++#if defined(__ANDROID__)
++  // SDL 3.4's Android SDL_WaitEvent loop pumps with a poll sentinel on every
++  // pass, and pushing the sentinel posts the lifecycle semaphore the same loop
++  // then waits on, so the wait never blocks: the UI thread spun at 70-80% of a
++  // core updating joysticks/audio and reading the clock. The sentinel only
++  // matters for SDL_PollEvent cycles, which this loop doesn't use. Without it
++  // the wait sleeps until something actually pushes an event.
++  SDL_SetHint(SDL_HINT_POLL_SENTINEL, "0");
++#endif
+   if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) {
+     REXLOG_ERROR("SDL_InitSubSystem(SDL_INIT_VIDEO) failed: {}", SDL_GetError());
+     return false;

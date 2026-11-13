@@ -1,0 +1,46 @@
+From a0c43904f5f64e1bc4be3345ebe63ed34a6a4f24 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 20:41:17 +0800
+Subject: [PATCH 034/108] gpu(spirv): take texture exp_adjust from fetch
+ constant word 3, not word 4
+
+Bits 13:18 of word 4 are inside the LOD bias; the -1 bias common for world
+textures scaled samples by 2^-32 and rendered lit geometry black on Vulkan.
+Same fix as Lighthing-Recomp (FFXIII) and leftisthominid/lr-ffxiii-port.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4..abc770f 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -2029,11 +2029,26 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+           }
+         }
+ 
+-        // Apply the exponent bias from the bits 13:18 of the fetch constant
+-        // word 4.
++        // Apply the exponent bias (exp_adjust) from the bits 13:18 of the fetch
++        // constant word 3, as the DXBC translator does. Bits 13:18 of the word 4
++        // are inside the LOD bias, and the -1 bias common for world textures
++        // scaled every sample by 2^-32, rendering lit geometry black (Lightning
++        // Returns battle scene; same bug as fixed in Lighthing-Recomp for FFXIII).
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(const_int_0_);
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) >> 2)));
++        id_vector_temp_.push_back(
++            builder_->makeIntConstant(int((fetch_constant_word_0_index + 3) & 3)));
++        spv::Id fetch_constant_word_3_signed = builder_->createUnaryOp(
++            spv::OpBitcast, type_int_,
++            builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
++                                                             uniform_fetch_constants_,
++                                                             id_vector_temp_),
++                                 spv::NoPrecision));
+         spv::Id result_exponent_bias = builder_->createBinBuiltinCall(
+             type_float_, ext_inst_glsl_std_450_, GLSLstd450Ldexp, const_float_1_,
+-            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_4_signed,
++            builder_->createTriOp(spv::OpBitFieldSExtract, type_int_, fetch_constant_word_3_signed,
+                                   builder_->makeUintConstant(13), builder_->makeUintConstant(6)));
+         {
+           uint32_t result_remaining_components = used_result_nonzero_components;

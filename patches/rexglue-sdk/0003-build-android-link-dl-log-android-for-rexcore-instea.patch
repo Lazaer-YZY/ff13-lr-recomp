@@ -1,0 +1,22 @@
+From 24df1636b81faf652f5e2a341be32a0e7486d3b2 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:16:53 +0800
+Subject: [PATCH 003/108] build(android): link dl/log/android for rexcore
+ instead of pthread/rt
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..c6f117b 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -100,6 +100,9 @@ target_include_directories(rexcore PRIVATE
+ 
+ if(APPLE)
+     target_link_libraries(rexcore PRIVATE pthread)
++elseif(ANDROID)
++    # Bionic: pthread/rt live in libc; no librt/libpthread to link.
++    target_link_libraries(rexcore PRIVATE dl log android)
+ elseif(UNIX)
+     target_link_libraries(rexcore PRIVATE pthread rt dl)
+ endif()

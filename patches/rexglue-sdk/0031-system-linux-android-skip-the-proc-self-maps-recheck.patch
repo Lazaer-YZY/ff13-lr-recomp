@@ -1,0 +1,74 @@
+From d3749ea14a330602fd5e3a4a60afd1be3fd7c7aa Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:48:42 +0800
+Subject: [PATCH 031/108] system(linux/android): skip the /proc/self/maps
+ recheck on write faults (behaviour informed by lr-ffxiii-port's Android
+ patch, re-implemented)
+
+MMIOHandler re-queried page protection (parsing /proc/self/maps on Linux)
+under the global lock for every unmapped write fault. Writes go straight to
+the access-violation callback instead; a watch already cleared by another
+thread is handled there (no watch found -> stale-protection recovery). Only
+if the callback fails is the protection re-queried, so a write that raced a
+protection change still resumes. Reads and Windows/macOS are unchanged.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 2b93005..db22267 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -406,19 +406,44 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     // clears the watch we just hit).
+     // Do this under the lock so we don't introduce another race condition.
+     auto lock = global_critical_region_.Acquire();
+-    memory::PageAccess cur_access;
+-    size_t page_length = memory::page_size();
+-    memory::QueryProtect(fault_host_address, page_length, cur_access);
+-    if (cur_access != memory::PageAccess::kNoAccess &&
+-        (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
+-      // Another thread has cleared this watch. Abort.
+-      return true;
++#if REX_PLATFORM_LINUX
++    // QueryProtect parses /proc/self/maps on Linux/Android (milliseconds with
++    // many watched ranges, under the global lock and the kernel mm lock). A
++    // write does not need it: a watch another thread already cleared finds
++    // nothing in TriggerCallbacks, and Memory's stale-protection path then
++    // restores write access from the guest page table.
++    const bool recheck = !is_write || !access_violation_callback_;
++#else
++    const bool recheck = true;
++#endif
++    if (recheck) {
++      memory::PageAccess cur_access;
++      size_t page_length = memory::page_size();
++      memory::QueryProtect(fault_host_address, page_length, cur_access);
++      if (cur_access != memory::PageAccess::kNoAccess &&
++          (!is_write || cur_access != memory::PageAccess::kReadOnly)) {
++        // Another thread has cleared this watch. Abort.
++        return true;
++      }
+     }
+     // The address is not found within any range, so either a write watch or an
+     // actual access violation.
+     if (access_violation_callback_) {
+-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
+-                                        fault_host_address, is_write);
++      if (access_violation_callback_(std::move(lock), access_violation_callback_context_,
++                                     fault_host_address, is_write)) {
++        return true;
++      }
++      if (!recheck) {
++        // Failure path only: keep the old "already writable again" answer for
++        // a write that raced a protection change.
++        memory::PageAccess cur_access;
++        size_t page_length = memory::page_size();
++        memory::QueryProtect(fault_host_address, page_length, cur_access);
++        if (cur_access == memory::PageAccess::kReadWrite ||
++            cur_access == memory::PageAccess::kExecuteReadWrite) {
++          return true;
++        }
++      }
+     }
+     return false;
+   }

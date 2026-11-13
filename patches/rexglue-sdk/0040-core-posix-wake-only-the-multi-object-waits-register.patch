@@ -1,0 +1,152 @@
+From 6b1253d3aa20618b5d6555610fa323c89dfeb6c2 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 23:45:54 +0800
+Subject: [PATCH 040/108] core: posix: wake only the multi-object waits
+ registered on a handle
+
+Multi-object waits slept on one process-wide condition variable, and every
+signal of any event, semaphore, mutant, timer or thread exit woke all of them.
+They now register on each handle they wait for and sleep on their own
+condition variable; a handle wakes only its registered waits (the 50 ms safety
+re-check stays). Thor title menu: audio worker 5098 -> 1082 wakeups/s and
+78 -> 19 ms/s on a CPU, a game thread 4295 -> 179 wakeups/s, main thread
+150 -> 96 ms/s (game code 4.8 -> 2.9 ms per frame).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 6989cb9..2e72e59 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -269,21 +269,20 @@ static sem_t* RexCreateAnonymousSemaphore() {
+ }
+ #endif  // __APPLE__
+ 
+-// Multi-object waits sleep on one process-wide condition variable instead of
+-// polling every millisecond. Anything that may make a handle signaled bumps the
+-// generation and wakes them (taking the mutex only while such a wait exists).
+-static std::mutex g_multi_wait_mutex;
+-static std::condition_variable g_multi_wait_cv;
+-static std::atomic<uint64_t> g_multi_wait_generation{0};
+-static std::atomic<int> g_multi_waiters{0};
+-
+-inline void NotifyMultiWaiters() {
+-  g_multi_wait_generation.fetch_add(1);
+-  if (g_multi_waiters.load() > 0) {
+-    std::lock_guard<std::mutex> lock(g_multi_wait_mutex);
+-    g_multi_wait_cv.notify_all();
+-  }
+-}
++// Multi-object waits register themselves on every handle they wait for and
++// sleep on their own condition variable; a handle that may have become
++// signaled wakes only the waits registered on it. (A single process-wide
++// condition variable woke every multi-object wait on every signal of any
++// handle: on the Thor the runtime's audio worker and a game thread woke
++// ~5000 times a second for nothing and pre-empted the game's worker threads.)
++struct MultiWaiter {
++  std::mutex mutex;
++  std::condition_variable cv;
++  bool woken = false;
++};
++// Guards every handle's list of registered multi-object waits. Lock order:
++// a handle's mutex_ (if held) -> this -> MultiWaiter::mutex.
++static std::mutex g_multi_wait_registry_mutex;
+ 
+ class PosixConditionBase {
+  public:
+@@ -305,6 +304,19 @@ class PosixConditionBase {
+   virtual ~PosixConditionBase() = default;
+   virtual bool Signal() = 0;
+ 
++  // Called after anything that may make this handle signaled.
++  void NotifyMultiWaiters() {
++    if (multi_waiter_count_.load(std::memory_order_acquire) == 0) {
++      return;
++    }
++    std::lock_guard<std::mutex> registry_lock(g_multi_wait_registry_mutex);
++    for (MultiWaiter* waiter : multi_waiters_) {
++      std::lock_guard<std::mutex> lock(waiter->mutex);
++      waiter->woken = true;
++      waiter->cv.notify_one();
++    }
++  }
++
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+     bool executed;
+     auto predicate = [this] { return this->signaled(); };
+@@ -385,15 +397,37 @@ class PosixConditionBase {
+                         ? std::chrono::steady_clock::time_point::max()
+                         : start_time + timeout;
+ 
+-    g_multi_waiters.fetch_add(1);
++    MultiWaiter waiter;
++    {
++      std::lock_guard<std::mutex> registry_lock(g_multi_wait_registry_mutex);
++      for (PosixConditionBase* handle : handles) {
++        handle->multi_waiters_.push_back(&waiter);
++        handle->multi_waiter_count_.fetch_add(1, std::memory_order_release);
++      }
++    }
+     struct MultiWaiterScope {
+-      ~MultiWaiterScope() { g_multi_waiters.fetch_sub(1); }
+-    } multi_waiter_scope;
++      std::vector<PosixConditionBase*>& handles;
++      MultiWaiter* waiter;
++      ~MultiWaiterScope() {
++        std::lock_guard<std::mutex> registry_lock(g_multi_wait_registry_mutex);
++        for (PosixConditionBase* handle : handles) {
++          auto& list = handle->multi_waiters_;
++          auto it = std::find(list.begin(), list.end(), waiter);
++          if (it != list.end()) {
++            list.erase(it);
++            handle->multi_waiter_count_.fetch_sub(1, std::memory_order_release);
++          }
++        }
++      }
++    } multi_waiter_scope{handles, &waiter};
+ 
+     while (true) {
+-      // Read before checking the handles: a signal after the check changes it,
+-      // so the sleep below returns immediately.
+-      const uint64_t generation = g_multi_wait_generation.load();
++      // Cleared before checking the handles: a signal after the check sets it
++      // again, so the sleep below returns immediately.
++      {
++        std::lock_guard<std::mutex> lock(waiter.mutex);
++        waiter.woken = false;
++      }
+       size_t first_signaled = std::numeric_limits<size_t>::max();
+       bool condition_met = false;
+       bool all_locked = true;
+@@ -475,10 +509,8 @@ class PosixConditionBase {
+       if (end_time < wake_time) {
+         wake_time = end_time;
+       }
+-      std::unique_lock<std::mutex> wait_lock(g_multi_wait_mutex);
+-      g_multi_wait_cv.wait_until(wait_lock, wake_time, [generation] {
+-        return g_multi_wait_generation.load() != generation;
+-      });
++      std::unique_lock<std::mutex> wait_lock(waiter.mutex);
++      waiter.cv.wait_until(wait_lock, wake_time, [&waiter] { return waiter.woken; });
+     }
+   }
+ 
+@@ -491,6 +523,9 @@ class PosixConditionBase {
+   inline virtual void post_execution() = 0;
+   std::condition_variable cond_;
+   std::mutex mutex_;
++  // Multi-object waits registered on this handle (under g_multi_wait_registry_mutex).
++  std::vector<MultiWaiter*> multi_waiters_;
++  std::atomic<int> multi_waiter_count_{0};
+ };
+ 
+ // There really is no native POSIX handle for a single wait/signal construct
+@@ -1544,7 +1579,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+     thread->handle_.exit_code_ = 0;
+     thread->handle_.signaled_ = true;
+     thread->handle_.cond_.notify_all();
+-    NotifyMultiWaiters();
++    thread->handle_.NotifyMultiWaiters();
+   }
+ 
+   current_thread_ = nullptr;

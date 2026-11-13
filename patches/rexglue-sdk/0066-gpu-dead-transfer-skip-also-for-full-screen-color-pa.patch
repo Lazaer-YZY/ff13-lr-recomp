@@ -1,0 +1,287 @@
+From bc6c1600df5a8ef824917059c24e267561f7e5c7 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 17:06:21 +0800
+Subject: [PATCH 066/108] gpu: dead-transfer skip also for full-screen color
+ passes (battle transfers 3.5 -> 2.5 ms)
+
+- gpu_skip_overwritten_transfers now also cuts the covered area out of
+  ownership transfers when the draw writes color render targets completely
+  (full write mask, no blending, depth test off or ALWAYS, no stencil
+  rejection, no alpha test / alpha-to-mask / pixel kill, full MSAA mask), and
+  every render target of the draw is overwritten (the cut-out is shared by the
+  transfer call). gpu_skip_overwritten_color_transfers (default true) turns
+  the color part off.
+- DrawExtentEstimator::EstimateRectangleCoverage: a single triangle (e.g. a
+  full-screen triangle) counts if it contains the scissor rectangle (limited
+  to the viewport for clipped draws); 4-vertex triangle fans count as quads.
+- Battle, same fight: transfers 3.5-3.6 -> 2.5 ms per frame, GPU work
+  14.0 -> 13.2-13.3 Mcycles at ~492 MHz (was ~550); battle-start frames with
+  and without it look the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/util/draw_extent_estimator.h b/include/rex/graphics/util/draw_extent_estimator.h
+index a7effcb..a3430cd 100644
+--- a/include/rex/graphics/util/draw_extent_estimator.h
++++ b/include/rex/graphics/util/draw_extent_estimator.h
+@@ -35,9 +35,14 @@ class DrawExtentEstimator {
+   // shader on the CPU and returns the pixels the rectangle covers fully (right
+   // and bottom exclusive, window offset and viewport clipping applied, scissor
+   // not applied). reject_out (optional) tells why not, for diagnostics.
+-  bool EstimateRectangleCoverage(const Shader& vertex_shader, int32_t& left_out,
+-                                 int32_t& top_out, int32_t& right_out, int32_t& bottom_out,
+-                                 uint32_t* reject_out = nullptr);
++  // A single triangle (a 1-triangle triangle list, e.g. a full-screen
++  // triangle) is accepted too if it contains the whole bounds rectangle
++  // (pixels, right / bottom exclusive, usually the scissor), which is then
++  // returned.
++  bool EstimateRectangleCoverage(const Shader& vertex_shader, int32_t bounds_left,
++                                 int32_t bounds_top, int32_t bounds_right, int32_t bounds_bottom,
++                                 int32_t& left_out, int32_t& top_out, int32_t& right_out,
++                                 int32_t& bottom_out, uint32_t* reject_out = nullptr);
+ 
+  private:
+   class PositionYExportSink : public ShaderInterpreter::ExportSink {
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 3878398..6350756 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -29,11 +29,15 @@
+ #include <rex/math.h>
+ 
+ REXCVAR_DEFINE_UINT32(gpu_skip_overwritten_transfers, 2, "GPU",
+-                      "Skip ownership transfers into the part of a depth render target that "
+-                      "the draw needing them overwrites completely (a single screen-space "
+-                      "rectangle with depth test ALWAYS and depth write). 1 = only if the "
+-                      "stencil is overwritten too, 2 = also if the stencil isn't written "
+-                      "(its old bits are then not transferred).");
++                      "Skip ownership transfers into the part of the render targets that "
++                      "the draw needing them overwrites completely (a single rectangle, or a "
++                      "triangle containing the scissor; depth written with ALWAYS, colors "
++                      "written without blending). 1 = only if the stencil is overwritten too, "
++                      "2 = also if the stencil isn't written (its old bits are then not "
++                      "transferred).");
++REXCVAR_DEFINE_BOOL(gpu_skip_overwritten_color_transfers, true, "GPU",
++                    "gpu_skip_overwritten_transfers also for draws writing color render "
++                    "targets (otherwise only depth-only draws).");
+ REXCVAR_DEFINE_BOOL(gpu_log_transfer_draws, false, "GPU",
+                     "Diagnostic: log each distinct ownership transfer situation once with "
+                     "the state of the draw that needs it.");
+@@ -702,15 +706,22 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   // clear with a rectangle drawn with depth ALWAYS) doesn't need the previous
+   // contents of that rectangle: cut it out of the ownership transfers.
+   last_update_transfer_cutout_valid_ = false;
+-  // Why the cut-out wasn't made (for gpu_log_transfer_draws): 1 = not a depth-only draw with
+-  // depth ALWAYS + write, 2 = stencil not overwritten, 3 = may discard, 4 = not a full
+-  // screen-space rectangle, 5 = empty after the scissor.
++  // Why the cut-out wasn't made (for gpu_log_transfer_draws): 1 = not applicable
++  // (off, no render targets, or a bound depth buffer not written with ALWAYS),
++  // 2 = stencil not overwritten, 3 = may discard, 4x = coverage (40 + estimator
++  // reason), 5 = empty after the scissor, 6 = a color target blended or not
++  // fully written.
+   uint32_t cutout_reject = 1;
+   uint32_t skip_overwritten_transfers = REXCVAR_GET(gpu_skip_overwritten_transfers);
++  bool cutout_depth_used = (depth_and_color_rts_used_bits & 0b1) != 0;
++  uint32_t cutout_color_used = depth_and_color_rts_used_bits >> 1;
+   if (skip_overwritten_transfers && !interlock_barrier_only && is_rasterization_done &&
+-      depth_and_color_rts_used_bits == 0b1 && normalized_depth_control.z_enable &&
+-      normalized_depth_control.z_write_enable &&
+-      normalized_depth_control.zfunc == xenos::CompareFunction::kAlways) {
++      depth_and_color_rts_used_bits &&
++      (!cutout_depth_used ||
++       (normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
++        normalized_depth_control.zfunc == xenos::CompareFunction::kAlways))) {
++    // The transfer cut-out applies to every render target of the draw, so all
++    // of them must be overwritten completely.
+     bool overwrites = true;
+     if (normalized_depth_control.stencil_enable) {
+       auto stencil_overwritten = [&](xenos::CompareFunction func, xenos::StencilOp zpass,
+@@ -725,10 +736,33 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                     stencil_overwritten(normalized_depth_control.stencilfunc_bf,
+                                         normalized_depth_control.stencilzpass_bf,
+                                         XE_GPU_REG_RB_STENCILREFMASK_BF));
+-    } else {
++    } else if (cutout_depth_used) {
+       overwrites = skip_overwritten_transfers >= 2;
+     }
+     cutout_reject = overwrites ? 3 : 2;
++    if (overwrites && cutout_color_used && !REXCVAR_GET(gpu_skip_overwritten_color_transfers)) {
++      overwrites = false;
++      cutout_reject = 6;
++    }
++    if (overwrites && cutout_color_used) {
++      uint32_t color_remaining = cutout_color_used;
++      uint32_t color_index;
++      while (overwrites && rex::bit_scan_forward(color_remaining, &color_index)) {
++        color_remaining &= ~(uint32_t(1) << color_index);
++        auto blend = regs.Get<reg::RB_BLENDCONTROL>(
++            reg::RB_BLENDCONTROL::rt_register_indices[color_index]);
++        if (((normalized_color_mask >> (color_index * 4)) & 0b1111) != 0b1111 ||
++            blend.color_srcblend != xenos::BlendFactor::kOne ||
++            blend.color_destblend != xenos::BlendFactor::kZero ||
++            blend.color_comb_fcn != xenos::BlendOp::kAdd ||
++            blend.alpha_srcblend != xenos::BlendFactor::kOne ||
++            blend.alpha_destblend != xenos::BlendFactor::kZero ||
++            blend.alpha_comb_fcn != xenos::BlendOp::kAdd) {
++          overwrites = false;
++          cutout_reject = 6;
++        }
++      }
++    }
+     auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+     if ((rb_colorcontrol.alpha_test_enable &&
+          rb_colorcontrol.alpha_func != xenos::CompareFunction::kAlways) ||
+@@ -736,29 +770,36 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+         (update_pixel_shader_ && update_pixel_shader_->kills_pixels()) ||
+         (msaa_samples != xenos::MsaaSamples::k1X &&
+          (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) != 0xFFFF)) {
++      if (overwrites) {
++        cutout_reject = 3;
++      }
+       overwrites = false;
+     }
+-    int32_t left, top, right, bottom;
+-    uint32_t rectangle_reject = 0;
+-    if (overwrites && !draw_extent_estimator_.EstimateRectangleCoverage(
+-                          vertex_shader, left, top, right, bottom, &rectangle_reject)) {
+-      // 40 + the rectangle estimation reason.
+-      cutout_reject = 40 + rectangle_reject;
+-    } else if (overwrites) {
++    if (overwrites) {
+       draw_util::Scissor scissor;
+       draw_util::GetScissor(regs, scissor);
+-      left = std::max(left, int32_t(scissor.offset[0]));
+-      top = std::max(top, int32_t(scissor.offset[1]));
+-      right = std::min(right, int32_t(scissor.offset[0] + scissor.extent[0]));
+-      bottom = std::min(bottom, int32_t(scissor.offset[1] + scissor.extent[1]));
+-      cutout_reject = 5;
+-      if (right > left && bottom > top) {
+-        cutout_reject = 0;
+-        last_update_transfer_cutout_.x_pixels = uint32_t(left);
+-        last_update_transfer_cutout_.y_pixels = uint32_t(top);
+-        last_update_transfer_cutout_.width_pixels = uint32_t(right - left);
+-        last_update_transfer_cutout_.height_pixels = uint32_t(bottom - top);
+-        last_update_transfer_cutout_valid_ = true;
++      int32_t scissor_right = int32_t(scissor.offset[0] + scissor.extent[0]);
++      int32_t scissor_bottom = int32_t(scissor.offset[1] + scissor.extent[1]);
++      int32_t left, top, right, bottom;
++      uint32_t rectangle_reject = 0;
++      if (!draw_extent_estimator_.EstimateRectangleCoverage(
++              vertex_shader, int32_t(scissor.offset[0]), int32_t(scissor.offset[1]),
++              scissor_right, scissor_bottom, left, top, right, bottom, &rectangle_reject)) {
++        cutout_reject = 40 + rectangle_reject;
++      } else {
++        left = std::max(left, int32_t(scissor.offset[0]));
++        top = std::max(top, int32_t(scissor.offset[1]));
++        right = std::min(right, scissor_right);
++        bottom = std::min(bottom, scissor_bottom);
++        cutout_reject = 5;
++        if (right > left && bottom > top) {
++          cutout_reject = 0;
++          last_update_transfer_cutout_.x_pixels = uint32_t(left);
++          last_update_transfer_cutout_.y_pixels = uint32_t(top);
++          last_update_transfer_cutout_.width_pixels = uint32_t(right - left);
++          last_update_transfer_cutout_.height_pixels = uint32_t(bottom - top);
++          last_update_transfer_cutout_valid_ = true;
++        }
+       }
+     }
+   }
+@@ -768,9 +809,8 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     uint32_t rt_bit_index = rt_base_index.second;
+     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+                     interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index],
+-                    (rt_bit_index == 0 && last_update_transfer_cutout_valid_)
+-                        ? &last_update_transfer_cutout_
+-                        : nullptr);
++                    last_update_transfer_cutout_valid_ ? &last_update_transfer_cutout_
++                                                       : nullptr);
+   }
+ 
+   // Diagnostic: each distinct ownership transfer situation once, with the state
+diff --git a/src/graphics/util/draw_extent_estimator.cpp b/src/graphics/util/draw_extent_estimator.cpp
+index 352f3f7..34dc099 100644
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -264,6 +264,8 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
+ }
+ 
+ bool DrawExtentEstimator::EstimateRectangleCoverage(const Shader& vertex_shader,
++                                                    int32_t bounds_left, int32_t bounds_top,
++                                                    int32_t bounds_right, int32_t bounds_bottom,
+                                                     int32_t& left_out, int32_t& top_out,
+                                                     int32_t& right_out, int32_t& bottom_out,
+                                                     uint32_t* reject_out) {
+@@ -276,11 +278,17 @@ bool DrawExtentEstimator::EstimateRectangleCoverage(const Shader& vertex_shader,
+   const RegisterFile& regs = register_file_;
+   auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+   uint32_t vertex_count;
++  bool is_triangle = false;
+   switch (vgt_draw_initiator.prim_type) {
++    case xenos::PrimitiveType::kTriangleList:
++      vertex_count = 3;
++      is_triangle = true;
++      break;
+     case xenos::PrimitiveType::kRectangleList:
+       vertex_count = 3;
+       break;
+     case xenos::PrimitiveType::kQuadList:
++    case xenos::PrimitiveType::kTriangleFan:
+     case xenos::PrimitiveType::kTriangleStrip:
+       vertex_count = 4;
+       break;
+@@ -406,9 +414,52 @@ bool DrawExtentEstimator::EstimateRectangleCoverage(const Shader& vertex_shader,
+   if (!valid) {
+     return false;
+   }
++  if (is_triangle) {
++    // The triangle must contain the centers of the corner pixels of the
++    // bounds (limited to the viewport for clipped draws).
++    float bx0 = float(bounds_left), by0 = float(bounds_top);
++    float bx1 = float(bounds_right), by1 = float(bounds_bottom);
++    if (clipped) {
++      bx0 = std::max(bx0, x_offset - std::abs(x_scale) + center_offset + window_x);
++      bx1 = std::min(bx1, x_offset + std::abs(x_scale) + center_offset + window_x);
++      by0 = std::max(by0, y_offset - std::abs(y_scale) + center_offset + window_y);
++      by1 = std::min(by1, y_offset + std::abs(y_scale) + center_offset + window_y);
++    }
++    int32_t left = int32_t(std::ceil(bx0)), top = int32_t(std::ceil(by0));
++    int32_t right = int32_t(std::floor(bx1)), bottom = int32_t(std::floor(by1));
++    reject = 5;
++    if (right <= left || bottom <= top) {
++      return false;
++    }
++    float area = (xs[1] - xs[0]) * (ys[2] - ys[0]) - (ys[1] - ys[0]) * (xs[2] - xs[0]);
++    if (area == 0.0f) {
++      return false;
++    }
++    float corner_xs[4] = {left + 0.5f, right - 0.5f, left + 0.5f, right - 0.5f};
++    float corner_ys[4] = {top + 0.5f, top + 0.5f, bottom - 0.5f, bottom - 0.5f};
++    for (uint32_t c = 0; c < 4; ++c) {
++      for (uint32_t e = 0; e < 3; ++e) {
++        uint32_t a = e, b = (e + 1) % 3;
++        float edge = (xs[b] - xs[a]) * (corner_ys[c] - ys[a]) -
++                     (ys[b] - ys[a]) * (corner_xs[c] - xs[a]);
++        if (area > 0.0f ? edge < 0.0f : edge > 0.0f) {
++          reject = 6;
++          return false;
++        }
++      }
++    }
++    left_out = left;
++    top_out = top;
++    right_out = right;
++    bottom_out = bottom;
++    reject = 0;
++    return true;
++  }
+   // The vertex opposite to v0 (for the bowtie check below).
+-  uint32_t opposite_of_0 =
+-      vgt_draw_initiator.prim_type == xenos::PrimitiveType::kQuadList ? 2 : 3;
++  uint32_t opposite_of_0 = (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kQuadList ||
++                            vgt_draw_initiator.prim_type == xenos::PrimitiveType::kTriangleFan)
++                               ? 2
++                               : 3;
+   if (vertex_count == 3) {
+     // Rectangle list: the longest edge is the diagonal, the fourth corner is
+     // its endpoints minus the right-angle corner (as Xenia expands them).

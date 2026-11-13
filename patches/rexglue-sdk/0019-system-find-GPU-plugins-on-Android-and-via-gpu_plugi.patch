@@ -1,0 +1,111 @@
+From b251e53aa98b32bcbb40197f287dccea4f652b83 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:11:45 +0800
+Subject: [PATCH 019/108] system: find GPU plugins on Android and via
+ gpu_plugin_dir
+
+On Android the executable is /system/bin/app_process, so the plugin was looked
+for in /system/bin and never found. Lookup order is now:
+1. Android: the already loaded librexgpu-<name>.so (dlopen RTLD_NOLOAD),
+2. Android: dlopen by soname (the app's native library directory),
+3. the new string cvar gpu_plugin_dir (all platforms, empty by default),
+4. next to the executable (previous behaviour).
+The source that succeeded is logged. With gpu_plugin_dir empty, desktop
+behaviour and messages are unchanged (the not-found message now also mentions
+gpu_plugin_dir).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 754fa13..419af20 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -17,11 +17,21 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/platform/dynlib.h>
+ 
++#if REX_PLATFORM_ANDROID
++#include <dlfcn.h>
++#endif
++
++REXCVAR_DEFINE_STRING(gpu_plugin_dir, "", "Runtime",
++                      "Directory to load GPU plugins from before the executable folder "
++                      "(empty = executable folder only; Android also tries the app's "
++                      "native library directory first)");
++
+ namespace rex::system {
+ 
+ namespace {
+@@ -55,18 +65,56 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
+ }  // namespace
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
+-  auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
+-  if (!std::filesystem::exists(path)) {
+-    REXSYS_ERROR(
+-        "GPU plugin '{}' not found at {}. Stage it next to the executable "
+-        "(GPU_PLUGINS {} in rexglue_configure_target).",
+-        name, path.string(), name);
+-    return nullptr;
++  const std::string file_name = PluginFileName(name);
++  platform::DynamicLibrary library;
++  // Where the plugin came from (for logs); a path or a soname.
++  std::filesystem::path path;
++
++#if REX_PLATFORM_ANDROID
++  // The "executable" is /system/bin/app_process; the plugin lives in the APK's
++  // native library directory and is usually already loaded by SDLActivity.
++  // 1) Reuse the loaded copy; 2) let the linker search the app's namespace.
++  if (void* loaded = dlopen(file_name.c_str(), RTLD_NOW | RTLD_NOLOAD)) {
++    dlclose(loaded);  // Load() below takes its own reference.
++    if (library.Load(file_name, platform::SymbolResolution::kImmediate)) {
++      path = file_name;
++      REXSYS_INFO("GPU plugin '{}': using already loaded {}", name, file_name);
++    }
++  }
++  if (!library && library.Load(file_name, platform::SymbolResolution::kImmediate)) {
++    path = file_name;
++    REXSYS_INFO("GPU plugin '{}': loaded {} from the app's library search path", name, file_name);
+   }
++#endif
+ 
+-  platform::DynamicLibrary library;
+-  if (!library.Load(path, platform::SymbolResolution::kImmediate)) {
+-    REXSYS_ERROR("GPU plugin '{}' failed to load: {}", name, path.string());
++  // 3) gpu_plugin_dir (if set), 4) next to the executable (the default).
++  std::vector<std::filesystem::path> candidates;
++  if (std::string dir = REXCVAR_GET(gpu_plugin_dir); !dir.empty()) {
++    candidates.push_back(std::filesystem::path(dir) / file_name);
++  }
++  candidates.push_back(rex::filesystem::GetExecutableFolder() / file_name);
++
++  std::filesystem::path last_tried;
++  for (size_t i = 0; !library && i < candidates.size(); ++i) {
++    last_tried = candidates[i];
++    if (!std::filesystem::exists(last_tried)) {
++      continue;
++    }
++    if (!library.Load(last_tried, platform::SymbolResolution::kImmediate)) {
++      REXSYS_ERROR("GPU plugin '{}' failed to load: {}", name, last_tried.string());
++      return nullptr;
++    }
++    path = last_tried;
++    if (candidates.size() > 1) {
++      REXSYS_INFO("GPU plugin '{}': loaded {}", name, path.string());
++    }
++  }
++
++  if (!library) {
++    REXSYS_ERROR(
++        "GPU plugin '{}' not found at {}. Stage it next to the executable "
++        "(GPU_PLUGINS {} in rexglue_configure_target) or set gpu_plugin_dir.",
++        name, last_tried.string(), name);
+     return nullptr;
+   }
+ 

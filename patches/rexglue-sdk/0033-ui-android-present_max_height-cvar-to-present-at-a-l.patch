@@ -1,0 +1,65 @@
+From 6af490179a47f7b58de82e40978dea56753dce0e Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:51:38 +0800
+Subject: [PATCH 033/108] ui(android): present_max_height cvar to present at a
+ lower resolution (behaviour informed by lr-ffxiii-port's Android patch,
+ re-implemented)
+
+New int cvar present_max_height (UI/Presenter, 0 = off). On Android the
+native-window surface reports at most that height (same aspect ratio), so the
+presenter lays out and sizes its swapchain smaller and the compositor scales
+it to the window. Applied in AndroidNativeWindowSurface::GetSizeImpl so
+layout and swapchain stay consistent; no effect on other platforms.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
+index 467d53f..ceb1405 100644
+--- a/src/ui/surface_android.cpp
++++ b/src/ui/surface_android.cpp
+@@ -11,8 +11,14 @@
+ 
+ #include <android/native_window.h>
+ 
++#include <algorithm>
++
++#include <rex/cvar.h>
+ #include <rex/ui/surface_android.h>
+ 
++// Defined in vulkan_presenter.cpp (present on every platform's config).
++REXCVAR_DECLARE(int32_t, present_max_height);
++
+ namespace rex {
+ namespace ui {
+ 
+@@ -25,6 +31,13 @@ bool AndroidNativeWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& heig
+   if (width <= 0 || height <= 0) {
+     return false;
+   }
++  // present_max_height: report a smaller size of the same shape. The
++  // presenter lays out and sizes its swapchain from this; Android's
++  // compositor scales the smaller buffers to the window.
++  if (int32_t max_height = REXCVAR_GET(present_max_height); max_height > 0 && height > max_height) {
++    width = std::max<int32_t>(1, int32_t((int64_t(width) * max_height + height / 2) / height));
++    height = max_height;
++  }
+   width_out = uint32_t(width);
+   height_out = uint32_t(height);
+   return true;
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 23645ef..e20179c 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -58,6 +58,12 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
+ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
+                     "Allow FIFO relaxed present mode");
+ 
++REXCVAR_DEFINE_INT32(present_max_height, 0, "UI/Presenter",
++                     "Largest presentation height (0 = the window's own). The swapchain keeps "
++                     "the window's aspect ratio and is stretched to the window by the display "
++                     "hardware. Android only (applied by the Android surface)")
++    .range(0, 16384);
++
+ namespace rex {
+ namespace ui {
+ namespace vulkan {

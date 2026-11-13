@@ -1,0 +1,265 @@
+From 45fac1be8b6b1c074a11292d6f8511648cbcb1eb Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 10:55:17 +0800
+Subject: [PATCH 057/108] gpu/ui: vulkan: diagnostics: device extension list,
+ pipeline statistics, coarse shading
+
+- Log every device extension the driver offers at startup.
+- vulkan_pipeline_statistics: enable VK_KHR_pipeline_executable_properties
+  and log the driver's statistics (instructions, registers, occupancy,
+  scratch) for each pipeline created.
+- vulkan_fragment_shading_rate=WxH: shade every guest draw at a coarser rate
+  (VK_KHR_fragment_shading_rate) to measure how much of a pass is pixel
+  shading.
+All off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 796dba8..789f87e 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -201,6 +201,10 @@ class VulkanDevice {
+     bool ext_1_3_KHR_maintenance4 = false;  // #414
+     // Has optional features not implied by this being true.
+     bool ext_1_3_KHR_dynamic_rendering = false;  // #55
++    // Diagnostics only (vulkan_pipeline_statistics), with pipelineExecutableInfo.
++    bool ext_KHR_pipeline_executable_properties = false;  // #270
++    // Diagnostics only (vulkan_fragment_shading_rate), with pipelineFragmentShadingRate.
++    bool ext_KHR_fragment_shading_rate = false;  // #227
+   };
+ 
+   const Extensions& extensions() const { return extensions_; }
+@@ -228,6 +232,8 @@ class VulkanDevice {
+ #include <rex/ui/vulkan/functions/device_1_3_khr_maintenance4.inc>
+     // VK_KHR_dynamic_rendering (#55, promoted to 1.3)
+ #include <rex/ui/vulkan/functions/device_1_3_khr_dynamic_rendering.inc>
++    // VK_KHR_pipeline_executable_properties (#270)
++#include <rex/ui/vulkan/functions/device_khr_pipeline_executable_properties.inc>
+ #undef XE_UI_VULKAN_FUNCTION_PROMOTED
+ #undef XE_UI_VULKAN_FUNCTION
+   };
+diff --git a/include/rex/ui/vulkan/functions/device_khr_pipeline_executable_properties.inc b/include/rex/ui/vulkan/functions/device_khr_pipeline_executable_properties.inc
+new file mode 100644
+index 0000000..0d61f9a
+--- /dev/null
++++ b/include/rex/ui/vulkan/functions/device_khr_pipeline_executable_properties.inc
+@@ -0,0 +1,4 @@
++// VK_KHR_pipeline_executable_properties (#270): shader statistics for diagnostics
++// (vulkan_pipeline_statistics).
++XE_UI_VULKAN_FUNCTION(vkGetPipelineExecutablePropertiesKHR)
++XE_UI_VULKAN_FUNCTION(vkGetPipelineExecutableStatisticsKHR)
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 0408c3c..8f9d7bc 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -35,6 +35,9 @@
+ #include <rex/memory.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/flags.h>
++#include <rex/cvar.h>
++
++REXCVAR_DECLARE(std::string, vulkan_fragment_shading_rate);
+ #include <rex/graphics/pipeline_util.h>
+ #include <rex/graphics/pipeline/shader/spirv_builder.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+@@ -3693,7 +3696,28 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   VkGraphicsPipelineCreateInfo pipeline_create_info;
+   pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+   pipeline_create_info.pNext = use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
++  // vulkan_fragment_shading_rate (diagnostics): coarse shading for every guest draw.
++  VkPipelineFragmentShadingRateStateCreateInfoKHR fragment_shading_rate_state = {
++      VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR};
++  if (vulkan_device->extensions().ext_KHR_fragment_shading_rate) {
++    const std::string& rate = REXCVAR_GET(vulkan_fragment_shading_rate);
++    uint32_t rate_w = 1, rate_h = 1;
++    if (rate.size() == 3 && rate[1] == 'x') {
++      rate_w = std::clamp(uint32_t(rate[0] - '0'), uint32_t(1), uint32_t(4));
++      rate_h = std::clamp(uint32_t(rate[2] - '0'), uint32_t(1), uint32_t(4));
++    }
++    fragment_shading_rate_state.fragmentSize = {rate_w, rate_h};
++    fragment_shading_rate_state.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
++    fragment_shading_rate_state.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
++    fragment_shading_rate_state.pNext = const_cast<void*>(pipeline_create_info.pNext);
++    pipeline_create_info.pNext = &fragment_shading_rate_state;
++  }
+   pipeline_create_info.flags = 0;
++  const bool capture_statistics =
++      vulkan_device->extensions().ext_KHR_pipeline_executable_properties;
++  if (capture_statistics) {
++    pipeline_create_info.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
++  }
+   pipeline_create_info.stageCount = shader_stage_count;
+   pipeline_create_info.pStages = shader_stages.data();
+   pipeline_create_info.pVertexInputState = &vertex_input_state;
+@@ -3736,6 +3760,55 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+         uint32_t(use_dynamic_rendering));
+     return false;
+   }
++  if (capture_statistics && !creating_placeholder) {
++    // vulkan_pipeline_statistics: one line per pipeline with every executable's
++    // integer statistics (the names are the driver's).
++    VkPipelineInfoKHR pipeline_info = {VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR};
++    pipeline_info.pipeline = pipeline;
++    uint32_t executable_count = 0;
++    dfn.vkGetPipelineExecutablePropertiesKHR(device, &pipeline_info, &executable_count, nullptr);
++    std::vector<VkPipelineExecutablePropertiesKHR> executables(
++        executable_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
++    dfn.vkGetPipelineExecutablePropertiesKHR(device, &pipeline_info, &executable_count,
++                                             executables.data());
++    std::string statistics_info;
++    for (uint32_t i = 0; i < executable_count; ++i) {
++      VkPipelineExecutableInfoKHR executable_info = {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
++      executable_info.pipeline = pipeline;
++      executable_info.executableIndex = i;
++      uint32_t statistic_count = 0;
++      dfn.vkGetPipelineExecutableStatisticsKHR(device, &executable_info, &statistic_count, nullptr);
++      std::vector<VkPipelineExecutableStatisticKHR> statistics(
++          statistic_count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR});
++      dfn.vkGetPipelineExecutableStatisticsKHR(device, &executable_info, &statistic_count,
++                                               statistics.data());
++      statistics_info += fmt::format(" | {}:", executables[i].name);
++      for (const VkPipelineExecutableStatisticKHR& statistic : statistics) {
++        switch (statistic.format) {
++          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
++            statistics_info += fmt::format(" {}={}", statistic.name, statistic.value.b32);
++            break;
++          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
++            statistics_info += fmt::format(" {}={}", statistic.name, statistic.value.i64);
++            break;
++          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
++            statistics_info += fmt::format(" {}={}", statistic.name, statistic.value.u64);
++            break;
++          case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
++            statistics_info += fmt::format(" {}={:.2f}", statistic.name, statistic.value.f64);
++            break;
++          default:
++            break;
++        }
++      }
++    }
++    REXGPU_INFO("Pipeline statistics VS {:016X} PS {:016X}{}",
++                creation_arguments.vertex_shader->shader().ucode_data_hash(),
++                creation_arguments.pixel_shader
++                    ? creation_arguments.pixel_shader->shader().ucode_data_hash()
++                    : 0,
++                statistics_info);
++  }
+   bool was_placeholder =
+       creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
+   VkPipeline old_pipeline =
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index a9e1dd0..1ba7466 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -36,6 +36,15 @@ REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC, "UI/Vulka
+                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
+                     "fallback primitive emulation paths)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(vulkan_pipeline_statistics, false, "UI/Vulkan",
++                    "Diagnostics: enable VK_KHR_pipeline_executable_properties if available and "
++                    "log the driver's statistics (such as registers) of the pipelines created")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(vulkan_fragment_shading_rate, "", "UI/Vulkan",
++                      "Diagnostics: shade guest draws at a coarser rate (\"2x2\", \"2x1\", "
++                      "\"1x2\") through VK_KHR_fragment_shading_rate if available, to measure how "
++                      "much of a pass is pixel shading. Blocky image.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/Vulkan",
+                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
+                     "allow fallback to solid fill for line/point polygon modes)")
+@@ -236,6 +245,14 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_custom_border_color)
+       // Required for true null descriptors in bindless texture bindings.
+       XE_UI_VULKAN_STRUCT_EXTENSION(EXT_robustness2)
++      if (REXCVAR_GET(vulkan_pipeline_statistics)) {
++        // #270.
++        XE_UI_VULKAN_STRUCT_EXTENSION(KHR_pipeline_executable_properties)
++      }
++      if (!REXCVAR_GET(vulkan_fragment_shading_rate).empty()) {
++        // #227.
++        XE_UI_VULKAN_STRUCT_EXTENSION(KHR_fragment_shading_rate)
++      }
+     }
+     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 1, 0)) {
+       // #237.
+@@ -267,6 +284,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+         return nullptr;
+       }
+       assert_true(supported_extension_count == supported_extensions.size());
++      {
++        // All extensions the device offers (not only the requested ones), for
++        // diagnostics.
++        std::string supported_names;
++        for (const VkExtensionProperties& supported_extension : supported_extensions) {
++          supported_names += ' ';
++          supported_names += supported_extension.extensionName;
++        }
++        REXLOG_INFO("Vulkan device '{}' supports {} extensions:{}", properties.deviceName,
++                    supported_extension_count, supported_names);
++      }
+       for (const VkExtensionProperties& supported_extension : supported_extensions) {
+         const auto requested_extension_it =
+             requested_extensions.find(supported_extension.extensionName);
+@@ -335,6 +363,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
+                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
+       features_EXT_robustness2;
++  VulkanFeatures<VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR,
++                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR>
++      features_KHR_pipeline_executable_properties;
++  VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,
++                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
++      features_KHR_fragment_shading_rate;
+ 
+   if (get_physical_device_properties2_supported) {
+     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+@@ -368,6 +402,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     if (ext_EXT_non_seamless_cube_map) {
+       features_EXT_non_seamless_cube_map.Link(supported_features_2, device_create_info);
+     }
++    if (device->extensions_.ext_KHR_pipeline_executable_properties) {
++      features_KHR_pipeline_executable_properties.Link(supported_features_2, device_create_info);
++    }
++    if (device->extensions_.ext_KHR_fragment_shading_rate) {
++      features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
++    }
+     if (device->extensions_.ext_EXT_custom_border_color) {
+       features_EXT_custom_border_color.Link(supported_features_2, device_create_info);
+       properties_EXT_custom_border_color.pNext = properties_2.pNext;
+@@ -719,6 +759,25 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     }
+   }
+ 
++  if (device->extensions_.ext_KHR_pipeline_executable_properties) {
++    features_KHR_pipeline_executable_properties.enabled.pipelineExecutableInfo =
++        features_KHR_pipeline_executable_properties.supported.pipelineExecutableInfo;
++    if (!features_KHR_pipeline_executable_properties.supported.pipelineExecutableInfo) {
++      device->extensions_.ext_KHR_pipeline_executable_properties = false;
++    } else {
++      REXLOG_INFO("* pipelineExecutableInfo (vulkan_pipeline_statistics)");
++    }
++  }
++  if (device->extensions_.ext_KHR_fragment_shading_rate) {
++    features_KHR_fragment_shading_rate.enabled.pipelineFragmentShadingRate =
++        features_KHR_fragment_shading_rate.supported.pipelineFragmentShadingRate;
++    if (!features_KHR_fragment_shading_rate.supported.pipelineFragmentShadingRate) {
++      device->extensions_.ext_KHR_fragment_shading_rate = false;
++    } else {
++      REXLOG_INFO("* pipelineFragmentShadingRate (vulkan_fragment_shading_rate)");
++    }
++  }
++
+   if (device->extensions_.ext_EXT_custom_border_color) {
+     if (with_gpu_emulation) {
+       XE_UI_VULKAN_FEATURE_2(features_EXT_custom_border_color, customBorderColors)
+@@ -804,6 +863,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   if (device->extensions_.ext_KHR_swapchain) {
+ #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
+   }
++  if (device->extensions_.ext_KHR_pipeline_executable_properties) {
++#include <rex/ui/vulkan/functions/device_khr_pipeline_executable_properties.inc>
++  }
+ #undef XE_UI_VULKAN_FUNCTION_PROMOTED
+ 
+ #undef XE_UI_VULKAN_FUNCTION

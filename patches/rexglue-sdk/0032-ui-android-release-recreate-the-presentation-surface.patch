@@ -1,0 +1,79 @@
+From 0dc2f9ba76c10e17cf2c87d7861d88d06a2ca0bd Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:50:12 +0800
+Subject: [PATCH 032/108] ui(android): release/recreate the presentation
+ surface across background (behaviour informed by lr-ffxiii-port's Android
+ patch, re-implemented)
+
+Android destroys the ANativeWindow while the app is in the background. On
+SDL_EVENT_WILL_ENTER_BACKGROUND each window drops its presenter surface
+(OnSurfaceChanged(false)); on SDL_EVENT_DID_ENTER_FOREGROUND it creates one
+from the new native window (OnSurfaceChanged(true)). Handled in the UI-thread
+event loop. Other platforms do not receive these events here.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+index 5079d0f..a76543f 100644
+--- a/include/rex/ui/window_sdl.h
++++ b/include/rex/ui/window_sdl.h
+@@ -43,6 +43,10 @@ class WindowSDL final : public Window {
+   void HandleMouseEvent(SDL_Event& event);
+   void HandleDropEvent(SDL_Event& event);
+   void HandlePaintEvent();
++  // Android: the native window goes away while the app is in the background.
++  // Release the presentation surface before, recreate it from the new native
++  // window after. Harmless elsewhere (never called).
++  void HandleAppBackground(bool entering_background);
+ 
+  protected:
+   uint32_t GetLatestDpiImpl() const override;
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index bbb8422..00c9dc0 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -499,6 +499,13 @@ void WindowSDL::HandlePaintEvent() {
+   OnPaint();
+ }
+ 
++void WindowSDL::HandleAppBackground(bool entering_background) {
++  REXLOG_INFO("App {} the background: {} the presentation surface",
++              entering_background ? "entering" : "leaving",
++              entering_background ? "releasing" : "recreating");
++  OnSurfaceChanged(!entering_background);
++}
++
+ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
+   WindowDestructionReceiver destruction_receiver(this);
+   switch (event.type) {
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index dc0b4c2..e0a8e70 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -175,6 +175,26 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
+       }
+       break;
+     }
++#if REX_PLATFORM_ANDROID
++    case SDL_EVENT_WILL_ENTER_BACKGROUND:
++    case SDL_EVENT_DID_ENTER_FOREGROUND: {
++      // The ANativeWindow is destroyed while in the background; drop the
++      // Vulkan surface and recreate it once the new window exists.
++      const bool background = event.type == SDL_EVENT_WILL_ENTER_BACKGROUND;
++      std::vector<SDL_WindowID> window_ids;
++      window_ids.reserve(windows_.size());
++      for (const auto& [id, window] : windows_) {
++        (void)window;
++        window_ids.push_back(id);
++      }
++      for (SDL_WindowID id : window_ids) {
++        if (WindowSDL* window = GetWindow(id)) {
++          window->HandleAppBackground(background);
++        }
++      }
++      break;
++    }
++#endif
+     default:
+       break;
+   }

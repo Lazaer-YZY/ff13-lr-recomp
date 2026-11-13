@@ -1,0 +1,317 @@
+From fb04046c52733c5b0fb555cbc3eb6ffb331ecc7e Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 17:21:10 +0800
+Subject: [PATCH 067/108] gpu: depth transfers from a recorded clear constant
+ become clears (battle GPU work -2%)
+
+gpu_constant_transfers_as_clears (default true): a depth-only draw that is a
+full rectangle with depth ALWAYS and the same depth at every vertex records
+"this depth render target holds raw value V within rectangle R" (forgotten on
+the next draw into it, and on every resolve clear). When a later depth-only
+draw needs transfers from that single source (same EDRAM base and pitch), R
+(converted between 1x and 4x through samples) is cut out of the transfer and
+cleared to V with the resolve-clear path instead. The shadow-map cascades'
+4x -> 1x transfers before the casters are such transfers.
+
+Battle: transfers 2.5 -> 2.44 ms, GPU work 13.2-13.3 -> 12.95 Mcycles at
+475 MHz. The first version encoded depth 1.0 as 0x1000000 (float rounding),
+which dropped to 0 in the 32-bit clear value; now clamped to 0xFFFFFF.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 8357fba..77bac3b 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -503,6 +503,12 @@ class RenderTargetCache {
+   const Transfer::Rectangle* last_update_transfer_cutout() const {
+     return last_update_transfer_cutout_valid_ ? &last_update_transfer_cutout_ : nullptr;
+   }
++  // Clear values for the render targets of the last update (index 0 = depth)
++  // when the cut-out area is to be cleared instead of transferred (its source
++  // held a constant, gpu_constant_transfers_as_clears) - or nullptr.
++  const uint64_t* last_update_transfer_clear_values() const {
++    return last_update_transfer_clear_ ? last_update_transfer_clear_values_ : nullptr;
++  }
+ 
+   HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
+       uint32_t pitch_tiles, bool msaa_2x_supported) const {
+@@ -564,6 +570,16 @@ class RenderTargetCache {
+   const Shader* update_pixel_shader_ = nullptr;
+   Transfer::Rectangle last_update_transfer_cutout_ = {};
+   bool last_update_transfer_cutout_valid_ = false;
++  uint64_t last_update_transfer_clear_values_[1 + xenos::kMaxColorRenderTargets] = {};
++  bool last_update_transfer_clear_ = false;
++  // Depth render targets whose content within a rectangle is a single raw
++  // guest depth / stencil value (written by a clear-like rectangle and not
++  // drawn to since), by RenderTargetKey::key.
++  struct ConstantDepthRegion {
++    Transfer::Rectangle rectangle;
++    uint32_t raw_value;
++  };
++  std::unordered_map<uint32_t, ConstantDepthRegion> constant_depth_regions_;
+ 
+   // For host render targets.
+ 
+diff --git a/include/rex/graphics/util/draw_extent_estimator.h b/include/rex/graphics/util/draw_extent_estimator.h
+index a3430cd..c980930 100644
+--- a/include/rex/graphics/util/draw_extent_estimator.h
++++ b/include/rex/graphics/util/draw_extent_estimator.h
+@@ -42,7 +42,8 @@ class DrawExtentEstimator {
+   bool EstimateRectangleCoverage(const Shader& vertex_shader, int32_t bounds_left,
+                                  int32_t bounds_top, int32_t bounds_right, int32_t bounds_bottom,
+                                  int32_t& left_out, int32_t& top_out, int32_t& right_out,
+-                                 int32_t& bottom_out, uint32_t* reject_out = nullptr);
++                                 int32_t& bottom_out, uint32_t* reject_out = nullptr,
++                                 float* constant_depth_out = nullptr);
+ 
+  private:
+   class PositionYExportSink : public ShaderInterpreter::ExportSink {
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 6350756..68d8fdc 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -38,6 +38,10 @@ REXCVAR_DEFINE_UINT32(gpu_skip_overwritten_transfers, 2, "GPU",
+ REXCVAR_DEFINE_BOOL(gpu_skip_overwritten_color_transfers, true, "GPU",
+                     "gpu_skip_overwritten_transfers also for draws writing color render "
+                     "targets (otherwise only depth-only draws).");
++REXCVAR_DEFINE_BOOL(gpu_constant_transfers_as_clears, true, "GPU",
++                    "When a depth ownership transfer's source only holds the constant written "
++                    "by a clear-like rectangle (depth ALWAYS, same z at every vertex), clear "
++                    "that area of the destination instead of transferring it.");
+ REXCVAR_DEFINE_BOOL(gpu_log_transfer_draws, false, "GPU",
+                     "Diagnostic: log each distinct ownership transfer situation once with "
+                     "the state of the draw that needs it.");
+@@ -380,6 +384,7 @@ void RenderTargetCache::ShutdownCommon() {
+ }
+ 
+ void RenderTargetCache::ClearCache() {
++  constant_depth_regions_.clear();
+   // Keep only render targets currently owning any EDRAM data.
+   if (!render_targets_.empty()) {
+     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
+@@ -706,6 +711,14 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   // clear with a rectangle drawn with depth ALWAYS) doesn't need the previous
+   // contents of that rectangle: cut it out of the ownership transfers.
+   last_update_transfer_cutout_valid_ = false;
++  last_update_transfer_clear_ = false;
++  // Render targets drawn to now no longer hold a recorded constant (a new one
++  // may be recorded below if this draw is a clear-like rectangle).
++  if (!constant_depth_regions_.empty()) {
++    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++      constant_depth_regions_.erase(rt_keys[edram_bases_sorted[i].second].key);
++    }
++  }
+   // Why the cut-out wasn't made (for gpu_log_transfer_draws): 1 = not applicable
+   // (off, no render targets, or a bound depth buffer not written with ALWAYS),
+   // 2 = stencil not overwritten, 3 = may discard, 4x = coverage (40 + estimator
+@@ -782,9 +795,11 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+       int32_t scissor_bottom = int32_t(scissor.offset[1] + scissor.extent[1]);
+       int32_t left, top, right, bottom;
+       uint32_t rectangle_reject = 0;
++      float constant_depth = -1.0f;
+       if (!draw_extent_estimator_.EstimateRectangleCoverage(
+               vertex_shader, int32_t(scissor.offset[0]), int32_t(scissor.offset[1]),
+-              scissor_right, scissor_bottom, left, top, right, bottom, &rectangle_reject)) {
++              scissor_right, scissor_bottom, left, top, right, bottom, &rectangle_reject,
++              &constant_depth)) {
+         cutout_reject = 40 + rectangle_reject;
+       } else {
+         left = std::max(left, int32_t(scissor.offset[0]));
+@@ -799,11 +814,100 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+           last_update_transfer_cutout_.width_pixels = uint32_t(right - left);
+           last_update_transfer_cutout_.height_pixels = uint32_t(bottom - top);
+           last_update_transfer_cutout_valid_ = true;
++          // Record the constant left by a depth-only clear-like rectangle.
++          if (REXCVAR_GET(gpu_constant_transfers_as_clears) && depth_and_color_rts_used_bits == 0b1 &&
++              constant_depth >= 0.0f &&
++              !(update_pixel_shader_ && update_pixel_shader_->writes_depth()) &&
++              (normalized_depth_control.stencil_enable || skip_overwritten_transfers >= 2)) {
++            const RenderTargetKey& depth_key = rt_keys[0];
++            uint32_t depth_raw =
++                depth_key.GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24FS8
++                    ? xenos::Float32To20e4(constant_depth, true)
++                    : std::min(uint32_t(double(constant_depth) * double(0xFFFFFF) + 0.5),
++                               uint32_t(0xFFFFFF));
++            uint32_t stencil_raw = 0;
++            if (normalized_depth_control.stencil_enable) {
++              stencil_raw = regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK).stencilref;
++            }
++            constant_depth_regions_[depth_key.key] = {last_update_transfer_cutout_,
++                                                      (depth_raw << 8) | stencil_raw};
++            static uint32_t constant_logs = 0;
++            if (constant_logs < 8) {
++              ++constant_logs;
++              REXGPU_INFO("Constant depth recorded: {} depth {} (raw {:06X}) stencil {} in "
++                          "{},{} {}x{}",
++                          depth_key.GetDebugName(), constant_depth, depth_raw, stencil_raw,
++                          last_update_transfer_cutout_.x_pixels,
++                          last_update_transfer_cutout_.y_pixels,
++                          last_update_transfer_cutout_.width_pixels,
++                          last_update_transfer_cutout_.height_pixels);
++            }
++          }
+         }
+       }
+     }
+   }
+ 
++  // A depth-only draw needing transfers from a single source that holds a
++  // recorded constant: transfer only outside the constant's rectangle, clear
++  // inside it.
++  if (!last_update_transfer_cutout_valid_ && REXCVAR_GET(gpu_constant_transfers_as_clears) &&
++      !interlock_barrier_only && depth_and_color_rts_used_bits == 0b1 &&
++      !constant_depth_regions_.empty()) {
++    const RenderTargetKey& dest_key = rt_keys[0];
++    uint32_t dest_start = dest_key.base_tiles;
++    uint32_t dest_end = dest_start + rt_lengths_tiles[0];
++    RenderTargetKey single_source;
++    bool sources_ok = true;
++    for (auto it = ownership_ranges_.begin(); sources_ok && it != ownership_ranges_.end(); ++it) {
++      if (it->second.end_tiles <= dest_start || it->first >= dest_end) {
++        continue;
++      }
++      RenderTargetKey owner = it->second.render_target;
++      if (owner.IsEmpty() || owner == dest_key) {
++        continue;
++      }
++      if (single_source.IsEmpty()) {
++        single_source = owner;
++      } else if (owner != single_source) {
++        sources_ok = false;
++      }
++    }
++    auto constant_it = (sources_ok && !single_source.IsEmpty())
++                           ? constant_depth_regions_.find(single_source.key)
++                           : constant_depth_regions_.end();
++    if (constant_it != constant_depth_regions_.end() && single_source.is_depth &&
++        single_source.base_tiles == dest_key.base_tiles &&
++        single_source.pitch_tiles_at_32bpp == dest_key.pitch_tiles_at_32bpp &&
++        dest_end <= xenos::kEdramTileCount) {
++      // Same EDRAM layout: convert the rectangle through samples.
++      auto samples_x = [](xenos::MsaaSamples m) {
++        return uint32_t(1) << uint32_t(m >= xenos::MsaaSamples::k4X);
++      };
++      auto samples_y = [](xenos::MsaaSamples m) {
++        return uint32_t(1) << uint32_t(m >= xenos::MsaaSamples::k2X);
++      };
++      const Transfer::Rectangle& source_rect = constant_it->second.rectangle;
++      uint32_t ssx = samples_x(single_source.msaa_samples), ssy = samples_y(single_source.msaa_samples);
++      uint32_t dsx = samples_x(dest_key.msaa_samples), dsy = samples_y(dest_key.msaa_samples);
++      uint32_t x0 = (source_rect.x_pixels * ssx + dsx - 1) / dsx;
++      uint32_t y0 = (source_rect.y_pixels * ssy + dsy - 1) / dsy;
++      uint32_t x1 = ((source_rect.x_pixels + source_rect.width_pixels) * ssx) / dsx;
++      uint32_t y1 = ((source_rect.y_pixels + source_rect.height_pixels) * ssy) / dsy;
++      if (x1 > x0 && y1 > y0) {
++        last_update_transfer_cutout_.x_pixels = x0;
++        last_update_transfer_cutout_.y_pixels = y0;
++        last_update_transfer_cutout_.width_pixels = x1 - x0;
++        last_update_transfer_cutout_.height_pixels = y1 - y0;
++        last_update_transfer_cutout_valid_ = true;
++        std::memset(last_update_transfer_clear_values_, 0, sizeof(last_update_transfer_clear_values_));
++        last_update_transfer_clear_values_[0] = constant_it->second.raw_value;
++        last_update_transfer_clear_ = true;
++        cutout_reject = 7;
++      }
++    }
++  }
++
+   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+     uint32_t rt_bit_index = rt_base_index.second;
+@@ -1121,6 +1225,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
+     RenderTarget*& depth_render_target_out, std::vector<Transfer>& depth_transfers_out,
+     RenderTarget*& color_render_target_out, std::vector<Transfer>& color_transfers_out) {
+   assert_true(GetPath() == Path::kHostRenderTargets);
++  constant_depth_regions_.clear();
+ 
+   uint32_t pitch_tiles_at_32bpp;
+   uint32_t base_offset_tiles_at_32bpp;
+diff --git a/src/graphics/util/draw_extent_estimator.cpp b/src/graphics/util/draw_extent_estimator.cpp
+index 34dc099..ec48152 100644
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -268,7 +268,12 @@ bool DrawExtentEstimator::EstimateRectangleCoverage(const Shader& vertex_shader,
+                                                     int32_t bounds_right, int32_t bounds_bottom,
+                                                     int32_t& left_out, int32_t& top_out,
+                                                     int32_t& right_out, int32_t& bottom_out,
+-                                                    uint32_t* reject_out) {
++                                                    uint32_t* reject_out,
++                                                    float* constant_depth_out) {
++  if (constant_depth_out) {
++    // Not constant (or unknown) unless found otherwise.
++    *constant_depth_out = -1.0f;
++  }
+   // Reject reasons: 1 primitive / index source / shader, 2 vertex kill or no
+   // position, 3 w or z outside the clip volume, 4 not an axis-aligned
+   // rectangle, 5 empty.
+@@ -347,7 +352,12 @@ bool DrawExtentEstimator::EstimateRectangleCoverage(const Shader& vertex_shader,
+     window_x = float(pa_sc_window_offset.window_x_offset);
+     window_y = float(pa_sc_window_offset.window_y_offset);
+   }
+-  float xs[4], ys[4];
++  float xs[4], ys[4], zs[4];
++  bool zs_known = true;
++  float z_scale =
++      pa_cl_vte_cntl.vport_z_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE) : 1.0f;
++  float z_offset =
++      pa_cl_vte_cntl.vport_z_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET) : 0.0f;
+   reject = 2;
+   shader_interpreter_.SetShader(vertex_shader);
+   PositionYExportSink sink;
+@@ -404,6 +414,19 @@ bool DrawExtentEstimator::EstimateRectangleCoverage(const Shader& vertex_shader,
+     }
+     xs[i] = x * x_scale + x_offset + center_offset + window_x;
+     ys[i] = y * y_scale + y_offset + center_offset + window_y;
++    if (sink.position_z().has_value()) {
++      float z = sink.position_z().value();
++      if (!pa_cl_vte_cntl.vtx_z_fmt) {
++        if (sink.position_w().has_value() && sink.position_w().value() != 0.0f) {
++          z /= sink.position_w().value();
++        } else {
++          zs_known = false;
++        }
++      }
++      zs[i] = z * z_scale + z_offset;
++    } else {
++      zs_known = false;
++    }
+     if (!std::isfinite(xs[i]) || !std::isfinite(ys[i])) {
+       reject = 25;
+       valid = false;
+@@ -452,6 +475,10 @@ bool DrawExtentEstimator::EstimateRectangleCoverage(const Shader& vertex_shader,
+     top_out = top;
+     right_out = right;
+     bottom_out = bottom;
++    if (constant_depth_out && zs_known && zs[0] == zs[1] && zs[0] == zs[2] && zs[0] >= 0.0f &&
++        zs[0] <= 1.0f) {
++      *constant_depth_out = zs[0];
++    }
+     reject = 0;
+     return true;
+   }
+@@ -520,6 +547,10 @@ bool DrawExtentEstimator::EstimateRectangleCoverage(const Shader& vertex_shader,
+   if (right_out <= left_out || bottom_out <= top_out) {
+     return false;
+   }
++  if (constant_depth_out && zs_known && zs[0] == zs[1] && zs[0] == zs[2] &&
++      (vertex_count == 3 || zs[0] == zs[3]) && zs[0] >= 0.0f && zs[0] <= 1.0f) {
++    *constant_depth_out = zs[0];
++  }
+   reject = 0;
+   return true;
+ }
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 01420b3..1008b7e 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1764,7 +1764,8 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+ 
+       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                        depth_and_color_render_targets, last_update_transfers(),
+-                                       nullptr, last_update_transfer_cutout());
++                                       last_update_transfer_clear_values(),
++                                       last_update_transfer_cutout());
+ 
+       if (depth_and_color_render_targets[0]) {
+         render_pass_key.depth_and_color_used |= 1 << 0;

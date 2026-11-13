@@ -1,0 +1,82 @@
+From 72c8c4d90cea4c320989f9ba9e0df30946098593 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 07:50:40 +0800
+Subject: [PATCH 075/108] input: sdl: AYN pads in their Nintendo button mode
+ act by position (gamepad_face_buttons_by_position)
+
+AYN handhelds (Odin 2, Thor; vendor 0x2020) report product 0x0111 in
+their Nintendo button mode and send the Android keycodes of the printed
+letters (bottom B, right A, top X, left Y), which SDL's default Android
+mapping turns into the wrong positions. Swap SOUTH/EAST and WEST/NORTH
+for that product so each button acts by where it is, matching the
+game's on-screen prompts. Xbox mode (0x0112) is untouched.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/input/sdl/sdl_input_driver.h b/include/rex/input/sdl/sdl_input_driver.h
+index 14470f6..76d3427 100644
+--- a/include/rex/input/sdl/sdl_input_driver.h
++++ b/include/rex/input/sdl/sdl_input_driver.h
+@@ -65,6 +65,9 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener
+     bool state_changed;
+     bool is_active;
+     DeviceId id;
++    // The pad sends its face buttons by label in a Nintendo layout (A right, B bottom, X top,
++    // Y left): SOUTH<->EAST and WEST<->NORTH are swapped back to positions.
++    bool swap_face_buttons;
+     // Per pad rather than per guest user, so it survives reassignment.
+     KeystrokeState keystroke;
+   };
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index aa5ba00..e2fcc65 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -26,6 +26,9 @@
+ 
+ REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
+                       "Path to SDL gamecontroller mappings file");
++REXCVAR_DEFINE_BOOL(gamepad_face_buttons_by_position, true, "Input",
++                    "AYN handhelds in their Nintendo button mode (USB product 0x0111): the face "
++                    "buttons act by position (bottom = A), not by their printed letters");
+ 
+ namespace rex::input::sdl {
+ 
+@@ -618,6 +621,19 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
+   ControllerState state = {};
+   state.sdl = controller;
+   state.id = AllocateDeviceId();
++  // AYN handhelds (Odin 2, Thor: "Odin Controller", vendor 0x2020) report product 0x0111 in
++  // their Nintendo button mode and 0x0112 in Xbox mode. In Nintendo mode the buttons send the
++  // Android keycodes of their labels (bottom B -> KEYCODE_BUTTON_B, right A -> BUTTON_A, top X
++  // -> BUTTON_X, left Y -> BUTTON_Y; RetroArch's "Odin_Controller.cfg" autoconfig), which SDL's
++  // default Android mapping turns into the wrong positions (bottom -> EAST). The game's prompts
++  // are drawn by position (the battle diamond), so each button should act by where it is.
++  state.swap_face_buttons = REXCVAR_GET(gamepad_face_buttons_by_position) &&
++                            SDL_GetGamepadVendor(controller) == 0x2020 &&
++                            SDL_GetGamepadProduct(controller) == 0x0111;
++  if (state.swap_face_buttons) {
++    REXLOG_INFO("SDL: AYN pad in its Nintendo button mode: face buttons act by position "
++                "(bottom = A, right = B, left = X, top = Y; gamepad_face_buttons_by_position)");
++  }
+   state.state_changed = true;  // XInput starts with packet_number = 1
+   UpdateXCapabilities(state);
+   controllers_.push_back(state);
+@@ -740,7 +756,17 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
+     REXLOG_INFO("SDL HID: Unknown button was pressed: {}.", event.gbutton.button);
+     return;
+   }
+-  auto xbutton = xbutton_lookup.at(event.gbutton.button);
++  uint8_t sdl_button = event.gbutton.button;
++  if (controller.swap_face_buttons) {
++    switch (sdl_button) {
++      case SDL_GAMEPAD_BUTTON_SOUTH: sdl_button = SDL_GAMEPAD_BUTTON_EAST; break;
++      case SDL_GAMEPAD_BUTTON_EAST: sdl_button = SDL_GAMEPAD_BUTTON_SOUTH; break;
++      case SDL_GAMEPAD_BUTTON_WEST: sdl_button = SDL_GAMEPAD_BUTTON_NORTH; break;
++      case SDL_GAMEPAD_BUTTON_NORTH: sdl_button = SDL_GAMEPAD_BUTTON_WEST; break;
++      default: break;
++    }
++  }
++  auto xbutton = xbutton_lookup.at(sdl_button);
+   // Pressed or released?
+   if (event.gbutton.down) {
+     if (xbutton == X_INPUT_GAMEPAD_GUIDE && !REXCVAR_GET(guide_button)) {

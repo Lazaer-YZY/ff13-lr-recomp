@@ -1,0 +1,931 @@
+From 20b530d80a6a5c7f9aea1b931fc0a3814f815489 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 19:25:55 +0800
+Subject: [PATCH 068/108] gpu: resolve feed for depth (k_24_8) and k_32_FLOAT
+ textures, lower texture parts, per-format registry
+
+- Feed pipelines for R32_SFLOAT targets: k_32_FLOAT render targets read
+  through their float or bit-exact uint transfer view (resolve_feed_uint.frag),
+  and kD24S8 depth render targets into k_24_8 textures (loaded as R32_SFLOAT
+  depth, resolve_feed_depth.frag, depth / stencil transfer source set).
+- Resolves into the lower part of a tiled 32bpp texture (an address a whole
+  number of 32-row bands after its base) feed that texture at that row: the
+  shadow map's two 1024x1024 cascades go to one 1024x2048 texture.
+- The feed registry is keyed by base and format: the game samples some
+  resolved memory both as k_24_8 and as k_8_8_8_8.
+- Diagnostics: each distinct feed / reject / depth resolve / depth or float
+  texture load is logged once.
+- Battle: texture loads 2.5 -> 1.24 ms per frame, GPU work 12.95 -> 12.5-12.6
+  Mcycles at 475 MHz; frames look the same.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index f9d3399..ad6e938 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -517,7 +517,15 @@ class TextureCache {
+   Texture* FindOrCreateTexture(TextureKey key);
+   // Resolve feeding: the most recently loaded single-level, single-slice, tiled
+   // 2D texture whose base starts at the address (page-aligned), or nullptr.
+-  Texture* FindResolveFeedTexture(uint32_t base_address);
++  // Diagnostics: the key of any texture whose base is at the address (slow).
++  bool FindTextureKeyAtBase(uint32_t base_address, TextureKey& key_out) const;
++  // The registered texture of the format at the address (several textures of
++  // different formats may sample the same memory).
++  Texture* FindResolveFeedTexture(uint32_t base_address, xenos::TextureFormat format);
++  // A registered tiled 32bpp texture that contains the address at the start of
++  // a 32-row band (a resolve into its lower part); returns the row it starts at.
++  Texture* FindResolveFeedTextureContaining(uint32_t address, xenos::TextureFormat format,
++                                            uint32_t& row_out);
+   // Keeps a texture whose contents have been written directly on the GPU valid
+   // after its memory has been marked as written.
+   void MarkTextureUpToDate(Texture& texture);
+@@ -611,7 +619,8 @@ class TextureCache {
+ 
+   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+   // Base page -> key of the last loaded texture there (FindResolveFeedTexture).
+-  std::unordered_map<uint32_t, TextureKey> resolve_feed_keys_;
++  // By base page << 8 | format.
++  std::unordered_map<uint64_t, TextureKey> resolve_feed_keys_;
+ 
+   uint64_t textures_total_host_memory_usage_ = 0;
+ 
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 7bdc1b6..86d3758 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -906,7 +906,14 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   // Resolve feeding (vulkan_resolve_feed_textures): draws a render target into a
+   // R8G8B8A8_UNORM texture, optionally swapping red and blue.
+   VkPipelineLayout resolve_feed_pipeline_layout_ = VK_NULL_HANDLE;
++  VkPipelineLayout resolve_feed_pipeline_layout_depth_ = VK_NULL_HANDLE;
++  // k_8_8_8_8 -> R8G8B8A8_UNORM.
+   VkPipeline resolve_feed_pipeline_ = VK_NULL_HANDLE;
++  // k_32_FLOAT -> R32_SFLOAT, from a float / a bit-exact uint transfer view.
++  VkPipeline resolve_feed_pipeline_float32_ = VK_NULL_HANDLE;
++  VkPipeline resolve_feed_pipeline_uint32_ = VK_NULL_HANDLE;
++  // kD24S8 depth -> R32_SFLOAT (k_24_8 textures).
++  VkPipeline resolve_feed_pipeline_depth_ = VK_NULL_HANDLE;
+   VkPipelineLayout direct_resolve_pipeline_layout_depth_ = VK_NULL_HANDLE;
+   std::unordered_map<DirectResolvePipelineKey, VkPipeline, DirectResolvePipelineKey::Hasher>
+       direct_resolve_pipelines_;
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index ad8fd08..90e0822 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -336,6 +336,11 @@ class VulkanTextureCache final : public TextureCache {
+   // guest memory. Call PrepareResolveFeed before marking the range as resolved
+   // and FinishResolveFeed (source in TRANSFER_SRC_OPTIMAL) after.
+   struct ResolveFeed {
++    // What the texture is fed from: a k_8_8_8_8 color render target
++    // (R8G8B8A8_UNORM texture), a k_32_FLOAT one (R32_SFLOAT), or a kD24S8
++    // depth render target (k_24_8 texture, loaded as R32_SFLOAT depth).
++    enum class Source : uint32_t { kColor8888, kColorFloat32, kDepth24 };
++    Source source = Source::kColor8888;
+     VulkanTexture* texture = nullptr;
+     int32_t dest_x = 0;
+     int32_t dest_y = 0;
+diff --git a/scripts/shaders/build_host_rt_resolve_shaders.sh b/scripts/shaders/build_host_rt_resolve_shaders.sh
+index edbef64..ab09921 100644
+--- a/scripts/shaders/build_host_rt_resolve_shaders.sh
++++ b/scripts/shaders/build_host_rt_resolve_shaders.sh
+@@ -37,4 +37,6 @@ build resolve_fast_32bpp_host_rt_1x_d24s8_cs $E -DXE_RESOLVE_HOST_RT_DEPTH
+ build resolve_fast_32bpp_host_rt_4x_d24s8_cs $E -DXE_RESOLVE_HOST_RT_DEPTH -DXE_RESOLVE_HOST_RT_MSAA
+ build_glsl resolve_feed_vs resolve_feed.vert vertex
+ build_glsl resolve_feed_ps resolve_feed.frag fragment
++build_glsl resolve_feed_uint_ps resolve_feed_uint.frag fragment
++build_glsl resolve_feed_depth_ps resolve_feed_depth.frag fragment
+ rm -rf "$TMP"
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 630cc7e..de156b7 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <unordered_set>
+ #include <cstdint>
+ #include <utility>
+ 
+@@ -446,19 +447,79 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
+   // not up to date anymore.
+   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+   texture.LogAction("Loaded");
++  {
++    // Diagnostics: each distinct depth / float texture key loaded, once.
++    static std::unordered_set<uint64_t> load_keys_logged;
++    if ((texture_key.format == xenos::TextureFormat::k_24_8 ||
++         texture_key.format == xenos::TextureFormat::k_24_8_FLOAT ||
++         texture_key.format == xenos::TextureFormat::k_32_FLOAT) &&
++        load_keys_logged.size() < 64 &&
++        load_keys_logged.insert(uint64_t(texture_key.base_page) << 20 ^ uint64_t(texture_key.format) ^
++                                uint64_t(texture_key.height_minus_1) << 8)
++            .second) {
++      REXGPU_INFO("Texture load (feed diagnostics): base {:08X} mips {:08X} {}x{}x{} format {} "
++                  "pitch {} tiled {} mip levels {} packed {} dimension {} scaled {} endian {} "
++                  "load_base {}",
++                  texture_key.base_page << 12, texture_key.mip_page << 12, texture_key.GetWidth(),
++                  texture_key.GetHeight(), texture_key.GetDepthOrArraySize(),
++                  uint32_t(texture_key.format), uint32_t(texture_key.pitch),
++                  uint32_t(texture_key.tiled), uint32_t(texture_key.mip_max_level) + 1,
++                  uint32_t(texture_key.packed_mips), uint32_t(texture_key.dimension),
++                  uint32_t(texture_key.scaled_resolve), uint32_t(texture_key.endianness),
++                  pending_load.load_base);
++    }
++  }
+   if (pending_load.load_base && texture_key.dimension == xenos::DataDimension::k2DOrStacked &&
+       !texture_key.depth_or_array_size_minus_1 && !texture_key.mip_max_level &&
+       texture_key.tiled && !texture_key.scaled_resolve) {
+-    resolve_feed_keys_[texture_key.base_page] = texture_key;
++    resolve_feed_keys_[uint64_t(texture_key.base_page) << 8 | uint32_t(texture_key.format)] =
++        texture_key;
+   }
+   return true;
+ }
+ 
+-TextureCache::Texture* TextureCache::FindResolveFeedTexture(uint32_t base_address) {
++TextureCache::Texture* TextureCache::FindResolveFeedTextureContaining(uint32_t address,
++                                                                     xenos::TextureFormat format,
++                                                                     uint32_t& row_out) {
++  for (const auto& key_pair : resolve_feed_keys_) {
++    const TextureKey& key = key_pair.second;
++    uint32_t base = key.base_page << 12;
++    if (key.format != format || address <= base || !key.tiled) {
++      continue;
++    }
++    // Feedable formats are all 32bpp; a band of 32 rows of the tiled layout.
++    uint32_t band_bytes = key.pitch * 32 * 32 * 4;
++    uint32_t height_aligned = (uint32_t(key.height_minus_1) + 1 + 31) & ~uint32_t(31);
++    uint32_t offset = address - base;
++    if (!band_bytes || offset % band_bytes || offset / band_bytes * 32 >= height_aligned) {
++      continue;
++    }
++    auto texture_it = textures_.find(key);
++    if (texture_it == textures_.end()) {
++      continue;
++    }
++    row_out = offset / band_bytes * 32;
++    return texture_it->second.get();
++  }
++  return nullptr;
++}
++
++bool TextureCache::FindTextureKeyAtBase(uint32_t base_address, TextureKey& key_out) const {
++  for (const auto& texture_pair : textures_) {
++    if ((texture_pair.first.base_page << 12) == base_address) {
++      key_out = texture_pair.first;
++      return true;
++    }
++  }
++  return false;
++}
++
++TextureCache::Texture* TextureCache::FindResolveFeedTexture(uint32_t base_address,
++                                                           xenos::TextureFormat format) {
+   if (base_address & 0xFFF) {
+     return nullptr;
+   }
+-  auto key_it = resolve_feed_keys_.find(base_address >> 12);
++  auto key_it = resolve_feed_keys_.find(uint64_t(base_address >> 12) << 8 | uint32_t(format));
+   if (key_it == resolve_feed_keys_.end()) {
+     return nullptr;
+   }
+diff --git a/src/graphics/shaders/glsl/resolve_feed_depth.frag b/src/graphics/shaders/glsl/resolve_feed_depth.frag
+new file mode 100644
+index 0000000..4e4aa48
+--- /dev/null
++++ b/src/graphics/shaders/glsl/resolve_feed_depth.frag
+@@ -0,0 +1,19 @@
++#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++// Resolve feed from a 1x depth render target (binding 0 of the depth / stencil
++// transfer source set) into an R32_SFLOAT texture, as k_24_8 textures are
++// loaded (24-bit unorm depth as float, stencil dropped).
++layout(set = 0, binding = 0) uniform texture2D xe_feed_depth;
++layout(push_constant) uniform XeFeedConstants {
++  ivec2 source_offset;
++  uint flags;
++} xe_feed;
++layout(location = 0) out vec4 xe_feed_color;
++void main() {
++  if ((xe_feed.flags & 2u) != 0u) {
++    xe_feed_color = vec4(0.5, 0.0, 0.0, 1.0);
++    return;
++  }
++  float depth = texelFetch(xe_feed_depth, ivec2(gl_FragCoord.xy) + xe_feed.source_offset, 0).r;
++  xe_feed_color = vec4(depth, 0.0, 0.0, 1.0);
++}
+diff --git a/src/graphics/shaders/glsl/resolve_feed_uint.frag b/src/graphics/shaders/glsl/resolve_feed_uint.frag
+new file mode 100644
+index 0000000..f135deb
+--- /dev/null
++++ b/src/graphics/shaders/glsl/resolve_feed_uint.frag
+@@ -0,0 +1,19 @@
++#version 450
++#extension GL_EXT_samplerless_texture_functions : require
++// Resolve feed from a render target with a bit-exact UINT transfer view (e.g.
++// k_32_FLOAT as R32_UINT) into an R32_SFLOAT texture. flags bit 1: write a
++// debug value (vulkan_resolve_feed_debug).
++layout(set = 0, binding = 0) uniform utexture2D xe_feed_source;
++layout(push_constant) uniform XeFeedConstants {
++  ivec2 source_offset;
++  uint flags;
++} xe_feed;
++layout(location = 0) out vec4 xe_feed_color;
++void main() {
++  if ((xe_feed.flags & 2u) != 0u) {
++    xe_feed_color = vec4(1.0, 0.0, 1.0, 1.0);
++    return;
++  }
++  uvec4 bits = texelFetch(xe_feed_source, ivec2(gl_FragCoord.xy) + xe_feed.source_offset, 0);
++  xe_feed_color = vec4(uintBitsToFloat(bits.r), 0.0, 0.0, 1.0);
++}
+diff --git a/src/graphics/shaders/vulkan_spirv/resolve_feed_depth_ps.h b/src/graphics/shaders/vulkan_spirv/resolve_feed_depth_ps.h
+new file mode 100644
+index 0000000..5c174fa
+--- /dev/null
++++ b/src/graphics/shaders/vulkan_spirv/resolve_feed_depth_ps.h
+@@ -0,0 +1,154 @@
++// Generated by scripts/shaders/build_host_rt_resolve_shaders.sh.
++#if 0
++; SPIR-V
++; Version: 1.0
++; Generator: Google Shaderc over Glslang; 10
++; Bound: 55
++; Schema: 0
++               OpCapability Shader
++          %1 = OpExtInstImport "GLSL.std.450"
++               OpMemoryModel Logical GLSL450
++               OpEntryPoint Fragment %main "main" %xe_feed_color %gl_FragCoord
++               OpExecutionMode %main OriginUpperLeft
++               OpSource GLSL 450
++               OpSourceExtension "GL_EXT_samplerless_texture_functions"
++               OpSourceExtension "GL_GOOGLE_cpp_style_line_directive"
++               OpSourceExtension "GL_GOOGLE_include_directive"
++               OpName %main "main"
++               OpName %XeFeedConstants "XeFeedConstants"
++               OpMemberName %XeFeedConstants 0 "source_offset"
++               OpMemberName %XeFeedConstants 1 "flags"
++               OpName %xe_feed "xe_feed"
++               OpName %xe_feed_color "xe_feed_color"
++               OpName %xe_feed_depth "xe_feed_depth"
++               OpName %gl_FragCoord "gl_FragCoord"
++               OpMemberDecorate %XeFeedConstants 0 Offset 0
++               OpMemberDecorate %XeFeedConstants 1 Offset 8
++               OpDecorate %XeFeedConstants Block
++               OpDecorate %xe_feed_color Location 0
++               OpDecorate %xe_feed_depth DescriptorSet 0
++               OpDecorate %xe_feed_depth Binding 0
++               OpDecorate %gl_FragCoord BuiltIn FragCoord
++       %void = OpTypeVoid
++          %3 = OpTypeFunction %void
++        %int = OpTypeInt 32 1
++      %v2int = OpTypeVector %int 2
++       %uint = OpTypeInt 32 0
++%XeFeedConstants = OpTypeStruct %v2int %uint
++%_ptr_PushConstant_XeFeedConstants = OpTypePointer PushConstant %XeFeedConstants
++    %xe_feed = OpVariable %_ptr_PushConstant_XeFeedConstants PushConstant
++      %int_1 = OpConstant %int 1
++%_ptr_PushConstant_uint = OpTypePointer PushConstant %uint
++     %uint_2 = OpConstant %uint 2
++     %uint_0 = OpConstant %uint 0
++       %bool = OpTypeBool
++      %float = OpTypeFloat 32
++    %v4float = OpTypeVector %float 4
++%_ptr_Output_v4float = OpTypePointer Output %v4float
++%xe_feed_color = OpVariable %_ptr_Output_v4float Output
++  %float_0_5 = OpConstant %float 0.5
++    %float_0 = OpConstant %float 0
++    %float_1 = OpConstant %float 1
++         %30 = OpConstantComposite %v4float %float_0_5 %float_0 %float_0 %float_1
++         %34 = OpTypeImage %float 2D 0 0 0 1 Unknown
++%_ptr_UniformConstant_34 = OpTypePointer UniformConstant %34
++%xe_feed_depth = OpVariable %_ptr_UniformConstant_34 UniformConstant
++%_ptr_Input_v4float = OpTypePointer Input %v4float
++%gl_FragCoord = OpVariable %_ptr_Input_v4float Input
++    %v2float = OpTypeVector %float 2
++      %int_0 = OpConstant %int 0
++%_ptr_PushConstant_v2int = OpTypePointer PushConstant %v2int
++       %main = OpFunction %void None %3
++          %5 = OpLabel
++               OpSelectionMerge %53 None
++               OpSwitch %uint_0 %54
++         %54 = OpLabel
++         %14 = OpAccessChain %_ptr_PushConstant_uint %xe_feed %int_1
++         %15 = OpLoad %uint %14
++         %17 = OpBitwiseAnd %uint %15 %uint_2
++         %20 = OpINotEqual %bool %17 %uint_0
++               OpSelectionMerge %22 None
++               OpBranchConditional %20 %21 %22
++         %21 = OpLabel
++               OpStore %xe_feed_color %30
++               OpBranch %53
++         %22 = OpLabel
++         %37 = OpLoad %34 %xe_feed_depth
++         %41 = OpLoad %v4float %gl_FragCoord
++         %42 = OpVectorShuffle %v2float %41 %41 0 1
++         %43 = OpConvertFToS %v2int %42
++         %46 = OpAccessChain %_ptr_PushConstant_v2int %xe_feed %int_0
++         %47 = OpLoad %v2int %46
++         %48 = OpIAdd %v2int %43 %47
++         %49 = OpImageFetch %v4float %37 %48 Lod %int_0
++         %50 = OpCompositeExtract %float %49 0
++         %52 = OpCompositeConstruct %v4float %50 %float_0 %float_0 %float_1
++               OpStore %xe_feed_color %52
++               OpBranch %53
++         %53 = OpLabel
++               OpReturn
++               OpFunctionEnd
++#endif
++
++const uint32_t resolve_feed_depth_ps[] = {
++    0x07230203, 0x00010000, 0x000D000A, 0x00000037, 0x00000000, 0x00020011,
++    0x00000001, 0x0006000B, 0x00000001, 0x4C534C47, 0x6474732E, 0x3035342E,
++    0x00000000, 0x0003000E, 0x00000000, 0x00000001, 0x0007000F, 0x00000004,
++    0x00000004, 0x6E69616D, 0x00000000, 0x0000001A, 0x00000027, 0x00030010,
++    0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001C2, 0x000B0004,
++    0x455F4C47, 0x735F5458, 0x6C706D61, 0x656C7265, 0x745F7373, 0x75747865,
++    0x665F6572, 0x74636E75, 0x736E6F69, 0x00000000, 0x000A0004, 0x475F4C47,
++    0x4C474F4F, 0x70635F45, 0x74735F70, 0x5F656C79, 0x656E696C, 0x7269645F,
++    0x69746365, 0x00006576, 0x00080004, 0x475F4C47, 0x4C474F4F, 0x6E695F45,
++    0x64756C63, 0x69645F65, 0x74636572, 0x00657669, 0x00040005, 0x00000004,
++    0x6E69616D, 0x00000000, 0x00060005, 0x00000009, 0x65466558, 0x6F436465,
++    0x6174736E, 0x0073746E, 0x00070006, 0x00000009, 0x00000000, 0x72756F73,
++    0x6F5F6563, 0x65736666, 0x00000074, 0x00050006, 0x00000009, 0x00000001,
++    0x67616C66, 0x00000073, 0x00040005, 0x0000000B, 0x665F6578, 0x00646565,
++    0x00060005, 0x0000001A, 0x665F6578, 0x5F646565, 0x6F6C6F63, 0x00000072,
++    0x00060005, 0x00000024, 0x665F6578, 0x5F646565, 0x74706564, 0x00000068,
++    0x00060005, 0x00000027, 0x465F6C67, 0x43676172, 0x64726F6F, 0x00000000,
++    0x00050048, 0x00000009, 0x00000000, 0x00000023, 0x00000000, 0x00050048,
++    0x00000009, 0x00000001, 0x00000023, 0x00000008, 0x00030047, 0x00000009,
++    0x00000002, 0x00040047, 0x0000001A, 0x0000001E, 0x00000000, 0x00040047,
++    0x00000024, 0x00000022, 0x00000000, 0x00040047, 0x00000024, 0x00000021,
++    0x00000000, 0x00040047, 0x00000027, 0x0000000B, 0x0000000F, 0x00020013,
++    0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006,
++    0x00000020, 0x00000001, 0x00040017, 0x00000007, 0x00000006, 0x00000002,
++    0x00040015, 0x00000008, 0x00000020, 0x00000000, 0x0004001E, 0x00000009,
++    0x00000007, 0x00000008, 0x00040020, 0x0000000A, 0x00000009, 0x00000009,
++    0x0004003B, 0x0000000A, 0x0000000B, 0x00000009, 0x0004002B, 0x00000006,
++    0x0000000C, 0x00000001, 0x00040020, 0x0000000D, 0x00000009, 0x00000008,
++    0x0004002B, 0x00000008, 0x00000010, 0x00000002, 0x0004002B, 0x00000008,
++    0x00000012, 0x00000000, 0x00020014, 0x00000013, 0x00030016, 0x00000017,
++    0x00000020, 0x00040017, 0x00000018, 0x00000017, 0x00000004, 0x00040020,
++    0x00000019, 0x00000003, 0x00000018, 0x0004003B, 0x00000019, 0x0000001A,
++    0x00000003, 0x0004002B, 0x00000017, 0x0000001B, 0x3F000000, 0x0004002B,
++    0x00000017, 0x0000001C, 0x00000000, 0x0004002B, 0x00000017, 0x0000001D,
++    0x3F800000, 0x0007002C, 0x00000018, 0x0000001E, 0x0000001B, 0x0000001C,
++    0x0000001C, 0x0000001D, 0x00090019, 0x00000022, 0x00000017, 0x00000001,
++    0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00040020,
++    0x00000023, 0x00000000, 0x00000022, 0x0004003B, 0x00000023, 0x00000024,
++    0x00000000, 0x00040020, 0x00000026, 0x00000001, 0x00000018, 0x0004003B,
++    0x00000026, 0x00000027, 0x00000001, 0x00040017, 0x00000028, 0x00000017,
++    0x00000002, 0x0004002B, 0x00000006, 0x0000002C, 0x00000000, 0x00040020,
++    0x0000002D, 0x00000009, 0x00000007, 0x00050036, 0x00000002, 0x00000004,
++    0x00000000, 0x00000003, 0x000200F8, 0x00000005, 0x000300F7, 0x00000035,
++    0x00000000, 0x000300FB, 0x00000012, 0x00000036, 0x000200F8, 0x00000036,
++    0x00050041, 0x0000000D, 0x0000000E, 0x0000000B, 0x0000000C, 0x0004003D,
++    0x00000008, 0x0000000F, 0x0000000E, 0x000500C7, 0x00000008, 0x00000011,
++    0x0000000F, 0x00000010, 0x000500AB, 0x00000013, 0x00000014, 0x00000011,
++    0x00000012, 0x000300F7, 0x00000016, 0x00000000, 0x000400FA, 0x00000014,
++    0x00000015, 0x00000016, 0x000200F8, 0x00000015, 0x0003003E, 0x0000001A,
++    0x0000001E, 0x000200F9, 0x00000035, 0x000200F8, 0x00000016, 0x0004003D,
++    0x00000022, 0x00000025, 0x00000024, 0x0004003D, 0x00000018, 0x00000029,
++    0x00000027, 0x0007004F, 0x00000028, 0x0000002A, 0x00000029, 0x00000029,
++    0x00000000, 0x00000001, 0x0004006E, 0x00000007, 0x0000002B, 0x0000002A,
++    0x00050041, 0x0000002D, 0x0000002E, 0x0000000B, 0x0000002C, 0x0004003D,
++    0x00000007, 0x0000002F, 0x0000002E, 0x00050080, 0x00000007, 0x00000030,
++    0x0000002B, 0x0000002F, 0x0007005F, 0x00000018, 0x00000031, 0x00000025,
++    0x00000030, 0x00000002, 0x0000002C, 0x00050051, 0x00000017, 0x00000032,
++    0x00000031, 0x00000000, 0x00070050, 0x00000018, 0x00000034, 0x00000032,
++    0x0000001C, 0x0000001C, 0x0000001D, 0x0003003E, 0x0000001A, 0x00000034,
++    0x000200F9, 0x00000035, 0x000200F8, 0x00000035, 0x000100FD, 0x00010038,
++};
+diff --git a/src/graphics/shaders/vulkan_spirv/resolve_feed_uint_ps.h b/src/graphics/shaders/vulkan_spirv/resolve_feed_uint_ps.h
+new file mode 100644
+index 0000000..6361ba7
+--- /dev/null
++++ b/src/graphics/shaders/vulkan_spirv/resolve_feed_uint_ps.h
+@@ -0,0 +1,156 @@
++// Generated by scripts/shaders/build_host_rt_resolve_shaders.sh.
++#if 0
++; SPIR-V
++; Version: 1.0
++; Generator: Google Shaderc over Glslang; 10
++; Bound: 57
++; Schema: 0
++               OpCapability Shader
++          %1 = OpExtInstImport "GLSL.std.450"
++               OpMemoryModel Logical GLSL450
++               OpEntryPoint Fragment %main "main" %xe_feed_color %gl_FragCoord
++               OpExecutionMode %main OriginUpperLeft
++               OpSource GLSL 450
++               OpSourceExtension "GL_EXT_samplerless_texture_functions"
++               OpSourceExtension "GL_GOOGLE_cpp_style_line_directive"
++               OpSourceExtension "GL_GOOGLE_include_directive"
++               OpName %main "main"
++               OpName %XeFeedConstants "XeFeedConstants"
++               OpMemberName %XeFeedConstants 0 "source_offset"
++               OpMemberName %XeFeedConstants 1 "flags"
++               OpName %xe_feed "xe_feed"
++               OpName %xe_feed_color "xe_feed_color"
++               OpName %xe_feed_source "xe_feed_source"
++               OpName %gl_FragCoord "gl_FragCoord"
++               OpMemberDecorate %XeFeedConstants 0 Offset 0
++               OpMemberDecorate %XeFeedConstants 1 Offset 8
++               OpDecorate %XeFeedConstants Block
++               OpDecorate %xe_feed_color Location 0
++               OpDecorate %xe_feed_source DescriptorSet 0
++               OpDecorate %xe_feed_source Binding 0
++               OpDecorate %gl_FragCoord BuiltIn FragCoord
++       %void = OpTypeVoid
++          %3 = OpTypeFunction %void
++        %int = OpTypeInt 32 1
++      %v2int = OpTypeVector %int 2
++       %uint = OpTypeInt 32 0
++%XeFeedConstants = OpTypeStruct %v2int %uint
++%_ptr_PushConstant_XeFeedConstants = OpTypePointer PushConstant %XeFeedConstants
++    %xe_feed = OpVariable %_ptr_PushConstant_XeFeedConstants PushConstant
++      %int_1 = OpConstant %int 1
++%_ptr_PushConstant_uint = OpTypePointer PushConstant %uint
++     %uint_2 = OpConstant %uint 2
++     %uint_0 = OpConstant %uint 0
++       %bool = OpTypeBool
++      %float = OpTypeFloat 32
++    %v4float = OpTypeVector %float 4
++%_ptr_Output_v4float = OpTypePointer Output %v4float
++%xe_feed_color = OpVariable %_ptr_Output_v4float Output
++    %float_1 = OpConstant %float 1
++    %float_0 = OpConstant %float 0
++         %29 = OpConstantComposite %v4float %float_1 %float_0 %float_1 %float_1
++     %v4uint = OpTypeVector %uint 4
++         %34 = OpTypeImage %uint 2D 0 0 0 1 Unknown
++%_ptr_UniformConstant_34 = OpTypePointer UniformConstant %34
++%xe_feed_source = OpVariable %_ptr_UniformConstant_34 UniformConstant
++%_ptr_Input_v4float = OpTypePointer Input %v4float
++%gl_FragCoord = OpVariable %_ptr_Input_v4float Input
++    %v2float = OpTypeVector %float 2
++      %int_0 = OpConstant %int 0
++%_ptr_PushConstant_v2int = OpTypePointer PushConstant %v2int
++       %main = OpFunction %void None %3
++          %5 = OpLabel
++               OpSelectionMerge %55 None
++               OpSwitch %uint_0 %56
++         %56 = OpLabel
++         %14 = OpAccessChain %_ptr_PushConstant_uint %xe_feed %int_1
++         %15 = OpLoad %uint %14
++         %17 = OpBitwiseAnd %uint %15 %uint_2
++         %20 = OpINotEqual %bool %17 %uint_0
++               OpSelectionMerge %22 None
++               OpBranchConditional %20 %21 %22
++         %21 = OpLabel
++               OpStore %xe_feed_color %29
++               OpBranch %55
++         %22 = OpLabel
++         %37 = OpLoad %34 %xe_feed_source
++         %41 = OpLoad %v4float %gl_FragCoord
++         %42 = OpVectorShuffle %v2float %41 %41 0 1
++         %43 = OpConvertFToS %v2int %42
++         %46 = OpAccessChain %_ptr_PushConstant_v2int %xe_feed %int_0
++         %47 = OpLoad %v2int %46
++         %48 = OpIAdd %v2int %43 %47
++         %49 = OpImageFetch %v4uint %37 %48 Lod %int_0
++         %52 = OpCompositeExtract %uint %49 0
++         %53 = OpBitcast %float %52
++         %54 = OpCompositeConstruct %v4float %53 %float_0 %float_0 %float_1
++               OpStore %xe_feed_color %54
++               OpBranch %55
++         %55 = OpLabel
++               OpReturn
++               OpFunctionEnd
++#endif
++
++const uint32_t resolve_feed_uint_ps[] = {
++    0x07230203, 0x00010000, 0x000D000A, 0x00000039, 0x00000000, 0x00020011,
++    0x00000001, 0x0006000B, 0x00000001, 0x4C534C47, 0x6474732E, 0x3035342E,
++    0x00000000, 0x0003000E, 0x00000000, 0x00000001, 0x0007000F, 0x00000004,
++    0x00000004, 0x6E69616D, 0x00000000, 0x0000001A, 0x00000027, 0x00030010,
++    0x00000004, 0x00000007, 0x00030003, 0x00000002, 0x000001C2, 0x000B0004,
++    0x455F4C47, 0x735F5458, 0x6C706D61, 0x656C7265, 0x745F7373, 0x75747865,
++    0x665F6572, 0x74636E75, 0x736E6F69, 0x00000000, 0x000A0004, 0x475F4C47,
++    0x4C474F4F, 0x70635F45, 0x74735F70, 0x5F656C79, 0x656E696C, 0x7269645F,
++    0x69746365, 0x00006576, 0x00080004, 0x475F4C47, 0x4C474F4F, 0x6E695F45,
++    0x64756C63, 0x69645F65, 0x74636572, 0x00657669, 0x00040005, 0x00000004,
++    0x6E69616D, 0x00000000, 0x00060005, 0x00000009, 0x65466558, 0x6F436465,
++    0x6174736E, 0x0073746E, 0x00070006, 0x00000009, 0x00000000, 0x72756F73,
++    0x6F5F6563, 0x65736666, 0x00000074, 0x00050006, 0x00000009, 0x00000001,
++    0x67616C66, 0x00000073, 0x00040005, 0x0000000B, 0x665F6578, 0x00646565,
++    0x00060005, 0x0000001A, 0x665F6578, 0x5F646565, 0x6F6C6F63, 0x00000072,
++    0x00060005, 0x00000024, 0x665F6578, 0x5F646565, 0x72756F73, 0x00006563,
++    0x00060005, 0x00000027, 0x465F6C67, 0x43676172, 0x64726F6F, 0x00000000,
++    0x00050048, 0x00000009, 0x00000000, 0x00000023, 0x00000000, 0x00050048,
++    0x00000009, 0x00000001, 0x00000023, 0x00000008, 0x00030047, 0x00000009,
++    0x00000002, 0x00040047, 0x0000001A, 0x0000001E, 0x00000000, 0x00040047,
++    0x00000024, 0x00000022, 0x00000000, 0x00040047, 0x00000024, 0x00000021,
++    0x00000000, 0x00040047, 0x00000027, 0x0000000B, 0x0000000F, 0x00020013,
++    0x00000002, 0x00030021, 0x00000003, 0x00000002, 0x00040015, 0x00000006,
++    0x00000020, 0x00000001, 0x00040017, 0x00000007, 0x00000006, 0x00000002,
++    0x00040015, 0x00000008, 0x00000020, 0x00000000, 0x0004001E, 0x00000009,
++    0x00000007, 0x00000008, 0x00040020, 0x0000000A, 0x00000009, 0x00000009,
++    0x0004003B, 0x0000000A, 0x0000000B, 0x00000009, 0x0004002B, 0x00000006,
++    0x0000000C, 0x00000001, 0x00040020, 0x0000000D, 0x00000009, 0x00000008,
++    0x0004002B, 0x00000008, 0x00000010, 0x00000002, 0x0004002B, 0x00000008,
++    0x00000012, 0x00000000, 0x00020014, 0x00000013, 0x00030016, 0x00000017,
++    0x00000020, 0x00040017, 0x00000018, 0x00000017, 0x00000004, 0x00040020,
++    0x00000019, 0x00000003, 0x00000018, 0x0004003B, 0x00000019, 0x0000001A,
++    0x00000003, 0x0004002B, 0x00000017, 0x0000001B, 0x3F800000, 0x0004002B,
++    0x00000017, 0x0000001C, 0x00000000, 0x0007002C, 0x00000018, 0x0000001D,
++    0x0000001B, 0x0000001C, 0x0000001B, 0x0000001B, 0x00040017, 0x0000001F,
++    0x00000008, 0x00000004, 0x00090019, 0x00000022, 0x00000008, 0x00000001,
++    0x00000000, 0x00000000, 0x00000000, 0x00000001, 0x00000000, 0x00040020,
++    0x00000023, 0x00000000, 0x00000022, 0x0004003B, 0x00000023, 0x00000024,
++    0x00000000, 0x00040020, 0x00000026, 0x00000001, 0x00000018, 0x0004003B,
++    0x00000026, 0x00000027, 0x00000001, 0x00040017, 0x00000028, 0x00000017,
++    0x00000002, 0x0004002B, 0x00000006, 0x0000002C, 0x00000000, 0x00040020,
++    0x0000002D, 0x00000009, 0x00000007, 0x00050036, 0x00000002, 0x00000004,
++    0x00000000, 0x00000003, 0x000200F8, 0x00000005, 0x000300F7, 0x00000037,
++    0x00000000, 0x000300FB, 0x00000012, 0x00000038, 0x000200F8, 0x00000038,
++    0x00050041, 0x0000000D, 0x0000000E, 0x0000000B, 0x0000000C, 0x0004003D,
++    0x00000008, 0x0000000F, 0x0000000E, 0x000500C7, 0x00000008, 0x00000011,
++    0x0000000F, 0x00000010, 0x000500AB, 0x00000013, 0x00000014, 0x00000011,
++    0x00000012, 0x000300F7, 0x00000016, 0x00000000, 0x000400FA, 0x00000014,
++    0x00000015, 0x00000016, 0x000200F8, 0x00000015, 0x0003003E, 0x0000001A,
++    0x0000001D, 0x000200F9, 0x00000037, 0x000200F8, 0x00000016, 0x0004003D,
++    0x00000022, 0x00000025, 0x00000024, 0x0004003D, 0x00000018, 0x00000029,
++    0x00000027, 0x0007004F, 0x00000028, 0x0000002A, 0x00000029, 0x00000029,
++    0x00000000, 0x00000001, 0x0004006E, 0x00000007, 0x0000002B, 0x0000002A,
++    0x00050041, 0x0000002D, 0x0000002E, 0x0000000B, 0x0000002C, 0x0004003D,
++    0x00000007, 0x0000002F, 0x0000002E, 0x00050080, 0x00000007, 0x00000030,
++    0x0000002B, 0x0000002F, 0x0007005F, 0x0000001F, 0x00000031, 0x00000025,
++    0x00000030, 0x00000002, 0x0000002C, 0x00050051, 0x00000008, 0x00000034,
++    0x00000031, 0x00000000, 0x0004007C, 0x00000017, 0x00000035, 0x00000034,
++    0x00070050, 0x00000018, 0x00000036, 0x00000035, 0x0000001C, 0x0000001C,
++    0x0000001B, 0x0003003E, 0x0000001A, 0x00000036, 0x000200F9, 0x00000037,
++    0x000200F8, 0x00000037, 0x000100FD, 0x00010038,
++};
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 1008b7e..6d49c5a 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <unordered_set>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+@@ -105,7 +106,9 @@ namespace shaders {
+ #include "../shaders/vulkan_spirv/resolve_fast_32bpp_1x2xmsaa_scaled_cs.h"
+ #include "../shaders/vulkan_spirv/resolve_fast_32bpp_4xmsaa_cs.h"
+ #include "../shaders/vulkan_spirv/resolve_fast_32bpp_host_rt_1x_d24s8_cs.h"
++#include "../shaders/vulkan_spirv/resolve_feed_depth_ps.h"
+ #include "../shaders/vulkan_spirv/resolve_feed_ps.h"
++#include "../shaders/vulkan_spirv/resolve_feed_uint_ps.h"
+ #include "../shaders/vulkan_spirv/resolve_feed_vs.h"
+ #include "../shaders/vulkan_spirv/resolve_fast_32bpp_host_rt_1x_uint_cs.h"
+ #include "../shaders/vulkan_spirv/resolve_fast_32bpp_host_rt_4x_d24s8_cs.h"
+@@ -750,6 +753,42 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+                                         &resolve_feed_pipeline_) != VK_SUCCESS) {
+         resolve_feed_pipeline_ = VK_NULL_HANDLE;
+       }
++      // R32_SFLOAT targets: k_32_FLOAT from a float or uint view, and depth.
++      feed_color_format = VK_FORMAT_R32_SFLOAT;
++      if (dfn.vkCreateGraphicsPipelines(device, vulkan_device->pipeline_cache(), 1,
++                                        &feed_pipeline_create_info, nullptr,
++                                        &resolve_feed_pipeline_float32_) != VK_SUCCESS) {
++        resolve_feed_pipeline_float32_ = VK_NULL_HANDLE;
++      }
++      VkShaderModule feed_uint_ps = ui::vulkan::util::CreateShaderModule(
++          vulkan_device, shaders::resolve_feed_uint_ps, sizeof(shaders::resolve_feed_uint_ps));
++      if (feed_uint_ps != VK_NULL_HANDLE) {
++        feed_stages[1].module = feed_uint_ps;
++        if (dfn.vkCreateGraphicsPipelines(device, vulkan_device->pipeline_cache(), 1,
++                                          &feed_pipeline_create_info, nullptr,
++                                          &resolve_feed_pipeline_uint32_) != VK_SUCCESS) {
++          resolve_feed_pipeline_uint32_ = VK_NULL_HANDLE;
++        }
++        dfn.vkDestroyShaderModule(device, feed_uint_ps, nullptr);
++      }
++      VkPipelineLayoutCreateInfo feed_depth_layout_create_info = feed_layout_create_info;
++      feed_depth_layout_create_info.pSetLayouts = &descriptor_set_layout_sampled_image_x2_;
++      VkShaderModule feed_depth_ps = ui::vulkan::util::CreateShaderModule(
++          vulkan_device, shaders::resolve_feed_depth_ps, sizeof(shaders::resolve_feed_depth_ps));
++      if (feed_depth_ps != VK_NULL_HANDLE &&
++          dfn.vkCreatePipelineLayout(device, &feed_depth_layout_create_info, nullptr,
++                                     &resolve_feed_pipeline_layout_depth_) == VK_SUCCESS) {
++        feed_stages[1].module = feed_depth_ps;
++        feed_pipeline_create_info.layout = resolve_feed_pipeline_layout_depth_;
++        if (dfn.vkCreateGraphicsPipelines(device, vulkan_device->pipeline_cache(), 1,
++                                          &feed_pipeline_create_info, nullptr,
++                                          &resolve_feed_pipeline_depth_) != VK_SUCCESS) {
++          resolve_feed_pipeline_depth_ = VK_NULL_HANDLE;
++        }
++      }
++      if (feed_depth_ps != VK_NULL_HANDLE) {
++        dfn.vkDestroyShaderModule(device, feed_depth_ps, nullptr);
++      }
+     }
+     if (feed_vs != VK_NULL_HANDLE) {
+       dfn.vkDestroyShaderModule(device, feed_vs, nullptr);
+@@ -757,8 +796,11 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+     if (feed_ps != VK_NULL_HANDLE) {
+       dfn.vkDestroyShaderModule(device, feed_ps, nullptr);
+     }
+-    REXGPU_INFO("VulkanRenderTargetCache: resolve feeding {}",
+-                resolve_feed_pipeline_ != VK_NULL_HANDLE ? "on" : "unavailable");
++    REXGPU_INFO("VulkanRenderTargetCache: resolve feeding {} (k_32_FLOAT {}/{}, depth {})",
++                resolve_feed_pipeline_ != VK_NULL_HANDLE ? "on" : "unavailable",
++                resolve_feed_pipeline_float32_ != VK_NULL_HANDLE,
++                resolve_feed_pipeline_uint32_ != VK_NULL_HANDLE,
++                resolve_feed_pipeline_depth_ != VK_NULL_HANDLE);
+   }
+   if (direct_resolve_pipeline_layout_depth_ != VK_NULL_HANDLE && !draw_resolution_scaled) {
+     direct_host_resolve_depth_pipelines_[0] = ui::vulkan::util::CreateComputePipeline(
+@@ -1170,6 +1212,14 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
+   }
+   direct_resolve_pipelines_.clear();
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, resolve_feed_pipeline_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
++                                         resolve_feed_pipeline_float32_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
++                                         resolve_feed_pipeline_uint32_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
++                                         resolve_feed_pipeline_depth_);
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
++                                         resolve_feed_pipeline_layout_depth_);
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
+                                          resolve_feed_pipeline_layout_);
+   for (VkPipeline& direct_host_resolve_depth_pipeline : direct_host_resolve_depth_pipelines_) {
+@@ -1523,19 +1573,69 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+ 
+           // Resolve feeding: a 1x k_8_8_8_8 render target region copied straight
+           // into the cached texture that samples it (vulkan_resolve_feed_textures).
++          if (resolve_info.IsCopyingDepth()) {
++            // Diagnostics: each distinct depth resolve situation once.
++            static std::unordered_set<uint64_t> depth_resolves_logged;
++            uint64_t situation =
++                uint64_t(resolve_info.copy_dest_base) << 32 ^
++                uint64_t(resolve_info.coordinate_info.width_div_8) << 20 ^
++                uint64_t(resolve_info.height_div_8) << 8 ^ uint64_t(direct_resolved);
++            if (depth_resolves_logged.size() < 64 &&
++                depth_resolves_logged.insert(situation).second) {
++              REXGPU_INFO(
++                  "Depth resolve @{:08X} {}x{} offset ({}, {}): direct {}, render target {}, edram "
++                  "base {} pitch {} msaa {}, copy sample select {}",
++                  resolve_info.copy_dest_base, resolve_info.coordinate_info.width_div_8 * 8,
++                  resolve_info.height_div_8 * 8,
++                  resolve_info.copy_dest_coordinate_info.offset_x_div_8 * 8,
++                  resolve_info.copy_dest_coordinate_info.offset_y_div_8 * 8, direct_resolved,
++                  direct_resolved ? direct_host_resolve.render_target->key().GetDebugName()
++                                  : std::string("-"),
++                  uint32_t(resolve_info.depth_edram_info.base_tiles),
++                  uint32_t(resolve_info.depth_edram_info.pitch_tiles),
++                  uint32_t(resolve_info.depth_edram_info.msaa_samples),
++                  uint32_t(resolve_info.copy_dest_coordinate_info.copy_sample_select));
++            }
++          }
+           VulkanTextureCache::ResolveFeed resolve_feed;
+           int32_t resolve_feed_x = 0, resolve_feed_y = 0;
+           bool resolve_feed_ok = false;
+-          if (direct_resolved && !direct_host_resolve.is_depth &&
+-              resolve_feed_pipeline_ != VK_NULL_HANDLE) {
++          VkPipeline resolve_feed_pipeline = VK_NULL_HANDLE;
++          VkPipelineLayout resolve_feed_layout = resolve_feed_pipeline_layout_;
++          if (direct_resolved && resolve_feed_pipeline_ != VK_NULL_HANDLE) {
+             RenderTargetKey feed_rt_key = direct_host_resolve.render_target->key();
+             uint32_t feed_pitch = feed_rt_key.pitch_tiles_at_32bpp;
+-            if (feed_rt_key.msaa_samples == xenos::MsaaSamples::k1X &&
+-                feed_rt_key.GetColorFormat() == xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+-                feed_pitch && resolve_info.color_edram_info.pitch_tiles == feed_pitch &&
++            const draw_util::ResolveEdramInfo& feed_edram_info =
++                direct_host_resolve.is_depth ? resolve_info.depth_edram_info
++                                             : resolve_info.color_edram_info;
++            if (feed_rt_key.msaa_samples == xenos::MsaaSamples::k1X && feed_pitch &&
++                feed_edram_info.pitch_tiles == feed_pitch &&
+                 texture_cache.PrepareResolveFeed(resolve_info, resolve_feed)) {
++              using FeedSource = VulkanTextureCache::ResolveFeed::Source;
++              if (direct_host_resolve.is_depth) {
++                if (resolve_feed.source == FeedSource::kDepth24 &&
++                    feed_rt_key.GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24S8) {
++                  resolve_feed_pipeline = resolve_feed_pipeline_depth_;
++                  resolve_feed_layout = resolve_feed_pipeline_layout_depth_;
++                }
++              } else if (resolve_feed.source == FeedSource::kColor8888 &&
++                         feed_rt_key.GetColorFormat() ==
++                             xenos::ColorRenderTargetFormat::k_8_8_8_8) {
++                resolve_feed_pipeline = resolve_feed_pipeline_;
++              } else if (resolve_feed.source == FeedSource::kColorFloat32 &&
++                         feed_rt_key.GetColorFormat() ==
++                             xenos::ColorRenderTargetFormat::k_32_FLOAT) {
++                bool transfer_is_uint = false;
++                GetColorOwnershipTransferVulkanFormat(feed_rt_key.GetColorFormat(),
++                                                      feed_rt_key.msaa_samples,
++                                                      &transfer_is_uint);
++                resolve_feed_pipeline = transfer_is_uint ? resolve_feed_pipeline_uint32_
++                                                         : resolve_feed_pipeline_float32_;
++              }
++            }
++            if (resolve_feed_pipeline != VK_NULL_HANDLE) {
+               uint32_t feed_rel_tiles =
+-                  (resolve_info.color_edram_info.base_tiles - feed_rt_key.base_tiles) &
++                  (feed_edram_info.base_tiles - feed_rt_key.base_tiles) &
+                   (xenos::kEdramTileCount - 1);
+               resolve_feed_x =
+                   int32_t((feed_rel_tiles % feed_pitch) * xenos::kEdramTileWidthSamples +
+@@ -1543,14 +1643,19 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+               resolve_feed_y =
+                   int32_t((feed_rel_tiles / feed_pitch) * xenos::kEdramTileHeightSamples +
+                           resolve_info.coordinate_info.edram_offset_y_div_8 * 8);
+-              static uint32_t feed_logs = 0;
+-              if (feed_logs < 20) {
+-                ++feed_logs;
++              // Each distinct (address, source) once.
++              static std::unordered_set<uint64_t> feeds_logged;
++              if (feeds_logged.size() < 100 &&
++                  feeds_logged
++                      .insert(uint64_t(resolve_info.copy_dest_base) << 8 |
++                              uint32_t(resolve_feed.source))
++                      .second) {
+                 REXGPU_INFO("Resolve feed @{:08X}: texture {}x{} at ({}, {}), from render target "
+-                            "({}, {}) base {} pitch {}",
++                            "({}, {}) base {} pitch {}, source {}",
+                             resolve_info.copy_dest_base, resolve_feed.width, resolve_feed.height,
+                             resolve_feed.dest_x, resolve_feed.dest_y, resolve_feed_x,
+-                            resolve_feed_y, uint32_t(feed_rt_key.base_tiles), feed_pitch);
++                            resolve_feed_y, uint32_t(feed_rt_key.base_tiles), feed_pitch,
++                            uint32_t(resolve_feed.source));
+               }
+               resolve_feed_ok =
+                   uint32_t(resolve_feed_x) + resolve_feed.width <=
+@@ -1573,7 +1678,10 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+             // them again for the fragment shader reading them here.
+             command_processor_.PushImageMemoryBarrier(
+                 feed_rt.image(),
+-                ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
++                ui::vulkan::util::InitializeSubresourceRange(
++                    direct_host_resolve.is_depth
++                        ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
++                        : VK_IMAGE_ASPECT_COLOR_BIT),
+                 feed_rt.src_stage_mask(kFeedSourceStages), kFeedSourceStages,
+                 feed_rt.src_access_mask(kFeedSourceStages),
+                 VK_ACCESS_SHADER_READ_BIT, feed_rt.current_layout(),
+@@ -1600,7 +1708,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+               feed_rendering_info.colorAttachmentCount = 1;
+               feed_rendering_info.pColorAttachments = &feed_attachment;
+               command_buffer.CmdVkBeginRendering(&feed_rendering_info);
+-              command_processor_.BindExternalGraphicsPipeline(resolve_feed_pipeline_);
++              command_processor_.BindExternalGraphicsPipeline(resolve_feed_pipeline);
+               VkViewport feed_viewport;
+               feed_viewport.x = float(feed_rect.offset.x);
+               feed_viewport.y = float(feed_rect.offset.y);
+@@ -1612,7 +1720,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+               command_processor_.SetScissor(feed_rect);
+               VkDescriptorSet feed_source_set = feed_rt.GetDescriptorSetTransferSource();
+               command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_GRAPHICS,
+-                                                     resolve_feed_pipeline_layout_, 0, 1,
++                                                     resolve_feed_layout, 0, 1,
+                                                      &feed_source_set, 0, nullptr);
+               int32_t feed_constants[3] = {resolve_feed_x - resolve_feed.dest_x,
+                                            resolve_feed_y - resolve_feed.dest_y,
+@@ -1622,7 +1730,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                                                      resolve_info.copy_dest_base)
+                                                     ? 2
+                                                     : 0)};
+-              command_buffer.CmdVkPushConstants(resolve_feed_pipeline_layout_,
++              command_buffer.CmdVkPushConstants(resolve_feed_layout,
+                                                 VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                                 sizeof(feed_constants), feed_constants);
+               command_buffer.CmdVkDraw(3, 1, 0, 0);
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 2f7db05..9cd8f1f 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -1184,7 +1184,9 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+   // Single-level 2D R8G8B8A8_UNORM textures may be fed directly from render
+   // targets by resolves (vulkan_resolve_feed_textures), drawn into.
+   const bool feed_attachment = REXCVAR_GET(vulkan_resolve_feed_textures) &&
+-                               formats[0] == VK_FORMAT_R8G8B8A8_UNORM && !is_3d &&
++                               (formats[0] == VK_FORMAT_R8G8B8A8_UNORM ||
++                                formats[0] == VK_FORMAT_R32_SFLOAT) &&
++                               !is_3d &&
+                                key.dimension == xenos::DataDimension::k2DOrStacked &&
+                                depth_or_array_size == 1 && !key.mip_max_level &&
+                                !key.scaled_resolve;
+@@ -1905,7 +1907,8 @@ VkImageView VulkanTextureCache::VulkanTexture::GetFeedAttachmentView() {
+   VkImageViewCreateInfo view_create_info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+   view_create_info.image = image();
+   view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+-  view_create_info.format = VK_FORMAT_R8G8B8A8_UNORM;
++  view_create_info.format =
++      vulkan_texture_cache.GetHostFormatPair(key()).format_unsigned.format;
+   view_create_info.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                                  VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+   view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
+@@ -2404,30 +2407,65 @@ bool VulkanTextureCache::PrepareResolveFeed(const draw_util::ResolveInfo& resolv
+                                             ResolveFeed& feed_out) {
+   feed_out = ResolveFeed();
+   // Logs the first reasons a resolve can't feed a texture (diagnostics).
+-  static uint32_t reject_logs = 0;
++  // Each distinct (address, reason) once, up to 300.
++  static std::unordered_set<uint64_t> reject_logged;
++  uint32_t reject_logs = uint32_t(reject_logged.size()) < 300 ? 0 : 40;
+   auto reject = [&](const char* reason, uint64_t a = 0, uint64_t b = 0) {
+-    if (reject_logs < 40) {
+-      ++reject_logs;
++    if (reject_logged.size() < 300 &&
++        reject_logged.insert(uint64_t(resolve_info.copy_dest_base) << 32 ^
++                             uint64_t(reinterpret_cast<uintptr_t>(reason)))
++            .second) {
+       REXGPU_INFO("Resolve feed @{:08X}: no ({}: {:X} {:X})", resolve_info.copy_dest_base, reason,
+                   a, b);
+     }
+     return false;
+   };
+   const reg::RB_COPY_DEST_INFO& dest_info = resolve_info.copy_dest_info;
+-  if (dest_info.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 ||
+-      dest_info.copy_dest_exp_bias || dest_info.copy_dest_array ||
++  ResolveFeed::Source source;
++  xenos::TextureFormat texture_format;
++  VkFormat host_vulkan_format;
++  if (resolve_info.IsCopyingDepth()) {
++    source = ResolveFeed::Source::kDepth24;
++    texture_format = xenos::TextureFormat::k_24_8;
++    host_vulkan_format = VK_FORMAT_R32_SFLOAT;
++  } else if (dest_info.copy_dest_format == xenos::ColorFormat::k_8_8_8_8) {
++    source = ResolveFeed::Source::kColor8888;
++    texture_format = xenos::TextureFormat::k_8_8_8_8;
++    host_vulkan_format = VK_FORMAT_R8G8B8A8_UNORM;
++  } else if (dest_info.copy_dest_format == xenos::ColorFormat::k_32_FLOAT) {
++    source = ResolveFeed::Source::kColorFloat32;
++    texture_format = xenos::TextureFormat::k_32_FLOAT;
++    host_vulkan_format = VK_FORMAT_R32_SFLOAT;
++  } else {
++    return reject("dest format", dest_info.value);
++  }
++  if (dest_info.copy_dest_exp_bias || dest_info.copy_dest_array ||
+       uint32_t(dest_info.copy_dest_endian) > uint32_t(xenos::Endian128::k16in32)) {
+     return reject("dest info", dest_info.value);
+   }
+-  Texture* texture = FindResolveFeedTexture(resolve_info.copy_dest_base);
++  Texture* texture = FindResolveFeedTexture(resolve_info.copy_dest_base, texture_format);
++  uint32_t texture_row_offset = 0;
++  if (!texture) {
++    texture = FindResolveFeedTextureContaining(resolve_info.copy_dest_base, texture_format,
++                                               texture_row_offset);
++  }
+   if (!texture) {
++    if (reject_logs < 40) {
++      // Is there a texture at the address that isn't registered for feeding?
++      TextureKey other_key;
++      if (FindTextureKeyAtBase(resolve_info.copy_dest_base, other_key)) {
++        return reject("texture at the address not feedable (format, tiled, mips | dim, scaled)",
++                      uint64_t(other_key.format) << 32 | uint64_t(other_key.tiled) << 16 |
++                          other_key.mip_max_level,
++                      uint64_t(other_key.dimension) << 32 | uint64_t(other_key.scaled_resolve));
++      }
++    }
+     return reject("no texture loaded at the address");
+   }
+   TextureKey key = texture->key();
+-  if (key.format != xenos::TextureFormat::k_8_8_8_8 || key.signed_separate ||
++  if (key.format != texture_format || key.signed_separate ||
+       uint32_t(key.endianness) != uint32_t(dest_info.copy_dest_endian) ||
+-      key.pitch != resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 ||
+-      (key.base_page << 12) != resolve_info.copy_dest_base) {
++      key.pitch != resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32) {
+     return reject("texture key (format, signed, endian, pitch | dest endian, pitch)",
+                   uint64_t(key.format) << 32 | uint64_t(key.signed_separate) << 24 |
+                       uint64_t(key.endianness) << 16 | key.pitch,
+@@ -2435,7 +2473,7 @@ bool VulkanTextureCache::PrepareResolveFeed(const draw_util::ResolveInfo& resolv
+                       resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32);
+   }
+   const HostFormatPair& host_format = GetHostFormatPair(key);
+-  if (host_format.format_unsigned.format != VK_FORMAT_R8G8B8A8_UNORM ||
++  if (host_format.format_unsigned.format != host_vulkan_format ||
+       host_format.format_unsigned.block_compressed) {
+     return reject("host format", host_format.format_unsigned.format);
+   }
+@@ -2443,7 +2481,8 @@ bool VulkanTextureCache::PrepareResolveFeed(const draw_util::ResolveInfo& resolv
+     return reject("texture can't be drawn into");
+   }
+   int32_t dest_x = int32_t(resolve_info.copy_dest_coordinate_info.offset_x_div_8 * 8);
+-  int32_t dest_y = int32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8 * 8);
++  int32_t dest_y = int32_t(resolve_info.copy_dest_coordinate_info.offset_y_div_8 * 8 +
++                           texture_row_offset);
+   uint32_t texture_width = key.width_minus_1 + 1;
+   uint32_t texture_height = key.height_minus_1 + 1;
+   if (uint32_t(dest_x) >= texture_width || uint32_t(dest_y) >= texture_height) {
+@@ -2462,8 +2501,10 @@ bool VulkanTextureCache::PrepareResolveFeed(const draw_util::ResolveInfo& resolv
+     return reject("texture already outdated, resolve covers part",
+                   texture->outdated_mask(), uint64_t(width) << 32 | height);
+   }
++  feed_out.source = source;
+   feed_out.texture = static_cast<VulkanTexture*>(texture);
+-  feed_out.swap_red_blue = dest_info.copy_dest_swap != 0;
++  feed_out.swap_red_blue =
++      source == ResolveFeed::Source::kColor8888 && dest_info.copy_dest_swap != 0;
+   feed_out.dest_x = dest_x;
+   feed_out.dest_y = dest_y;
+   feed_out.width = width;

@@ -1,0 +1,45 @@
+From 4e7dee649398affdf4a51757b4f057c86fc49dfd Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 13:43:54 +0800
+Subject: [PATCH 085/108] gpu: vulkan: no zero-timeout fence polling by default
+ (vulkan_fence_poll)
+
+On Turnip over KGSL vkWaitForFences with a zero timeout blocks until the fence
+signals (off-CPU profile: ~67% of the GPU command thread's time, called from
+CheckSubmissionFenceAndDeviceLoss in BeginSubmission). So every new submission
+waited for the GPU to drain first, and the GPU idled while the next batch was
+translated. Completion is now learned only from blocking waits (frame in flight,
+explicit awaits). Thor, Ark view facing Hope's screen: 42.1 -> 33.3 ms per frame,
+frames over 45 ms 52% -> 0.6%; GPU work stayed ~13 Mcycles per frame (the governor raised the
+clock to 550 MHz once the GPU was fed steadily).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 3b689f5..1a06856 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -82,6 +82,14 @@ REXCVAR_DEFINE_UINT32(vulkan_submit_before_wait_min_draws, 1, "GPU/Vulkan",
+                       "sleeps. Lightning Returns waits once per frame for a guest memory counter; "
+                       "without this the GPU idled until the wait ended. 0 = never.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(vulkan_fence_poll, false, "GPU/Vulkan",
++                    "Poll in-flight submission fences with zero-timeout waits whenever a submission "
++                    "begins, to reclaim resources early (Xenia's behaviour). Off: completion is "
++                    "learned from the blocking frame-in-flight waits (and explicit awaits) only. "
++                    "On Turnip over KGSL a zero-timeout fence wait blocks until the fence signals, "
++                    "so polling made the command thread wait for the GPU before every new "
++                    "submission: the Thor's Ark screen view went from 42 to 33.3 ms per frame "
++                    "with it off.");
+ REXCVAR_DEFINE_UINT32(vulkan_fence_wait_sleep_us, 0, "GPU/Vulkan",
+                       "When the GPU thread must wait for a submission, poll the fences with "
+                       "sleeps of this many microseconds instead of a blocking vkWaitForFences "
+@@ -6151,7 +6159,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+   // Check how far into the submissions the GPU currently is, in order because
+   // submission themselves can be executed out of order, but Xenia serializes
+   // that for simplicity.
+-  while (fences_awaited < fences_total) {
++  while (fences_awaited < fences_total && REXCVAR_GET(vulkan_fence_poll)) {
+     VkResult fence_status =
+         dfn.vkWaitForFences(device, 1, &submissions_in_flight_fences_[fences_awaited], VK_TRUE, 0);
+     if (fence_status != VK_SUCCESS) {

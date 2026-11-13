@@ -1,0 +1,59 @@
+From 44552c3dfb99654779cf87f3886aaea90bfabd58 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:34:33 +0800
+Subject: [PATCH 012/108] templates: support SHARED hosts and SDKs without the
+ rexglue CLI
+
+- rexglue_setup_target: the <target>_recomp OBJECT library is built PIC when
+  the host target is a SHARED library (Android libmain.so).
+- The <name>_codegen custom command is only created when rex::rexglue exists;
+  cross SDK installs (Android, REXGLUE_BUILD_TOOLS=OFF) get an empty target and
+  require codegen output generated beforehand by the host SDK.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/resources/templates/init/rexglue_cmake.inja b/resources/templates/init/rexglue_cmake.inja
+index 97796d9..fd96b59 100644
+--- a/resources/templates/init/rexglue_cmake.inja
++++ b/resources/templates/init/rexglue_cmake.inja
+@@ -85,6 +85,14 @@ macro(rexglue_setup_target target_name)
+             {{ cmake_var("REXGLUE_ENTRYPOINT_INCLUDE_DIR") }}
+         )
+         target_link_libraries({{ cmake_var("target_name") }}_recomp PRIVATE rex::runtime)
++        # A SHARED host (Android: libmain.so) needs PIC objects; toolchains that
++        # default to PIE would otherwise produce non-shareable code.
++        get_target_property(_rexglue_host_type {{ cmake_var("target_name") }} TYPE)
++        if(_rexglue_host_type STREQUAL "SHARED_LIBRARY")
++            set_target_properties({{ cmake_var("target_name") }}_recomp PROPERTIES
++                POSITION_INDEPENDENT_CODE ON)
++        endif()
++        unset(_rexglue_host_type)
+         rexglue_apply_target_settings({{ cmake_var("target_name") }}_recomp)
+         rexglue_apply_recomp_settings({{ cmake_var("target_name") }}_recomp
+             "{{ cmake_var("REXGLUE_ENTRYPOINT_INCLUDE_DIR") }}/{{ names.original }}_pch.h")
+@@ -114,6 +122,17 @@ endmacro()
+ # codegen, including one a project assembles itself rather than taking the
+ # library rexglue_setup_target() builds. The stamp comes first: the DEPFILE
+ # names it.
++#
++# Cross builds (e.g. Android) have no rexglue CLI in the SDK install: codegen
++# must have been run beforehand with the host SDK, and the target is a no-op.
++if(NOT TARGET rex::rexglue)
++    if(NOT REXGLUE_ENTRYPOINT_GENERATED_SOURCES)
++        message(FATAL_ERROR
++            "No rexglue CLI in this SDK (cross build) and no generated sources found. "
++            "Run codegen with the host SDK first.")
++    endif()
++    add_custom_target({{ names.original }}_codegen)
++else()
+ add_custom_command(
+     OUTPUT "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp"
+            {{ cmake_var("REXGLUE_ENTRYPOINT_GENERATED_SOURCES") }}
+@@ -125,6 +144,7 @@ add_custom_command(
+ )
+ add_custom_target({{ names.original }}_codegen
+     DEPENDS "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/codegen.build.stamp")
++endif()
+ 
+ # Include DLL module shared library targets if codegen has generated them
+ if(EXISTS "{{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/{{ entrypoint_out_dir }}/dll_targets.cmake")

@@ -1,0 +1,39 @@
+From 09a3caeb4205455875e2e200f83f7c4d402271c9 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 11:01:18 +0800
+Subject: [PATCH 058/108] gpu: vulkan: diagnostic switch to skip draws by
+ vertex shader hash
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index bbd7908..d25e93d 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -77,6 +77,10 @@ REXCVAR_DEFINE_BOOL(vulkan_gpu_timing, false, "GPU",
+                     "transfers, resolves, texture loads, draws and submissions every 10 s")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_STRING(gpu_debug_skip_vertex_shader, "", "GPU/Vulkan",
++                      "Diagnostics: skip every draw whose vertex shader has this ucode hash (hex)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(vulkan_lr_skip_battle_grey, false, "GPU/Vulkan",
+                     "Lightning Returns, diagnostic only: leave out the battle-exit grey filter "
+                     "overlay, which flickers / shows line noise on Adreno. Hides the symptom; the "
+@@ -4321,6 +4325,15 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       return true;
+     }
+   }
++  // Diagnostics: skip every draw with the given vertex shader ucode hash
++  // (gpu_debug_skip_vertex_shader, hex), to measure what those draws cost.
++  {
++    static const uint64_t skip_vertex_shader_hash =
++        std::strtoull(REXCVAR_GET(gpu_debug_skip_vertex_shader).c_str(), nullptr, 16);
++    if (skip_vertex_shader_hash && vertex_shader->ucode_data_hash() == skip_vertex_shader_hash) {
++      return true;
++    }
++  }
+   // Lightning Returns, diagnostic: the battle-exit grey filter (a blurred,
+   // desaturated full-screen overlay, pixel shader 8DA8D0C5199404FF, drawn after
+   // the frame's crossfade by the blend constant) flickers / shows line noise on

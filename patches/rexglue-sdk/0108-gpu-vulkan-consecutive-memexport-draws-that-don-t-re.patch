@@ -1,0 +1,121 @@
+From 8bbe3396045dd90fdb6f1d0decf2aaf5b7bdb549 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Fri, 13 Nov 2026 07:08:10 +0800
+Subject: [PATCH 108/108] gpu/vulkan: consecutive memexport draws that don't
+ read pending exports share one barrier (vulkan_memexport_coalesce_barriers)
+
+
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index 104bdad..1499431 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -45,7 +45,13 @@ class VulkanSharedMemory : public SharedMemory {
+   };
+   // Inserts a pipeline barrier for the target usage, also ensuring consecutive
+   // read-write accesses are ordered with each other.
+-  void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
++  void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {},
++           bool coalesce_writes = false);
++  // Guest draw writes (memexport) not yet made visible by a barrier.
++  std::pair<uint32_t, uint32_t> pending_written_range() const {
++    return last_usage_ == Usage::kGuestDrawReadWrite ? last_written_range_
++                                                    : std::pair<uint32_t, uint32_t>(0, 0);
++  }
+ 
+   VkBuffer buffer() const { return buffer_; }
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index ddab8be..ce82f6a 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -59,6 +59,11 @@ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_memexport_coalesce_barriers, true, "GPU/Vulkan",
++                    "Consecutive memexport draws whose vertex fetches don't read the memory the "
++                    "previous ones exported share one barrier instead of one each (each ends the "
++                    "render pass on a tiler).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(vulkan_readback_memexport, false, "GPU/Vulkan",
+                     "Read data written by memory export in shaders on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -5409,6 +5414,31 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
++  // Does this draw's vertex fetch read memexport writes that no barrier has covered yet?
++  bool reads_pending_memexport = true;
++  if (REXCVAR_GET(vulkan_memexport_coalesce_barriers)) {
++    reads_pending_memexport = false;
++    const std::pair<uint32_t, uint32_t> pending = shared_memory_->pending_written_range();
++    if (pending.second) {
++      for (uint32_t i = 0;
++           i < rex::countof(constant_map_vertex.vertex_fetch_bitmap) && !reads_pending_memexport;
++           ++i) {
++        uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
++        uint32_t j;
++        while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
++          vfetch_bits_remaining &= ~(uint32_t(1) << j);
++          const VertexBufferState& state = vertex_buffer_states_[i * 32 + j];
++          const uint64_t start = uint64_t(state.address) << 2, length = uint64_t(state.size) << 2;
++          if (length && start < uint64_t(pending.first) + pending.second &&
++              uint64_t(pending.first) < start + length) {
++            reads_pending_memexport = true;
++            break;
++          }
++        }
++      }
++    }
++  }
++
+   // Synchronize the memory pages backing memory scatter export streams, and
+   // calculate the range that includes the streams for the buffer barrier.
+   uint32_t memexport_extent_start = UINT32_MAX, memexport_extent_end = 0;
+@@ -5480,13 +5510,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   if (memexport_extent_start < memexport_extent_end) {
+     shared_memory_->Use(
+         VulkanSharedMemory::Usage::kGuestDrawReadWrite,
+-        std::make_pair(memexport_extent_start, memexport_extent_end - memexport_extent_start));
++        std::make_pair(memexport_extent_start, memexport_extent_end - memexport_extent_start),
++        !reads_pending_memexport);
+   } else if (memexport_writes_possible) {
+     // Stream constants can be invalid or dynamic, making the exact destination
+     // unknown. Keep synchronization conservative similarly to D3D12 UAV
+     // handling for memexport-capable draws.
+     shared_memory_->Use(VulkanSharedMemory::Usage::kGuestDrawReadWrite,
+-                        std::make_pair(0u, SharedMemory::kBufferSize));
++                        std::make_pair(0u, SharedMemory::kBufferSize), !reads_pending_memexport);
+   } else {
+     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
+   }
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index f3fc44a..8e9e603 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -198,10 +198,24 @@ void VulkanSharedMemory::EndSubmission() {
+   upload_buffer_pool_->FlushWrites();
+ }
+ 
+-void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range) {
++void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range,
++                             bool coalesce_writes) {
+   written_range.first = std::min(written_range.first, kBufferSize);
+   written_range.second = std::min(written_range.second, kBufferSize - written_range.first);
+   assert_true(usage != Usage::kRead || !written_range.second);
++  // Consecutive memexport draws that don't read what the previous ones wrote (the caller checks
++  // its vertex fetches against pending_written_range()): no barrier between them, the written
++  // ranges accumulate and the next read, or a draw that reads them, gets one barrier for all.
++  // Lightning Returns' battle starts run ~10,000 such draws; a barrier each ends the render pass
++  // every time on a tiler.
++  if (coalesce_writes && usage == Usage::kGuestDrawReadWrite && last_usage_ == usage &&
++      last_written_range_.second && written_range.second) {
++    const uint32_t start = std::min(last_written_range_.first, written_range.first);
++    const uint32_t end = std::max(last_written_range_.first + last_written_range_.second,
++                                  written_range.first + written_range.second);
++    last_written_range_ = std::make_pair(start, end - start);
++    return;
++  }
+   if (last_usage_ != usage || last_written_range_.second) {
+     VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+     VkAccessFlags src_access_mask, dst_access_mask;

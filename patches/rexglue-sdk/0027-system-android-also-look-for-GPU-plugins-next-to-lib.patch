@@ -1,0 +1,34 @@
+From 00627e1ff60c8ed6176cc2f3e5c31b49a121ec82 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:47:23 +0800
+Subject: [PATCH 027/108] system(android): also look for GPU plugins next to
+ librexruntime.so (behaviour informed by lr-ffxiii-port's Android patch,
+ re-implemented)
+
+After the already-loaded and soname lookups, try the directory that holds
+librexruntime.so (the APK's extracted native library dir) before
+gpu_plugin_dir and the executable folder (which is REX_ANDROID_APP_DIR on
+Android now).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 419af20..30d6138 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -87,8 +87,14 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
+   }
+ #endif
+ 
+-  // 3) gpu_plugin_dir (if set), 4) next to the executable (the default).
++  // 3) Android: the directory holding librexruntime.so (the native library
++  // dir), 4) gpu_plugin_dir (if set), 5) next to the executable (default).
+   std::vector<std::filesystem::path> candidates;
++#if REX_PLATFORM_ANDROID
++  if (auto runtime_path = rex::filesystem::GetExecutablePath(); !runtime_path.empty()) {
++    candidates.push_back(runtime_path.parent_path() / file_name);
++  }
++#endif
+   if (std::string dir = REXCVAR_GET(gpu_plugin_dir); !dir.empty()) {
+     candidates.push_back(std::filesystem::path(dir) / file_name);
+   }

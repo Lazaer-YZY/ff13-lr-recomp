@@ -1,0 +1,32 @@
+From 712fd2436ccc70bcc5e253c3ce733ce940c73a4d Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:36:50 +0800
+Subject: [PATCH 015/108] ui(android): single-app mode so SDL_main finds
+ GetWindowedAppCreator
+
+The inherited Xenia Android multi-app registry (XE_UI_WINDOWED_APPS_IN_LIBRARY)
+removed the GetWindowedAppCreator() declaration that windowed_app_main_sdl.cpp
+needs. ReXGlue builds one game per libmain.so, so Android now uses the same
+REX_DEFINE_APP -> GetWindowedAppCreator path as desktop.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/ui/windowed_app.h b/include/rex/ui/windowed_app.h
+index 50638d6..ebf8cca 100644
+--- a/include/rex/ui/windowed_app.h
++++ b/include/rex/ui/windowed_app.h
+@@ -24,10 +24,10 @@
+ #include <rex/platform.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
+-#if REX_PLATFORM_ANDROID
+-// Multiple apps in a single library instead of separate executables.
+-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
+-#endif
++// Xenia's Android port registered multiple apps in one library
++// (XE_UI_WINDOWED_APPS_IN_LIBRARY). ReXGlue ships one game per libmain.so and
++// enters through SDL_main (windowed_app_main_sdl.cpp), which uses
++// GetWindowedAppCreator() like the desktop builds, so the mode stays off.
+ 
+ namespace rex {
+ namespace ui {

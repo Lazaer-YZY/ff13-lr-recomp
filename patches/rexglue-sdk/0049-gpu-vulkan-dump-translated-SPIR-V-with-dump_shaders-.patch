@@ -1,0 +1,24 @@
+From 6ba73d54111d4d07f258947d266c54c19d3929d7 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 09:10:34 +0800
+Subject: [PATCH 049/108] gpu: vulkan: dump translated SPIR-V with
+ dump_shaders, like the D3D12 backend
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 73276db..0408c3c 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -1478,6 +1478,11 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
+   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
+     return false;
+   }
++  // Dump the SPIR-V (shader_<ucode hash>_<modification>.vk.bin.vert/frag) like
++  // the D3D12 backend does, if desired.
++  if (!REXCVAR_GET(dump_shaders).empty()) {
++    translation.Dump(REXCVAR_GET(dump_shaders), "vk");
++  }
+ 
+   // TODO(Triang3l): Log that the shader has been successfully translated in
+   // common code.

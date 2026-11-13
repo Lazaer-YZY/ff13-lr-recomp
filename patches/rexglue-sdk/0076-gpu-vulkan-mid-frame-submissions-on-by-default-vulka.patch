@@ -1,0 +1,43 @@
+From b482f3061cd1b30df273d42757611757e2481d83 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 08:35:30 +0800
+Subject: [PATCH 076/108] gpu: vulkan: mid-frame submissions on by default
+ (vulkan_submit_on_primary_buffer_end)
+
+Turned off on 2026-11-08 for a title flicker on Qualcomm's v819.2
+driver. On Turnip it causes no flicker (0 of 72 title frames) and, in a
+Luxerion field view, frames shown for exactly 2 refreshes went from
+93.7% to 97.3% (judder frames 98 -> 37 per minute) and GPU busy time
+dropped ~5% at the same clock. The Android app now always runs Turnip.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index a44c4ed..d24e553 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -66,10 +66,11 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
+                     "used placeholder pipelines to avoid visible flashing")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+-REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, false, "GPU/Vulkan",
+-                    "Submit command buffer when PM4 primary buffer ends. Off by default on "
+-                    "Android: with it on, Lightning Returns' title shows a mostly black frame "
+-                    "every 8-16 frames on the Adreno 740 (cause not found yet).")
++REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
++                    "Submit command buffer when PM4 primary buffer ends, so the GPU starts on a "
++                    "frame before its end (on Turnip: steadier frame pacing, less GPU busy time). "
++                    "Qualcomm's v819.2 driver showed a black title frame every 8-16 frames with "
++                    "it; the Android app always runs Turnip on Adreno.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ REXCVAR_DEFINE_UINT32(vulkan_fence_wait_sleep_us, 0, "GPU/Vulkan",
+@@ -877,6 +878,8 @@ bool VulkanCommandProcessor::SetupContext() {
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
++  REXGPU_INFO("VulkanCommandProcessor: mid-frame submissions {}",
++              REXCVAR_GET(vulkan_submit_on_primary_buffer_end) ? "on" : "off");
+ 
+   // The unconditional inclusion of the vertex shader stage also covers the case
+   // of manual index / factor buffer fetch (the system constants and the shared

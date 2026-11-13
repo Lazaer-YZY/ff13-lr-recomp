@@ -1,0 +1,37 @@
+# Game assets never enter the repo
+Input - Data/
+# Read-only reference clones (re-clone with tools/fetch_refs.ps1)
+refs/
+# Build output
+out/
+build/
+generated/
+*.apk
+*.aab
+.gradle/
+local.properties
+# Toolchain & SDK installs live outside the repo (C:\dev)
+# Editors / OS
+.vs/
+.idea/
+*.swp
+Thumbs.db
+# Logs and dumps
+logs/
+*.log
+*.dmp
+# Working SDK fork (changes are exported to patches/rexglue-sdk/)
+sdk/
+# Staged Android native libraries (tools/build_android.sh stage)
+android/app/src/main/jniLibs/
+# the bundled Turnip driver zip (tools/build_android.sh stage)
+android/app/src/main/assets/gpu_driver/
+# the bottom screen's area maps (tools/build_android.sh stage, from the game files)
+android/app/src/main/assets/navimap/
+android/app/src/main/assets/hud/
+android/app/src/main/assets/fonts/
+
+# built locally by tools/native/build_xxh3.sh
+tools/native/*.dll
+tools/native/*.lib
+__pycache__/

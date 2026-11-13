@@ -1,0 +1,51 @@
+From 515b2d4e24cedce982f4715fac52c88c56747b42 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:16:53 +0800
+Subject: [PATCH 002/108] build(android): build SDL3 shared with no desktop
+ Linux backends
+
+SDLActivity loads libSDL3.so via System.loadLibrary, so Android builds
+SDL3-shared only (SDL3::SDL3 aliases it). X11/Wayland/ALSA/Pulse/PipeWire off.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index f102b56..06f7450 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -245,8 +245,16 @@ target_compile_options(imgui PRIVATE -w)
+ # SDL3 - Cross-platform media layer
+ #=============================================================================
+ set(SDL_INSTALL ON CACHE BOOL "" FORCE)
+-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+-set(SDL_STATIC ON CACHE BOOL "" FORCE)
++if(ANDROID)
++    # Android: SDLActivity (Java) System.loadLibrary("SDL3") and SDL's JNI_OnLoad
++    # must live in a loadable .so, so build SDL3 shared only. SDL3::SDL3 then
++    # aliases SDL3-shared and rexui/rexruntime link it unchanged.
++    set(SDL_SHARED ON CACHE BOOL "" FORCE)
++    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
++else()
++    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
++    set(SDL_STATIC ON CACHE BOOL "" FORCE)
++endif()
+ set(SDL_TEST OFF CACHE BOOL "" FORCE)
+ set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+ 
+@@ -290,7 +298,15 @@ set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
+ 
+ # Linux video and audio backends. Both video drivers are always built so the
+ # one in use stays a runtime choice.
+-if(UNIX AND NOT APPLE)
++if(ANDROID)
++    # SDL3 selects its Android video/audio backends itself; make sure no
++    # desktop-Linux backends are requested.
++    set(SDL_X11               OFF CACHE BOOL "" FORCE)
++    set(SDL_WAYLAND           OFF CACHE BOOL "" FORCE)
++    set(SDL_ALSA              OFF CACHE BOOL "" FORCE)
++    set(SDL_PULSEAUDIO        OFF CACHE BOOL "" FORCE)
++    set(SDL_PIPEWIRE          OFF CACHE BOOL "" FORCE)
++elseif(UNIX AND NOT APPLE)
+     set(SDL_X11               ON  CACHE BOOL "" FORCE)
+     set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
+     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)

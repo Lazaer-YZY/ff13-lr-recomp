@@ -1,0 +1,116 @@
+From 0cf3e037c88677cc6d4225d8656bbf0c7694b8ca Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:16:52 +0800
+Subject: [PATCH 001/108] build(android): detect Android before generic UNIX,
+ add REXGLUE_BUILD_TOOLS
+
+Android sets REX_PLATFORM=android-<arch> and defines REX_PLATFORM_ANDROID +
+REX_PLATFORM_LINUX (matching include/rex/platform.h). The host-only codegen
+CLI (src/codegen, src/rexglue) is gated by REXGLUE_BUILD_TOOLS (OFF on Android);
+its install/export rules are made conditional, and the CMake user package
+registry is not written for Android installs.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c9dfc17..34ea739 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -23,6 +23,12 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
+ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
++# Host tools (rexglue codegen CLI). Not meaningful when cross-compiling for Android.
++if(ANDROID)
++    option(REXGLUE_BUILD_TOOLS "Build the rexglue codegen CLI (host tool)" OFF)
++else()
++    option(REXGLUE_BUILD_TOOLS "Build the rexglue codegen CLI (host tool)" ON)
++endif()
+ # Propagate profiling defines globally (compiled out in Release)
+ if(REXGLUE_ENABLE_TRACY)
+     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
+@@ -162,6 +168,17 @@ if(WIN32)
+         message(FATAL_ERROR "Unsupported Windows architecture: ${REX_TARGET_PROCESSOR}")
+     endif()
+     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
++elseif(ANDROID)
++    # Must precede the generic UNIX branch: the NDK toolchain sets UNIX too.
++    # Mirrors include/rex/platform.h (__ANDROID__ -> ANDROID + LINUX, not GNU_LINUX).
++    if(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
++        set(REX_PLATFORM "android-arm64")
++    elseif(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
++        set(REX_PLATFORM "android-amd64")
++    else()
++        message(FATAL_ERROR "Unsupported Android architecture: ${REX_TARGET_PROCESSOR}")
++    endif()
++    add_compile_definitions(REX_PLATFORM_ANDROID=1 REX_PLATFORM_LINUX=1)
+ elseif(UNIX AND NOT APPLE)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "linux-amd64")
+@@ -264,8 +281,10 @@ add_subdirectory(src/audio)
+ add_subdirectory(src/graphics)
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+-add_subdirectory(src/codegen)
+-add_subdirectory(src/rexglue)
++if(REXGLUE_BUILD_TOOLS)
++    add_subdirectory(src/codegen)
++    add_subdirectory(src/rexglue)
++endif()
+ 
+ # Add tests subdirectory if tests are enabled
+ if(REXGLUE_BUILD_TESTS)
+diff --git a/cmake/rexglue_export_targets.cmake b/cmake/rexglue_export_targets.cmake
+index 2d40e1f..385418e 100644
+--- a/cmake/rexglue_export_targets.cmake
++++ b/cmake/rexglue_export_targets.cmake
+@@ -4,7 +4,9 @@ set_target_properties(rexui PROPERTIES EXPORT_NAME ui)
+ set_target_properties(rexinput PROPERTIES EXPORT_NAME input)
+ set_target_properties(rexaudio PROPERTIES EXPORT_NAME audio)
+ set_target_properties(rexruntime PROPERTIES EXPORT_NAME runtime)
+-set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
++if(TARGET rexcodegen)
++    set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
++endif()
+ 
+ set(REXGLUE_INSTALL_TARGETS
+     rexruntime
+diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
+index a003313..0b7a0f1 100644
+--- a/cmake/rexglue_install.cmake
++++ b/cmake/rexglue_install.cmake
+@@ -11,11 +11,13 @@ install(TARGETS ${REXGLUE_INSTALL_TARGETS}
+ )
+ 
+ # A Debug codegen tool runs an order of magnitude slower, so only Release ships.
+-install(TARGETS rexglue
+-    EXPORT rexglueTargets
+-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+-    CONFIGURATIONS Release
+-)
++if(TARGET rexglue)
++    install(TARGETS rexglue
++        EXPORT rexglueTargets
++        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
++        CONFIGURATIONS Release
++    )
++endif()
+ 
+ if(REXGLUE_INSTALL_FIDELITYFX_TARGETS)
+     install(TARGETS ${REXGLUE_INSTALL_FIDELITYFX_TARGETS}
+@@ -150,6 +152,10 @@ install(EXPORT rexglueTargets
+ #
+ # Windows: HKCU\Software\Kitware\CMake\Packages\rexglue  (REG_SZ, value name = MD5 hash)
+ # Unix:    ~/.cmake/packages/rexglue/<hash>               (file containing prefix path)
++#
++# Skipped for Android: a cross-compiled prefix in the host registry would be
++# picked up by host game projects' find_package(rexglue).
++if(NOT ANDROID)
+ install(CODE [[
+     # Normalize path casing on Windows before hashing to avoid duplicate entries
+     if(CMAKE_HOST_WIN32)
+@@ -174,3 +180,4 @@ install(CODE [[
+     message(STATUS "Registered rexglue in CMake user package registry")
+     message(STATUS "  -> ${CMAKE_INSTALL_PREFIX}")
+ ]])
++endif()

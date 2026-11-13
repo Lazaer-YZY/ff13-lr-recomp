@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The game screen: RuntimeActivity hides the system bars. -->
+    <style name="Theme.LightningReturns.Game" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

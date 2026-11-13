@@ -1,0 +1,227 @@
+From 4dc618b3da97d736bb7fc49699cf006c42938a59 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Thu, 12 Nov 2026 23:57:39 +0800
+Subject: [PATCH 107/108] gpu: memexport watches - skip repeated ranges
+ (generation), block-skip watched pages, counters; arm64 counter clock for the
+ frame timers
+
+
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 406d720..254836e 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -189,6 +189,18 @@ class SharedMemory {
+   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
+   uint32_t num_system_page_flags_ = 0;
+ 
++  // Bumped whenever watches are added or validity / page protection may have changed outside
++  // RangeWrittenByGpu (CPU writes, invalidations, cache clears). RangeWrittenByGpu skips a range
++  // it already handled at the same generation: memexport draws re-declare the same destination
++  // after every draw (Lightning Returns' battle starts: ~10,000 draws exporting 32 MB each).
++  uint64_t watch_generation_ = 1;
++  struct RecentGpuWrite {
++    uint32_t start = 0, length = 0;
++    uint64_t generation = 0;
++  };
++  RecentGpuWrite recent_gpu_writes_[4];
++  uint32_t recent_gpu_write_next_ = 0;
++
+   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
+       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
+ 
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 72292e1..2c93662 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -389,8 +389,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+   struct CpFrameStats {
+     uint64_t start_ns = 0, translate_ns = 0, textures_ns = 0, pipeline_ns = 0, rt_update_ns = 0,
+              copy_ns = 0, submit_ns = 0, fence_us = 0, regmem_us_start = 0, primitives_ns = 0,
+-             vertex_buffers_ns = 0, vertex_buffer_bytes = 0;
+-    uint32_t draws = 0, copies = 0;
++             vertex_buffers_ns = 0, vertex_buffer_bytes = 0, memexport_ns = 0, memexport_bytes = 0;
++    uint32_t draws = 0, copies = 0, memexport_draws = 0, memexport_unknown_draws = 0;
+   };
+   CpFrameStats cp_frame_;
+   void CpFrameOnSwap();
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 9a4e59e..ee6ef7e 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -90,6 +90,10 @@ void SharedMemory::ShutdownCommon() {
+ }
+ 
+ void SharedMemory::InvalidateAllPages() {
++  {
++    auto generation_lock = global_critical_region_.Acquire();
++    ++watch_generation_;
++  }
+   auto global_lock = global_critical_region_.Acquire();
+ 
+   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
+@@ -98,6 +102,10 @@ void SharedMemory::InvalidateAllPages() {
+ }
+ 
+ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
++  {
++    auto generation_lock = global_critical_region_.Acquire();
++    ++watch_generation_;
++  }
+   auto global_lock = global_critical_region_.Acquire();
+ 
+   // Pages that are valid only because the CPU uploaded them lose their valid
+@@ -106,6 +114,10 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+ }
+ 
+ void SharedMemory::ClearCache() {
++  {
++    auto generation_lock = global_critical_region_.Acquire();
++    ++watch_generation_;
++  }
+   // Keeping GPU-written data, so "invalidated by GPU".
+   FireWatches(0, (kBufferSize - 1) >> page_size_log2_, true);
+   // No watches now, so no references to the pools accessible by guest threads -
+@@ -167,6 +179,7 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
+   uint32_t bucket_last = watch_page_last << page_size_log2_ >> kWatchBucketSizeLog2;
+ 
+   auto global_lock = global_critical_region_.Acquire();
++  ++watch_generation_;
+ 
+   // Allocate the range.
+   WatchRange* range = watch_range_first_free_;
+@@ -259,6 +272,19 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+     return;
+   }
+   length = std::min(length, kBufferSize - start);
++  // The same range handled since the last change to watches or validity: firing watches,
++  // marking it valid and re-arming its protection would change nothing (no watches were added in
++  // it, nothing invalidated it). See watch_generation_.
++  uint64_t generation;
++  {
++    auto global_lock = global_critical_region_.Acquire();
++    generation = watch_generation_;
++    for (const RecentGpuWrite& recent : recent_gpu_writes_) {
++      if (recent.generation == generation && recent.start == start && recent.length == length) {
++        return;
++      }
++    }
++  }
+   uint32_t end = start + length - 1;
+   uint32_t page_first = start >> page_size_log2_;
+   uint32_t page_last = end >> page_size_log2_;
+@@ -270,6 +296,11 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   // Mark the range as valid (so pages are not reuploaded until modified by the
+   // CPU) and watch it so the CPU can reuse it and this will be caught.
+   MakeRangeValid(start, length, true);
++
++  // Remember it with the generation from before the work: if anything bumped the generation
++  // meanwhile, the entry is stale and the next identical call redoes the work.
++  auto global_lock = global_critical_region_.Acquire();
++  recent_gpu_writes_[recent_gpu_write_next_++ & 3] = RecentGpuWrite{start, length, generation};
+ }
+ 
+ bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
+@@ -498,6 +529,7 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+   uint32_t block_last = page_last >> 6;
+ 
+   auto global_lock = global_critical_region_.Acquire();
++  ++watch_generation_;
+ 
+   if (!exact_range) {
+     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index b942c00..ddab8be 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -144,9 +144,23 @@ REXCVAR_DEFINE_UINT32(vulkan_slow_frame_ms, 30, "GPU",
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ namespace {
+ inline uint64_t CpNowNs() {
++#if defined(__aarch64__)
++  // The architected counter directly (a few ns): the vdso clock_gettime was ~10% of the command
++  // thread's samples with these per-draw timers on (Thor, 2026-11-12). Resolution 1/CNTFRQ
++  // (52 ns at 19.2 MHz), plenty for the per-frame breakdown.
++  static const double ns_per_tick = [] {
++    uint64_t f;
++    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(f));
++    return f ? 1e9 / double(f) : 1.0;
++  }();
++  uint64_t t;
++  __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
++  return uint64_t(double(t) * ns_per_tick);
++#else
+   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count());
++#endif
+ }
+ // Feeds only the "GPU slow frame" breakdown: with vulkan_slow_frame_ms 0 (the Android app's
+ // "Debug logging" off) no clock reads (several per draw, one per vertex fetch).
+@@ -4694,16 +4708,19 @@ void VulkanCommandProcessor::CpFrameOnSwap() {
+     const double total = (now - f.start_ns) / 1e6;
+     const double regmem = (wait_reg_mem_us_total_ - f.regmem_us_start) / 1e3;
+     const double known = (f.translate_ns + f.textures_ns + f.pipeline_ns + f.rt_update_ns +
+-                          f.copy_ns + f.submit_ns + f.primitives_ns + f.vertex_buffers_ns) / 1e6 +
++                          f.copy_ns + f.submit_ns + f.primitives_ns + f.vertex_buffers_ns +
++                          f.memexport_ns) / 1e6 +
+                          f.fence_us / 1e3 + regmem;
+     REXGPU_INFO("GPU slow frame: {:.1f} ms between swaps = shader translation {:.1f} + pipelines "
+                 "{:.1f} + textures {:.1f} + render targets {:.1f} + copies {:.1f} ({}) + submits "
+                 "{:.1f} + fence waits {:.1f} + WAIT_REG_MEM {:.1f} + primitives/indices {:.1f} + "
+-                "vertex buffers {:.1f} ({:.1f} MB requested) + other {:.1f}; {} draws",
++                "vertex buffers {:.1f} ({:.1f} MB requested) + memexport watches {:.1f} ({} draws, "
++                "{} to unknown destinations, {:.1f} MB) + other {:.1f}; {} draws",
+                 total, f.translate_ns / 1e6, f.pipeline_ns / 1e6, f.textures_ns / 1e6,
+                 f.rt_update_ns / 1e6, f.copy_ns / 1e6, f.copies, f.submit_ns / 1e6, f.fence_us / 1e3,
+                 regmem, f.primitives_ns / 1e6, f.vertex_buffers_ns / 1e6,
+-                f.vertex_buffer_bytes / 1048576.0, total - known, f.draws);
++                f.vertex_buffer_bytes / 1048576.0, f.memexport_ns / 1e6, f.memexport_draws,
++                f.memexport_unknown_draws, f.memexport_bytes / 1048576.0, total - known, f.draws);
+   }
+   f = CpFrameStats();
+   f.start_ns = now;
+@@ -5547,13 +5564,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   // Invalidate textures in memexported memory and watch for changes.
+   if (!memexport_ranges_.empty()) {
++    CpScopedTimer memexport_timer(cp_frame_.memexport_ns);
++    ++cp_frame_.memexport_draws;
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
++      cp_frame_.memexport_bytes += memexport_range.size_bytes;
+       shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
+                                         memexport_range.size_bytes);
+     }
+   } else if (memexport_writes_possible) {
+     // Stream constants can be invalid or dynamic, so exact destinations may be
+     // unknown. Keep invalidation conservative in this case.
++    CpScopedTimer memexport_timer(cp_frame_.memexport_ns);
++    ++cp_frame_.memexport_draws;
++    ++cp_frame_.memexport_unknown_draws;
+     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
+   }
+ 
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index e5fff79..e113436 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -2186,6 +2186,20 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+   uint32_t protect_system_page_first = UINT32_MAX;
+   auto global_lock = global_critical_region_.Acquire();
+   for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
++    // A whole block of 64 system pages already watched for invalidation needs nothing: no page
++    // in it can need protection (that requires its notify bit to be clear). Memexport draws
++    // re-arm their (often large) destination after every draw - the busiest code of the GPU
++    // command thread at Lightning Returns' battle starts (2026-11-12) - and walked every page.
++    if (enable_invalidation_notifications && !enable_data_providers && (i & 63) == 0 &&
++        system_page_last - i >= 63 && system_page_flags_[i >> 6].notify_on_invalidation == ~uint64_t(0)) {
++      if (protect_system_page_first != UINT32_MAX) {
++        rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
++                             (i - protect_system_page_first) * system_page_size_, protect_access);
++        protect_system_page_first = UINT32_MAX;
++      }
++      i += 63;
++      continue;
++    }
+     // Check if need to enable callbacks for the page and raise its protection.
+     //
+     // If enabling invalidation notifications:

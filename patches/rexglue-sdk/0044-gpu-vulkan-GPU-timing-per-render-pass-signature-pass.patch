@@ -1,0 +1,381 @@
+From 9d1e2d0834c717d522c53b48e6b6da20d10d76f2 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 07:28:24 +0800
+Subject: [PATCH 044/108] gpu: vulkan: GPU timing per render pass signature,
+ pass end reasons and transfer pairs
+
+With vulkan_gpu_timing, timestamps also split draw and transfer segments
+when the render pass signature (RenderPassKey and pitch) changes, and the
+10-s log adds GPU time, passes and draws per signature, why render pass
+instances end (framebuffer change, barrier kind, forced) and the most
+frequent ownership transfers by source and destination format.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 336b57b..45f5cc6 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -241,6 +241,19 @@ class VulkanCommandProcessor : public CommandProcessor {
+   GpuTimingCategory GpuTimingTransferCategory() const {
+     return gpu_timing_in_resolve_ ? GpuTimingCategory::kResolves : GpuTimingCategory::kTransfers;
+   }
++  // Signature of the next render pass instance for the per-signature GPU time
++  // breakdown: RenderPassKey | pitch tiles at 32bpp << 32; bit 63 marks an
++  // ownership transfer pass, bit 62 a resolve clear pass.
++  void GpuTimingSetPassTag(uint64_t tag) { gpu_timing_pass_tag_ = tag; }
++  // pair: host depth source << 32 | source descriptor << 16 | destination
++  // descriptor (is_depth << 15 | msaa << 13 | resource format << 8 | pitch).
++  void GpuTimingNoteTransfer(uint64_t pair, uint32_t tiles) {
++    if (gpu_timing_enabled_) {
++      auto& t = gpu_timing_transfer_pairs_[pair];
++      ++t.first;
++      t.second += tiles;
++    }
++  }
+   // Cheap CPU counters, always maintained, logged with vulkan_gpu_timing.
+   struct GpuTimingCounters {
+     uint64_t render_passes = 0;
+@@ -264,6 +277,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+     uint64_t render_area_framebuffer_width = 0;
+     uint64_t render_area_framebuffer_height = 0;
+     uint64_t render_area_framebuffer_pixels = 0;
++    // Render pass instance ends by PassEndReason.
++    uint64_t pass_end_reasons[8] = {};
+   };
+   GpuTimingCounters& gpu_timing_counters() { return gpu_timing_counters_; }
+ 
+@@ -938,12 +953,15 @@ class VulkanCommandProcessor : public CommandProcessor {
+     bool closed = false;
+     // Category of the segment that starts at each timestamp.
+     std::vector<uint8_t> categories;
++    // Render pass signature of draw and transfer segments (0 for others).
++    std::vector<uint64_t> tags;
+   };
+   void GpuTimingWriteTimestamp(GpuTimingCategory category);
+   void GpuTimingBeginSubmission();
+   void GpuTimingEndSubmission();
+   void GpuTimingReadCompleted();
+   void GpuTimingOnSwap();
++  void GpuTimingLogPasses(double frames);
+   void GpuTimingShutdown();
+   bool gpu_timing_enabled_ = false;
+   // 0 - not checked yet, 1 - supported, -1 - unsupported.
+@@ -952,6 +970,27 @@ class VulkanCommandProcessor : public CommandProcessor {
+   uint64_t gpu_timing_valid_mask_ = UINT64_MAX;
+   bool gpu_timing_in_resolve_ = false;
+   GpuTimingCategory gpu_timing_segment_category_ = GpuTimingCategory::kCount;
++  uint64_t gpu_timing_pass_tag_ = 0;
++  uint64_t gpu_timing_segment_tag_ = 0;
++  struct GpuTimingTagStats {
++    uint64_t passes = 0;
++    uint64_t draws = 0;
++    double ns = 0.0;
++  };
++  std::unordered_map<uint64_t, GpuTimingTagStats> gpu_timing_tag_stats_;
++  std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> gpu_timing_transfer_pairs_;
++  enum PassEndReason : uint32_t {
++    kPassEndOther,
++    kPassEndFramebuffer,
++    kPassEndForced,
++    kPassEndBarrierRead,
++    kPassEndBarrierAttachment,
++    kPassEndBarrierGeneral,
++    kPassEndBarrierTransfer,
++    kPassEndBarrierBuffer,
++    kPassEndCount,
++  };
++  PassEndReason pass_end_reason_ = kPassEndOther;
+   GpuTimingSubmission gpu_timing_current_;
+   std::vector<GpuTimingSubmission> gpu_timing_free_;
+   std::deque<std::pair<uint64_t, GpuTimingSubmission>> gpu_timing_submitted_;
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 34f7033..6785596 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -115,6 +115,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
+   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
+   const Framebuffer* last_update_framebuffer() const { return last_update_framebuffer_; }
++  uint32_t last_update_framebuffer_pitch_tiles_at_32bpp() const {
++    return last_update_framebuffer_pitch_tiles_at_32bpp_;
++  }
+   void GetLastUpdateRenderingAttachments(VkRenderingAttachmentInfo* color_attachments,
+                                          uint32_t* color_attachment_count_out,
+                                          VkRenderingAttachmentInfo* depth_attachment,
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index de65683..5f8bcc2 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -3078,10 +3078,32 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+   SplitPendingBarrier();
+   if (pending_barriers_.empty()) {
+     if (force_end_render_pass) {
++      pass_end_reason_ = kPassEndForced;
+       EndRenderPass();
+     }
+     return false;
+   }
++  if (in_render_pass_ && gpu_timing_enabled_) {
++    pass_end_reason_ = kPassEndBarrierBuffer;
++    if (!pending_barriers_image_memory_barriers_.empty()) {
++      switch (pending_barriers_image_memory_barriers_.front().newLayout) {
++        case VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:
++        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
++          pass_end_reason_ = kPassEndBarrierRead;
++          break;
++        case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
++        case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
++          pass_end_reason_ = kPassEndBarrierAttachment;
++          break;
++        case VK_IMAGE_LAYOUT_GENERAL:
++          pass_end_reason_ = kPassEndBarrierGeneral;
++          break;
++        default:
++          pass_end_reason_ = kPassEndBarrierTransfer;
++          break;
++      }
++    }
++  }
+   EndRenderPass();
+   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
+     auto it_next = std::next(it);
+@@ -3129,6 +3151,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   }
+ 
+   if (in_render_pass_) {
++    ++gpu_timing_counters_.pass_end_reasons[kPassEndFramebuffer];
+     RenderPassAreaEnd();
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+@@ -3142,6 +3165,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   current_framebuffer_ = framebuffer;
+ 
+   ++gpu_timing_counters_.render_passes;
++  if (gpu_timing_enabled_) {
++    gpu_timing_pass_tag_ =
++        uint64_t(render_target_cache_->last_update_render_pass_key().key) |
++        (uint64_t(render_target_cache_->last_update_framebuffer_pitch_tiles_at_32bpp()) << 32);
++    ++gpu_timing_tag_stats_[gpu_timing_pass_tag_].passes;
++  }
+   GpuTimingMark(GpuTimingCategory::kDraws);
+ 
+   if (use_dynamic_rendering) {
+@@ -3219,6 +3248,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   }
+ 
+   if (in_render_pass_) {
++    ++gpu_timing_counters_.pass_end_reasons[kPassEndFramebuffer];
+     RenderPassAreaEnd();
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+@@ -3234,6 +3264,9 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   // Transfer render passes always load the destination.
+   ++gpu_timing_counters_.render_passes;
+   ++gpu_timing_counters_.render_passes_with_load;
++  if (gpu_timing_enabled_) {
++    ++gpu_timing_tag_stats_[gpu_timing_pass_tag_].passes;
++  }
+   GpuTimingMark(GpuTimingTransferCategory());
+ 
+   if (use_dynamic_rendering) {
+@@ -3300,9 +3333,12 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+ 
+ void VulkanCommandProcessor::EndRenderPass() {
+   assert_true(submission_open_);
++  PassEndReason pass_end_reason = pass_end_reason_;
++  pass_end_reason_ = kPassEndOther;
+   if (!in_render_pass_) {
+     return;
+   }
++  ++gpu_timing_counters_.pass_end_reasons[pass_end_reason];
+   RenderPassAreaEnd();
+   if (current_render_pass_ == VK_NULL_HANDLE) {
+     deferred_command_buffer_.CmdVkEndRendering();
+@@ -3409,8 +3445,12 @@ void VulkanCommandProcessor::RenderPassAreaEnd() {
+ void VulkanCommandProcessor::GpuTimingWriteTimestamp(GpuTimingCategory category) {
+   // Never inside a render pass; consecutive work of one category stays in one
+   // segment.
++  uint64_t tag =
++      (category == GpuTimingCategory::kDraws || category == GpuTimingCategory::kTransfers)
++          ? gpu_timing_pass_tag_
++          : 0;
+   if (in_render_pass_ || gpu_timing_current_.closed ||
+-      category == gpu_timing_segment_category_) {
++      (category == gpu_timing_segment_category_ && tag == gpu_timing_segment_tag_)) {
+     return;
+   }
+   // The last query is reserved for the end of the submission.
+@@ -3422,7 +3462,9 @@ void VulkanCommandProcessor::GpuTimingWriteTimestamp(GpuTimingCategory category)
+   deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                                gpu_timing_current_.pool, query);
+   gpu_timing_current_.categories[query] = uint8_t(category);
++  gpu_timing_current_.tags[query] = tag;
+   gpu_timing_segment_category_ = category;
++  gpu_timing_segment_tag_ = tag;
+ }
+ 
+ void VulkanCommandProcessor::GpuTimingBeginSubmission() {
+@@ -3477,6 +3519,7 @@ void VulkanCommandProcessor::GpuTimingBeginSubmission() {
+       return;
+     }
+     submission.categories.resize(kGpuTimingMaxTimestamps);
++    submission.tags.resize(kGpuTimingMaxTimestamps);
+   }
+   submission.timestamp_count = 0;
+   submission.closed = false;
+@@ -3524,6 +3567,10 @@ void VulkanCommandProcessor::GpuTimingReadCompleted() {
+           uint64_t ticks =
+               (gpu_timing_results_[i + 1] - gpu_timing_results_[i]) & gpu_timing_valid_mask_;
+           gpu_timing_category_ns_[category] += double(ticks) * gpu_timing_period_ns_;
++          if (category == uint8_t(GpuTimingCategory::kDraws) ||
++              category == uint8_t(GpuTimingCategory::kTransfers)) {
++            gpu_timing_tag_stats_[submission.tags[i]].ns += double(ticks) * gpu_timing_period_ns_;
++          }
+         }
+         ++gpu_timing_submissions_measured_;
+       }
+@@ -3550,6 +3597,8 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+     gpu_timing_overflows_ = 0;
+     gpu_timing_frames_ = 0;
+     gpu_timing_counters_ = GpuTimingCounters();
++    gpu_timing_tag_stats_.clear();
++    gpu_timing_transfer_pairs_.clear();
+     if (presenter) {
+       presenter->SetPaintGpuTimingEnabled(true);
+       presenter->TakePaintGpuTiming(paint_ns, paint_count);
+@@ -3610,6 +3659,7 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+         double(c.texture_loads) / frames, double(c.uploads) / frames, double(c.draws) / frames,
+         double(c.submissions) / frames, gpu_timing_submissions_measured_, gpu_timing_overflows_,
+         render_area_info);
++    GpuTimingLogPasses(frames);
+   } else {
+     REXGPU_INFO(
+         "GPU timing ({:.1f} s, {} frames, no timestamps): per frame {:.1f} render passes ({:.1f} "
+@@ -3627,6 +3677,72 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+   gpu_timing_overflows_ = 0;
+   gpu_timing_frames_ = 0;
+   gpu_timing_counters_ = GpuTimingCounters();
++  gpu_timing_tag_stats_.clear();
++  gpu_timing_transfer_pairs_.clear();
++}
++
++void VulkanCommandProcessor::GpuTimingLogPasses(double frames) {
++  const GpuTimingCounters& c = gpu_timing_counters_;
++  const uint64_t* r = c.pass_end_reasons;
++  auto per_frame = [frames](uint64_t value) { return double(value) / frames; };
++  std::vector<std::pair<uint64_t, GpuTimingTagStats>> tags(gpu_timing_tag_stats_.begin(),
++                                                           gpu_timing_tag_stats_.end());
++  std::sort(tags.begin(), tags.end(),
++            [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
++  std::string tags_info;
++  for (size_t i = 0; i < tags.size() && i < 14; ++i) {
++    uint64_t tag = tags[i].first;
++    VulkanRenderTargetCache::RenderPassKey key;
++    key.key = uint32_t(tag);
++    std::string attachments;
++    if (key.depth_and_color_used & 1) {
++      attachments += fmt::format("D{}", uint32_t(key.depth_format));
++    }
++    xenos::ColorRenderTargetFormat color_formats[] = {
++        key.color_0_view_format, key.color_1_view_format, key.color_2_view_format,
++        key.color_3_view_format};
++    for (uint32_t j = 0; j < 4; ++j) {
++      if (key.depth_and_color_used & (uint32_t(2) << j)) {
++        attachments += fmt::format("{}C{}f{}", attachments.empty() ? "" : "+", j,
++                                   uint32_t(color_formats[j]));
++      }
++    }
++    tags_info += fmt::format(" | {}{} {}x p{}: {:.2f} ms {:.1f} passes {:.1f} draws",
++                             (tag >> 63) ? "xfer " : ((tag >> 62) & 1) ? "clear " : "",
++                             attachments.empty() ? "none" : attachments,
++                             uint32_t(1) << uint32_t(key.msaa_samples), uint32_t(tag >> 32) & 0xFF,
++                             tags[i].second.ns / frames * 1.0e-6, per_frame(tags[i].second.passes),
++                             per_frame(tags[i].second.draws));
++  }
++  REXGPU_INFO(
++      "GPU passes per frame: ends by framebuffer change {:.1f}, barrier before texture read "
++      "{:.1f} / attachment use {:.1f} / general {:.1f} / transfer {:.1f} / buffer {:.1f}, forced "
++      "{:.1f}, other {:.1f}; by signature (D/C = depth/color attachment, f = guest format, Nx = "
++      "MSAA, p = pitch tiles at 32bpp){}",
++      per_frame(r[kPassEndFramebuffer]), per_frame(r[kPassEndBarrierRead]),
++      per_frame(r[kPassEndBarrierAttachment]), per_frame(r[kPassEndBarrierGeneral]),
++      per_frame(r[kPassEndBarrierTransfer]), per_frame(r[kPassEndBarrierBuffer]),
++      per_frame(r[kPassEndForced]), per_frame(r[kPassEndOther]), tags_info);
++  std::vector<std::pair<uint64_t, std::pair<uint64_t, uint64_t>>> pairs(
++      gpu_timing_transfer_pairs_.begin(), gpu_timing_transfer_pairs_.end());
++  std::sort(pairs.begin(), pairs.end(),
++            [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
++  auto describe = [](uint32_t d) {
++    return fmt::format("{}{} {}x p{}", (d >> 15) & 1 ? "D" : "C", (d >> 8) & 0x1F,
++                       uint32_t(1) << ((d >> 13) & 3), d & 0xFF);
++  };
++  std::string pairs_info;
++  for (size_t i = 0; i < pairs.size() && i < 12; ++i) {
++    uint64_t pair = pairs[i].first;
++    pairs_info += fmt::format(" | {} -> {}{}: {:.1f} x {:.0f} tiles",
++                              describe(uint32_t(pair >> 16) & 0xFFFF),
++                              describe(uint32_t(pair) & 0xFFFF), (pair >> 32) & 1 ? " +hostdepth" : "",
++                              per_frame(pairs[i].second.first),
++                              double(pairs[i].second.second) /
++                                  double(std::max(pairs[i].second.first, uint64_t(1))));
++  }
++  REXGPU_INFO("GPU transfers per frame (source -> destination, count x average tiles):{}",
++              pairs_info);
+ }
+ 
+ void VulkanCommandProcessor::GpuTimingShutdown() {
+@@ -4509,6 +4625,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   }
+ 
+   ++gpu_timing_counters_.draws;
++  if (gpu_timing_enabled_) {
++    ++gpu_timing_tag_stats_[gpu_timing_pass_tag_].draws;
++  }
+ 
+   // Draw.
+   if (primitive_processing_result.index_buffer_type ==
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 90835e2..8eb7b34 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -4844,6 +4844,19 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+ 
+     if (!current_transfers.empty()) {
+       command_processor_.gpu_timing_counters().transfers += current_transfers.size();
++      auto transfer_descriptor = [](RenderTargetKey k) {
++        return uint32_t(k.is_depth) << 15 | uint32_t(k.msaa_samples) << 13 |
++               (uint32_t(k.resource_format) & 0x1F) << 8 | (k.pitch_tiles_at_32bpp & 0xFF);
++      };
++      for (const Transfer& transfer : current_transfers) {
++        if (transfer.source) {
++          command_processor_.GpuTimingNoteTransfer(
++              uint64_t(transfer.host_depth_source != nullptr) << 32 |
++                  uint64_t(transfer_descriptor(transfer.source->key())) << 16 |
++                  transfer_descriptor(dest_rt_key),
++              transfer.end_tiles - transfer.start_tiles);
++        }
++      }
+       uint32_t dest_pitch_tiles = dest_rt_key.GetPitchTiles();
+       bool dest_is_64bpp = dest_rt_key.Is64bpp();
+ 
+@@ -4971,6 +4984,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+ 
+       // Perform the transfers for the render target.
+ 
++      command_processor_.GpuTimingSetPassTag(
++          (uint64_t(1) << 63) | (uint64_t(dest_rt_key.pitch_tiles_at_32bpp) << 32) |
++          transfer_render_pass_key.key);
+       command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+           transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
+ 
+@@ -5297,6 +5313,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+ 
+     // Perform the clear.
+     if (resolve_clear_needed) {
++      command_processor_.GpuTimingSetPassTag(
++          (uint64_t(1) << 62) | (uint64_t(dest_rt_key.pitch_tiles_at_32bpp) << 32) |
++          transfer_render_pass_key.key);
+       command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+           transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
+       VkClearAttachment resolve_clear_attachment;

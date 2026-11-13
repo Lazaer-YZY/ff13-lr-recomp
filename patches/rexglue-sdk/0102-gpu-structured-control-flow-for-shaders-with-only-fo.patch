@@ -1,0 +1,325 @@
+From d4d022c625f81b78ad017d01379b97cf867f9f02 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Wed, 11 Nov 2026 16:05:14 +0800
+Subject: [PATCH 102/108] gpu: structured control flow for shaders with only
+ forward jumps (spirv_structured_forward_jumps, on)
+
+
+diff --git a/include/rex/graphics/pipeline/shader/shader.h b/include/rex/graphics/pipeline/shader/shader.h
+index 27ce2ba..218a3ae 100644
+--- a/include/rex/graphics/pipeline/shader/shader.h
++++ b/include/rex/graphics/pipeline/shader/shader.h
+@@ -876,6 +876,9 @@ class Shader {
+ 
+   // Labels that jumps (explicit or from loops) can be done to.
+   const std::set<uint32_t>& label_addresses() const { return label_addresses_; }
++  // Only forward jumps, no calls / returns, only empty loops: translatable without the program
++  // counter loop (SpirvShaderTranslator, spirv_structured_forward_jumps).
++  bool cf_forward_only() const { return cf_forward_only_; }
+ 
+   // Exclusive upper bound of the indexes of paired control flow instructions
+   // (each corresponds to 3 dwords).
+@@ -1010,6 +1013,7 @@ class Shader {
+   std::vector<TextureBinding> texture_bindings_;
+   ConstantRegisterMap constant_register_map_ = {};
+   std::set<uint32_t> label_addresses_;
++  bool cf_forward_only_ = false;
+   uint32_t cf_pair_index_bound_ = 0;
+   uint32_t register_static_address_bound_ = 0;
+   uint32_t writes_interpolators_ = 0;
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index 90d18ed..ed1edf9 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -657,6 +657,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
+   // Closes conditionals opened by exec and instructions within them (but not by
+   // labels) and updates the state accordingly.
+   void CloseExecConditionals();
++  // Forward-jump control flow (cf_forward_mode_): opens "if (no jump pending)" around the following
++  // code, and closes all such guards (at labels and at the end).
++  void OpenForwardJumpGuard();
++  void CloseForwardJumpGuards();
+ 
+   spv::Id GetStorageAddressingIndex(InstructionStorageAddressingMode addressing_mode,
+                                     uint32_t storage_index, bool is_float_constant = false);
+@@ -1126,6 +1130,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
+   std::unique_ptr<spv::Instruction> main_switch_op_;
+   spv::Block* main_switch_merge_;
+   std::vector<spv::Id> main_switch_next_pc_phi_operands_;
++  // Whether the program counter switch is used (labels, and not cf_forward_mode_).
++  bool cf_main_switch_ = false;
++  // Structured control flow for shaders with only forward jumps (Shader::cf_forward_only,
++  // spirv_structured_forward_jumps): no program counter loop; a jump stores its target in
++  // var_main_forward_target_ (0 = none), the code after it and after each label is guarded by
++  // "no jump pending", and a label clears a pending jump to it. Without the loop, the guest
++  // registers need no loop-carried copies, and dead outputs (binning pass) can be eliminated.
++  bool cf_forward_mode_ = false;
++  spv::Id var_main_forward_target_ = spv::NoResult;
++  std::vector<spv::Block*> cf_forward_guard_merges_;
+ 
+   // If the exec bool constant / predicate conditional is open, block after it
+   // (not added to the function yet).
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 8bbf2c7..2da26f6 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -33,6 +33,12 @@ REXCVAR_DEFINE_BOOL(vulkan_shared_memory_texel_buffer, true, "GPU/Vulkan",
+                     "128/256 MB (Adreno/Turnip), instead of selecting one of several storage "
+                     "buffers per load")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(spirv_structured_forward_jumps, true, "GPU/Vulkan",
++                    "Shaders whose jumps all go forward (no calls, only empty loops): structured "
++                    "if-blocks guarded by a pending jump target instead of the program counter "
++                    "loop with a switch (no loop-carried register copies; the binning vertex "
++                    "shader can drop code that does not feed the position)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ namespace rex::graphics {
+ 
+@@ -641,8 +647,19 @@ void SpirvShaderTranslator::StartTranslation() {
+   builder_->createBranch(main_loop_header_);
+ 
+   // If no jumps, don't create a switch, but still create a loop so exece can
+-  // break.
+-  bool has_main_switch = !current_shader().label_addresses().empty();
++  // break. Forward-only control flow doesn't need the switch either.
++  cf_forward_mode_ = REXCVAR_GET(spirv_structured_forward_jumps) &&
++                     !current_shader().label_addresses().empty() &&
++                     current_shader().cf_forward_only();
++  cf_forward_guard_merges_.clear();
++  var_main_forward_target_ = spv::NoResult;
++  if (cf_forward_mode_) {
++    var_main_forward_target_ =
++        builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
++                                 "xe_var_forward_jump_target", const_int_0_);
++  }
++  bool has_main_switch = !current_shader().label_addresses().empty() && !cf_forward_mode_;
++  cf_main_switch_ = has_main_switch;
+ 
+   // Main loop header - based on whether it's the first iteration (entered from
+   // the function or from the continuation), choose the program counter.
+@@ -665,6 +682,10 @@ void SpirvShaderTranslator::StartTranslation() {
+ 
+   // Main loop body.
+   builder_->setBuildPoint(&main_loop_body);
++  if (cf_forward_mode_) {
++    // The rectangle-list fallback runs the body once per source vertex: no jump pending at start.
++    builder_->createStore(const_int_0_, var_main_forward_target_);
++  }
+   if (has_main_switch) {
+     // Create the program counter switch with cases for every label and for
+     // label 0.
+@@ -694,7 +715,8 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+   if (!is_depth_only_fragment_shader_) {
+     // Close flow control within the last switch case.
+     CloseExecConditionals();
+-    bool has_main_switch = !current_shader().label_addresses().empty();
++    CloseForwardJumpGuards();
++    bool has_main_switch = cf_main_switch_;
+     // After the final exec (if it happened to be not exece, which would already
+     // have a break branch), break from the switch if it exists, or from the
+     // loop it doesn't.
+@@ -1333,6 +1355,23 @@ void SpirvShaderTranslator::ProcessLabel(uint32_t cf_index) {
+     return;
+   }
+ 
++  if (cf_forward_mode_) {
++    // Reachable by falling through (nothing pending) or by a jump to this label: clear it, then
++    // guard the following code against jumps still pending to later labels.
++    CloseExecConditionals();
++    CloseForwardJumpGuards();
++    EnsureBuildPointAvailable();
++    spv::Id target = builder_->createLoad(var_main_forward_target_, spv::NoPrecision);
++    builder_->createStore(
++        builder_->createTriOp(spv::OpSelect, type_int_,
++                              builder_->createBinOp(spv::OpIEqual, type_bool_, target,
++                                                    builder_->makeIntConstant(int(cf_index))),
++                              const_int_0_, target),
++        var_main_forward_target_);
++    OpenForwardJumpGuard();
++    return;
++  }
++
+   assert_false(current_shader().label_addresses().empty());
+ 
+   // Close flow control within the previous switch case.
+@@ -1363,8 +1402,7 @@ void SpirvShaderTranslator::ProcessExecInstructionEnd(const ParsedExecInstructio
+     // Break out of the main switch (if exists) and the main loop.
+     CloseInstructionPredication();
+     if (!builder_->getBuildPoint()->isTerminated()) {
+-      builder_->createBranch(current_shader().label_addresses().empty() ? main_loop_merge_
+-                                                                        : main_switch_merge_);
++      builder_->createBranch(cf_main_switch_ ? main_switch_merge_ : main_loop_merge_);
+     }
+   }
+   UpdateExecConditionals(instr.type, instr.bool_constant_index, instr.condition);
+@@ -1373,6 +1411,11 @@ void SpirvShaderTranslator::ProcessExecInstructionEnd(const ParsedExecInstructio
+ void SpirvShaderTranslator::ProcessLoopStartInstruction(const ParsedLoopStartInstruction& instr) {
+   // loop il<idx>, L<idx> - loop with loop data il<idx>, end @ L<idx>
+ 
++  if (cf_forward_mode_) {
++    // Only empty loops (Shader::cf_forward_only): nothing to run, no state that outlives it.
++    return;
++  }
++
+   // Loop control is outside execs - actually close the last exec.
+   CloseExecConditionals();
+ 
+@@ -1463,6 +1506,10 @@ void SpirvShaderTranslator::ProcessLoopStartInstruction(const ParsedLoopStartIns
+ void SpirvShaderTranslator::ProcessLoopEndInstruction(const ParsedLoopEndInstruction& instr) {
+   // endloop il<idx>, L<idx> - end loop w/ data il<idx>, head @ L<idx>
+ 
++  if (cf_forward_mode_) {
++    return;  // Empty loop, see ProcessLoopStartInstruction.
++  }
++
+   // Loop control is outside execs - actually close the last exec.
+   CloseExecConditionals();
+ 
+@@ -1599,6 +1646,15 @@ void SpirvShaderTranslator::ProcessJumpInstruction(const ParsedJumpInstruction&
+     // Unreachable for some reason.
+     return;
+   }
++  if (cf_forward_mode_) {
++    // Forward jump: remember the target (within this jump's condition), and skip everything until
++    // the label that clears it.
++    builder_->createStore(builder_->makeIntConstant(int(instr.target_address)),
++                          var_main_forward_target_);
++    CloseExecConditionals();
++    OpenForwardJumpGuard();
++    return;
++  }
+   main_switch_next_pc_phi_operands_.push_back(builder_->makeIntConstant(int(instr.target_address)));
+   main_switch_next_pc_phi_operands_.push_back(builder_->getBuildPoint()->getId());
+   builder_->createBranch(main_loop_continue_);
+@@ -3483,6 +3539,35 @@ void SpirvShaderTranslator::CloseInstructionPredication() {
+   cf_instruction_predicate_merge_ = nullptr;
+ }
+ 
++void SpirvShaderTranslator::OpenForwardJumpGuard() {
++  assert_true(cf_forward_mode_);
++  EnsureBuildPointAvailable();
++  spv::Id no_jump_pending =
++      builder_->createBinOp(spv::OpIEqual, type_bool_,
++                            builder_->createLoad(var_main_forward_target_, spv::NoPrecision),
++                            const_int_0_);
++  spv::Block* merge = new spv::Block(builder_->getUniqueId(), builder_->getBuildPoint()->getParent());
++  builder_->createSelectionMerge(merge, spv::SelectionControlDontFlattenMask);
++  spv::Block& inner_block = builder_->makeNewBlock();
++  builder_->createConditionalBranch(no_jump_pending, &inner_block, merge);
++  builder_->setBuildPoint(&inner_block);
++  cf_forward_guard_merges_.push_back(merge);
++}
++
++void SpirvShaderTranslator::CloseForwardJumpGuards() {
++  // Innermost first; the exec / instruction conditionals inside must be closed already.
++  while (!cf_forward_guard_merges_.empty()) {
++    spv::Block* merge = cf_forward_guard_merges_.back();
++    cf_forward_guard_merges_.pop_back();
++    spv::Block& inner_block = *builder_->getBuildPoint();
++    if (!inner_block.isTerminated()) {
++      builder_->createBranch(merge);
++    }
++    inner_block.getParent().addBlock(merge);
++    builder_->setBuildPoint(merge);
++  }
++}
++
+ void SpirvShaderTranslator::CloseExecConditionals() {
+   // Within the exec - instruction-level predicate check.
+   CloseInstructionPredication();
+diff --git a/src/graphics/pipeline/shader/translator.cpp b/src/graphics/pipeline/shader/translator.cpp
+index e3c1b0e..bbd419d 100644
+--- a/src/graphics/pipeline/shader/translator.cpp
++++ b/src/graphics/pipeline/shader/translator.cpp
+@@ -58,6 +58,11 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+   // Gather the upper bound of the control flow instructions, and label
+   // addresses, which are needed for disassembly.
+   cf_pair_index_bound_ = uint32_t(ucode_data_.size() / 3);
++  // Whether the control flow can be translated without the program counter loop
++  // (cf_forward_only): only forward jumps, no calls / returns, and only empty
++  // loops (loop at k, endloop at k + 1 - no-ops).
++  cf_forward_only_ = true;
++  std::vector<std::pair<uint32_t, uint32_t>> cf_loop_starts, cf_loop_ends;  // index, address
+   for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
+     ControlFlowInstruction cf_ab[2];
+     UnpackControlFlowInstructions(ucode_data_.data() + i * 3, cf_ab);
+@@ -69,24 +74,46 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+       if (IsControlFlowOpcodeExec(cf.opcode())) {
+         cf_pair_index_bound_ = std::min(cf_pair_index_bound_, cf.exec.address());
+       }
++      const uint32_t cf_index = i * 2 + j;
+       switch (cf.opcode()) {
+         case ControlFlowOpcode::kCondCall:
+           label_addresses_.insert(cf.cond_call.address());
++          cf_forward_only_ = false;
++          break;
++        case ControlFlowOpcode::kReturn:
++          cf_forward_only_ = false;
+           break;
+         case ControlFlowOpcode::kCondJmp:
+           label_addresses_.insert(cf.cond_jmp.address());
++          if (cf.cond_jmp.address() <= cf_index) {
++            cf_forward_only_ = false;
++          }
+           break;
+         case ControlFlowOpcode::kLoopStart:
+           label_addresses_.insert(cf.loop_start.address());
++          cf_loop_starts.emplace_back(cf_index, cf.loop_start.address());
+           break;
+         case ControlFlowOpcode::kLoopEnd:
+           label_addresses_.insert(cf.loop_end.address());
++          cf_loop_ends.emplace_back(cf_index, cf.loop_end.address());
+           break;
+         default:
+           break;
+       }
+     }
+   }
++  if (cf_loop_starts.size() != cf_loop_ends.size()) {
++    cf_forward_only_ = false;
++  } else {
++    for (size_t i = 0; i < cf_loop_starts.size() && cf_forward_only_; ++i) {
++      // loop at k (exits to k + 2), endloop at k + 1 (loops back to k + 1): nothing in the body.
++      uint32_t k = cf_loop_starts[i].first;
++      if (cf_loop_starts[i].second != k + 2 || cf_loop_ends[i].first != k + 1 ||
++          cf_loop_ends[i].second != k + 1) {
++        cf_forward_only_ = false;
++      }
++    }
++  }
+ 
+   // Disassemble and gather information.
+   ucode_disasm_buffer.Reset();
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 0df9cd5..6d9fb18 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -70,6 +70,7 @@ REXCVAR_DECLARE(bool, vulkan_shader_xenos_multiply);
+ REXCVAR_DECLARE(bool, vulkan_shader_xenos_multiply_vertex);
+ REXCVAR_DECLARE(bool, vulkan_texture_fetch_implicit_lod);
+ REXCVAR_DECLARE(bool, vulkan_shared_memory_texel_buffer);
++REXCVAR_DECLARE(bool, spirv_structured_forward_jumps);
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_pipeline_libraries, true, "GPU/Vulkan",
+                     "Link guest pipelines from per-stage libraries (VK_EXT_graphics_pipeline_"
+@@ -3975,7 +3976,8 @@ uint64_t FragmentLibraryKeyHash(uint64_t pixel_shader_hash, uint64_t pixel_shade
+       uint32_t(REXCVAR_GET(spirv_texture_sign_branch)) |
+       (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply)) << 1) |
+       (uint32_t(REXCVAR_GET(vulkan_texture_fetch_implicit_lod)) << 2) |
+-      (uint32_t(SpirvShaderTranslator::IsTextureSignSpecializationEnabled()) << 3);
++      (uint32_t(SpirvShaderTranslator::IsTextureSignSpecializationEnabled()) << 3) |
++      (uint32_t(REXCVAR_GET(spirv_structured_forward_jumps)) << 4);
+   key.texture_sign_classes = texture_sign_classes;
+   return XXH3_64bits(&key, sizeof(key));
+ }
+@@ -5320,7 +5322,8 @@ void VulkanPipelineCache::PrecompileThread() {
+                                 (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply)) << 9) |
+                                 (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply_vertex)) << 10) |
+                                 (uint32_t(REXCVAR_GET(vulkan_texture_fetch_implicit_lod)) << 11) |
+-                                (uint32_t(REXCVAR_GET(vulkan_shared_memory_texel_buffer)) << 13);
++                                (uint32_t(REXCVAR_GET(vulkan_shared_memory_texel_buffer)) << 13) |
++                                (uint32_t(REXCVAR_GET(spirv_structured_forward_jumps)) << 14);
+   std::memcpy(marker + 24, &precompile_version, 4);
+   if (FILE* file = rex::filesystem::OpenFile(precompile_marker_path_, "rb")) {
+     uint8_t existing[28];

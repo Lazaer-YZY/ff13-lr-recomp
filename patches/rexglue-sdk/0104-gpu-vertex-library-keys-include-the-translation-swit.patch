@@ -1,0 +1,49 @@
+From 71cbc6e11f2efc5d397d7b5bb264beeea0b16d9e Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Wed, 11 Nov 2026 18:10:21 +0800
+Subject: [PATCH 104/108] gpu: vertex library keys include the translation
+ switches (stale keys made draws compile on the command thread); precompile
+ version 5
+
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 8508466..90999b2 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -4228,12 +4228,25 @@ uint64_t VulkanPipelineCache::PreRasterizationLibraryKeyHash(uint64_t vertex_sha
+     uint32_t geometry_shader_key = 0;
+     uint64_t vertex_shader_hash;
+     uint64_t vertex_shader_modification;
++    // The vertex shader SPIR-V depends on translator switches (the driver cache is keyed by it):
++    // part of the key, so the library list never claims a library of another translation. Without
++    // them, after the structured-jump switch the list claimed every vertex library, draws linked
++    // "cached" libraries on the command thread and the driver compiled them there (130-150 ms
++    // stalls, 2026-11-11).
++    uint32_t translation_switches;
++    uint32_t reserved = 0;
+   } key;
+   key.vertex_shader_hash = vertex_shader_hash;
+   key.vertex_shader_modification = vertex_shader_modification;
+-  // Vertex texture sign classes above the kind (0 = runtime: the same key as before).
++  // Vertex texture sign classes above the kind (0 = runtime).
+   key.kind |= vertex_texture_sign_classes << 8;
+   key.geometry_shader_key = geometry_shader_key;
++  key.translation_switches =
++      uint32_t(REXCVAR_GET(spirv_texture_sign_branch)) |
++      (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply)) << 1) |
++      (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply_vertex)) << 2) |
++      (uint32_t(REXCVAR_GET(vulkan_shared_memory_texel_buffer)) << 3) |
++      (uint32_t(REXCVAR_GET(spirv_structured_forward_jumps)) << 4);
+   return XXH3_64bits(&key, sizeof(key));
+ }
+ 
+@@ -5388,7 +5401,8 @@ void VulkanPipelineCache::PrecompileThread() {
+   // the marker - a change rebuilds the libraries here, in the background, instead of compiling
+   // them while the game runs (the driver cache is keyed by the SPIR-V).
+   // 4: fragment library keys include the translation switches and texture sign classes.
+-  uint32_t precompile_version = 4 | (uint32_t(REXCVAR_GET(spirv_texture_sign_branch)) << 8) |
++  // 5: vertex (pre-rasterization) libraries too, with the translation switches in their keys.
++  uint32_t precompile_version = 5 | (uint32_t(REXCVAR_GET(spirv_texture_sign_branch)) << 8) |
+                                 (uint32_t(SpirvShaderTranslator::IsTextureSignSpecializationEnabled())
+                                  << 12) |
+                                 (uint32_t(REXCVAR_GET(vulkan_shader_xenos_multiply)) << 9) |

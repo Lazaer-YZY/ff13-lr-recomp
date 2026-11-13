@@ -1,0 +1,663 @@
+From 70732251021529702cafa0268f36e9aadf444a45 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sun, 8 Nov 2026 13:53:17 +0800
+Subject: [PATCH 063/108] gpu: skip ownership transfers a full-rectangle clear
+ overwrites; feed fully-resolved textures; sync diagnostics
+
+- gpu_skip_overwritten_transfers (default 0 for now): when the draw that needs
+  an ownership transfer into a depth render target is a single screen-space
+  rectangle (rectangle list, quad list or 4-vertex strip) writing depth with
+  ALWAYS, with no alpha test / alpha-to-mask / pixel kill and a full MSAA
+  sample mask, the rectangle it covers is cut out of the transfer (reusing the
+  resolve-clear cut-out). 1 = only if the stencil is replaced as well, 2 = also
+  when the stencil isn't written. Lightning Returns clears its shadow-map
+  cascades and its 4x "clear trick" target this way. The rectangle comes from
+  DrawExtentEstimator::EstimateRectangleCoverage (vertex shader on the CPU,
+  rectangle lists completed via the longest edge as Xenia expands them,
+  clipped draws limited to the viewport and to depth inside the clip volume).
+- Resolve feed: a resolve covering the whole single-level texture feeds it
+  even if it was already outdated.
+- Diagnostics (off): gpu_log_transfer_draws now prints why no cut-out was made;
+  vulkan_resolve_full_barrier_before_copy, vulkan_rt_barrier_new_pass,
+  vulkan_submission_start_full_barrier.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 3bbd52e..8357fba 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -173,6 +173,8 @@ class RenderTargetCache {
+ 
+   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+                       uint32_t normalized_color_mask, const Shader& vertex_shader);
++  // The pixel shader of the draw for the next Update (whether it may discard).
++  void SetUpdatePixelShader(const Shader* pixel_shader) { update_pixel_shader_ = pixel_shader; }
+ 
+   // Returns bits where 0 is whether a depth render target is currently bound on
+   // the host and 1... are whether the same applies to color render targets, and
+@@ -496,6 +498,11 @@ class RenderTargetCache {
+     assert_true(GetPath() == Path::kHostRenderTargets);
+     return last_update_transfers_;
+   }
++  // Pixels of the depth render target that the current draw overwrites
++  // completely (gpu_skip_overwritten_transfers), not transferred - or nullptr.
++  const Transfer::Rectangle* last_update_transfer_cutout() const {
++    return last_update_transfer_cutout_valid_ ? &last_update_transfer_cutout_ : nullptr;
++  }
+ 
+   HostDepthStoreRenderTargetConstant GetHostDepthStoreRenderTargetConstant(
+       uint32_t pitch_tiles, bool msaa_2x_supported) const {
+@@ -554,6 +561,9 @@ class RenderTargetCache {
+   uint32_t draw_resolution_scale_y_;
+ 
+   DrawExtentEstimator draw_extent_estimator_;
++  const Shader* update_pixel_shader_ = nullptr;
++  Transfer::Rectangle last_update_transfer_cutout_ = {};
++  bool last_update_transfer_cutout_valid_ = false;
+ 
+   // For host render targets.
+ 
+diff --git a/include/rex/graphics/util/draw_extent_estimator.h b/include/rex/graphics/util/draw_extent_estimator.h
+index e5e4908..a7effcb 100644
+--- a/include/rex/graphics/util/draw_extent_estimator.h
++++ b/include/rex/graphics/util/draw_extent_estimator.h
+@@ -30,6 +30,14 @@ class DrawExtentEstimator {
+   // The shader must have its ucode analyzed.
+   uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
+   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
++  // For a draw of a single axis-aligned rectangle (a 1-rectangle rectangle
++  // list, a 1-quad quad list, or a 4-vertex triangle strip), runs the vertex
++  // shader on the CPU and returns the pixels the rectangle covers fully (right
++  // and bottom exclusive, window offset and viewport clipping applied, scissor
++  // not applied). reject_out (optional) tells why not, for diagnostics.
++  bool EstimateRectangleCoverage(const Shader& vertex_shader, int32_t& left_out,
++                                 int32_t& top_out, int32_t& right_out, int32_t& bottom_out,
++                                 uint32_t* reject_out = nullptr);
+ 
+  private:
+   class PositionYExportSink : public ShaderInterpreter::ExportSink {
+@@ -38,18 +46,24 @@ class DrawExtentEstimator {
+                 uint32_t value_mask) override;
+ 
+     void Reset() {
++      position_x_.reset();
++      position_z_.reset();
+       position_y_.reset();
+       position_w_.reset();
+       point_size_.reset();
+       vertex_kill_.reset();
+     }
+ 
++    const std::optional<float>& position_x() const { return position_x_; }
++    const std::optional<float>& position_z() const { return position_z_; }
+     const std::optional<float>& position_y() const { return position_y_; }
+     const std::optional<float>& position_w() const { return position_w_; }
+     const std::optional<float>& point_size() const { return point_size_; }
+     const std::optional<uint32_t>& vertex_kill() const { return vertex_kill_; }
+ 
+    private:
++    std::optional<float> position_x_;
++    std::optional<float> position_z_;
+     std::optional<float> position_y_;
+     std::optional<float> position_w_;
+     std::optional<float> point_size_;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index d83fb1d..89200b8 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -194,6 +194,10 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // If not started yet, begins a render pass from the render target cache.
+   // Submission must be open.
+   void AttachmentBarrierBetweenPasses();
++  bool IsInRenderTargetCacheRenderPass(
++      const VulkanRenderTargetCache::Framebuffer* framebuffer) const {
++    return in_render_pass_ && current_framebuffer_ == framebuffer;
++  }
+   void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+       VkRenderPass render_pass, const VulkanRenderTargetCache::Framebuffer* framebuffer);
+   // Overload for transfer operations with dynamic rendering.
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index 16809c7..c4a7bb7 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -28,6 +28,15 @@
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ 
++REXCVAR_DEFINE_UINT32(gpu_skip_overwritten_transfers, 0, "GPU",
++                      "Skip ownership transfers into the part of a depth render target that "
++                      "the draw needing them overwrites completely (a single screen-space "
++                      "rectangle with depth test ALWAYS and depth write). 1 = only if the "
++                      "stencil is overwritten too, 2 = also if the stencil isn't written "
++                      "(its old bits are then not transferred).");
++REXCVAR_DEFINE_BOOL(gpu_log_transfer_draws, false, "GPU",
++                    "Diagnostic: log each distinct ownership transfer situation once with "
++                    "the state of the draw that needs it.");
+ REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
+                     "Clamp MRT EDRAM used range to minimum");
+ 
+@@ -689,11 +698,127 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   // draw with whatever contents currently are in the render target in this
+   // case).
+ 
++  // A draw that overwrites a whole rectangle of the depth render target (games
++  // clear with a rectangle drawn with depth ALWAYS) doesn't need the previous
++  // contents of that rectangle: cut it out of the ownership transfers.
++  last_update_transfer_cutout_valid_ = false;
++  // Why the cut-out wasn't made (for gpu_log_transfer_draws): 1 = not a depth-only draw with
++  // depth ALWAYS + write, 2 = stencil not overwritten, 3 = may discard, 4 = not a full
++  // screen-space rectangle, 5 = empty after the scissor.
++  uint32_t cutout_reject = 1;
++  uint32_t skip_overwritten_transfers = REXCVAR_GET(gpu_skip_overwritten_transfers);
++  if (skip_overwritten_transfers && !interlock_barrier_only && is_rasterization_done &&
++      depth_and_color_rts_used_bits == 0b1 && normalized_depth_control.z_enable &&
++      normalized_depth_control.z_write_enable &&
++      normalized_depth_control.zfunc == xenos::CompareFunction::kAlways) {
++    bool overwrites = true;
++    if (normalized_depth_control.stencil_enable) {
++      auto stencil_overwritten = [&](xenos::CompareFunction func, xenos::StencilOp zpass,
++                                     Register ref_mask_reg) {
++        return func == xenos::CompareFunction::kAlways && zpass == xenos::StencilOp::kReplace &&
++               regs.Get<reg::RB_STENCILREFMASK>(ref_mask_reg).stencilwritemask == 0xFF;
++      };
++      overwrites = stencil_overwritten(normalized_depth_control.stencilfunc,
++                                       normalized_depth_control.stencilzpass,
++                                       XE_GPU_REG_RB_STENCILREFMASK) &&
++                   (!normalized_depth_control.backface_enable ||
++                    stencil_overwritten(normalized_depth_control.stencilfunc_bf,
++                                        normalized_depth_control.stencilzpass_bf,
++                                        XE_GPU_REG_RB_STENCILREFMASK_BF));
++    } else {
++      overwrites = skip_overwritten_transfers >= 2;
++    }
++    cutout_reject = overwrites ? 3 : 2;
++    auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
++    if ((rb_colorcontrol.alpha_test_enable &&
++         rb_colorcontrol.alpha_func != xenos::CompareFunction::kAlways) ||
++        rb_colorcontrol.alpha_to_mask_enable ||
++        (update_pixel_shader_ && update_pixel_shader_->kills_pixels()) ||
++        (msaa_samples != xenos::MsaaSamples::k1X &&
++         (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) != 0xFFFF)) {
++      overwrites = false;
++    }
++    int32_t left, top, right, bottom;
++    uint32_t rectangle_reject = 0;
++    if (overwrites && !draw_extent_estimator_.EstimateRectangleCoverage(
++                          vertex_shader, left, top, right, bottom, &rectangle_reject)) {
++      // 40 + the rectangle estimation reason.
++      cutout_reject = 40 + rectangle_reject;
++    } else if (overwrites) {
++      draw_util::Scissor scissor;
++      draw_util::GetScissor(regs, scissor);
++      left = std::max(left, int32_t(scissor.offset[0]));
++      top = std::max(top, int32_t(scissor.offset[1]));
++      right = std::min(right, int32_t(scissor.offset[0] + scissor.extent[0]));
++      bottom = std::min(bottom, int32_t(scissor.offset[1] + scissor.extent[1]));
++      cutout_reject = 5;
++      if (right > left && bottom > top) {
++        cutout_reject = 0;
++        last_update_transfer_cutout_.x_pixels = uint32_t(left);
++        last_update_transfer_cutout_.y_pixels = uint32_t(top);
++        last_update_transfer_cutout_.width_pixels = uint32_t(right - left);
++        last_update_transfer_cutout_.height_pixels = uint32_t(bottom - top);
++        last_update_transfer_cutout_valid_ = true;
++      }
++    }
++  }
++
+   for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+     const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
+     uint32_t rt_bit_index = rt_base_index.second;
+     ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+-                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
++                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index],
++                    (rt_bit_index == 0 && last_update_transfer_cutout_valid_)
++                        ? &last_update_transfer_cutout_
++                        : nullptr);
++  }
++
++  // Diagnostic: each distinct ownership transfer situation once, with the state
++  // of the draw that needs it (to find transfers the draw fully overwrites).
++  if (REXCVAR_GET(gpu_log_transfer_draws) && !interlock_barrier_only) {
++    static std::unordered_set<uint64_t> logged_situations;
++    auto draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
++      uint32_t rt_bit_index = edram_bases_sorted[i].second;
++      const std::vector<Transfer>& transfers = last_update_transfers_[rt_bit_index];
++      if (transfers.empty() || logged_situations.size() >= 400) {
++        continue;
++      }
++      uint32_t tiles = 0;
++      std::string sources;
++      uint64_t hash = rt_keys[rt_bit_index].key * 0x9E3779B97F4A7C15ull;
++      for (const Transfer& transfer : transfers) {
++        tiles += transfer.end_tiles - transfer.start_tiles;
++        if (transfer.source) {
++          sources += fmt::format(" [{} {}-{}]", transfer.source->key().GetDebugName(),
++                                 transfer.start_tiles, transfer.end_tiles);
++          hash = (hash ^ transfer.source->key().key) * 0x100000001B3ull;
++        }
++        hash = (hash ^ transfer.start_tiles ^ (uint64_t(transfer.end_tiles) << 16)) * 0x100000001B3ull;
++      }
++      hash = (hash ^ normalized_depth_control.value) * 0x100000001B3ull;
++      hash = (hash ^ normalized_color_mask ^ (uint64_t(draw_initiator.value) << 32)) *
++             0x100000001B3ull;
++      if (!logged_situations.insert(hash).second) {
++        continue;
++      }
++      REXGPU_INFO("Transfer into {} ({} tiles, rt range {}):{} | draw: prim {} indices {} "
++                  "height {} | z en {} wr {} func {} | stencil en {} func {} ops {}/{}/{} | "
++                  "color mask {:08X} | cut-out {} {},{} {}x{} (used bits {:X})",
++                  rt_keys[rt_bit_index].GetDebugName(), tiles, rt_lengths_tiles[i], sources,
++                  uint32_t(draw_initiator.prim_type), uint32_t(draw_initiator.num_indices),
++                  height_used, uint32_t(normalized_depth_control.z_enable),
++                  uint32_t(normalized_depth_control.z_write_enable),
++                  uint32_t(normalized_depth_control.zfunc),
++                  uint32_t(normalized_depth_control.stencil_enable),
++                  uint32_t(normalized_depth_control.stencilfunc),
++                  uint32_t(normalized_depth_control.stencilfail),
++                  uint32_t(normalized_depth_control.stencilzpass),
++                  uint32_t(normalized_depth_control.stencilzfail), normalized_color_mask,
++                  cutout_reject, last_update_transfer_cutout_.x_pixels,
++                  last_update_transfer_cutout_.y_pixels, last_update_transfer_cutout_.width_pixels,
++                  last_update_transfer_cutout_.height_pixels, depth_and_color_rts_used_bits);
++    }
+   }
+ 
+   if (interlock_barrier_only) {
+diff --git a/src/graphics/util/draw_extent_estimator.cpp b/src/graphics/util/draw_extent_estimator.cpp
+index b321b49..352f3f7 100644
+--- a/src/graphics/util/draw_extent_estimator.cpp
++++ b/src/graphics/util/draw_extent_estimator.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cmath>
+ #include <cfloat>
+ #include <cstdint>
+ 
+@@ -19,6 +20,7 @@
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/format/ucode.h>
+ #include <rex/graphics/registers.h>
++#include <rex/logging.h>
+ #include <rex/graphics/util/draw_extent_estimator.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/memory.h>
+@@ -67,6 +69,12 @@ namespace rex::graphics {
+ void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister export_register,
+                                                       const float* value, uint32_t value_mask) {
+   if (export_register == ucode::ExportRegister::kVSPosition) {
++    if (value_mask & 0b0001) {
++      position_x_ = value[0];
++    }
++    if (value_mask & 0b0100) {
++      position_z_ = value[2];
++    }
+     if (value_mask & 0b0010) {
+       position_y_ = value[1];
+     }
+@@ -255,6 +263,216 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
+          8;
+ }
+ 
++bool DrawExtentEstimator::EstimateRectangleCoverage(const Shader& vertex_shader,
++                                                    int32_t& left_out, int32_t& top_out,
++                                                    int32_t& right_out, int32_t& bottom_out,
++                                                    uint32_t* reject_out) {
++  // Reject reasons: 1 primitive / index source / shader, 2 vertex kill or no
++  // position, 3 w or z outside the clip volume, 4 not an axis-aligned
++  // rectangle, 5 empty.
++  uint32_t reject_dummy;
++  uint32_t& reject = reject_out ? *reject_out : reject_dummy;
++  reject = 1;
++  const RegisterFile& regs = register_file_;
++  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++  uint32_t vertex_count;
++  switch (vgt_draw_initiator.prim_type) {
++    case xenos::PrimitiveType::kRectangleList:
++      vertex_count = 3;
++      break;
++    case xenos::PrimitiveType::kQuadList:
++    case xenos::PrimitiveType::kTriangleStrip:
++      vertex_count = 4;
++      break;
++    default:
++      return false;
++  }
++  if (vgt_draw_initiator.num_indices != vertex_count ||
++      (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA &&
++       vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex) ||
++      xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) ||
++      !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
++    return false;
++  }
++  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
++  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
++  auto pa_cl_clip_cntl = regs.Get<reg::PA_CL_CLIP_CNTL>();
++  bool clipped = !pa_cl_clip_cntl.clip_disable;
++  auto vgt_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
++  const void* index_buffer = nullptr;
++  xenos::Endian index_endian = vgt_dma_size.swap_mode;
++  bool index_32 = vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32;
++  if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
++    if (vgt_dma_size.num_words < vertex_count) {
++      return false;
++    }
++    uint32_t index_buffer_base = regs[XE_GPU_REG_VGT_DMA_BASE];
++    if (!index_32) {
++      if (index_endian == xenos::Endian::k8in32) {
++        index_endian = xenos::Endian::k8in16;
++      } else if (index_endian == xenos::Endian::k16in32) {
++        index_endian = xenos::Endian::kNone;
++      }
++      index_buffer_base &= ~uint32_t(1);
++    } else {
++      index_buffer_base &= ~uint32_t(3);
++    }
++    index_buffer = memory_.TranslatePhysical(index_buffer_base);
++  }
++  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
++  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
++  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
++  float x_scale =
++      pa_cl_vte_cntl.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f;
++  float x_offset =
++      pa_cl_vte_cntl.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f;
++  float y_scale =
++      pa_cl_vte_cntl.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f;
++  float y_offset =
++      pa_cl_vte_cntl.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
++  // To pixel-center-at-0.5 coordinates.
++  float center_offset =
++      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
++  float window_x = 0.0f, window_y = 0.0f;
++  if (pa_su_sc_mode_cntl.vtx_window_offset_enable) {
++    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
++    window_x = float(pa_sc_window_offset.window_x_offset);
++    window_y = float(pa_sc_window_offset.window_y_offset);
++  }
++  float xs[4], ys[4];
++  reject = 2;
++  shader_interpreter_.SetShader(vertex_shader);
++  PositionYExportSink sink;
++  shader_interpreter_.SetExportSink(&sink);
++  bool valid = true;
++  for (uint32_t i = 0; i < vertex_count; ++i) {
++    uint32_t vertex_index = i;
++    if (index_buffer) {
++      vertex_index = index_32 ? static_cast<const uint32_t*>(index_buffer)[i]
++                              : static_cast<const uint16_t*>(index_buffer)[i];
++      vertex_index = xenos::GpuSwap(vertex_index, index_endian) & 0xFFFFFF;
++    }
++    vertex_index =
++        std::min(max_index, std::max(min_index, (vertex_index + index_offset) & 0xFFFFFF));
++    sink.Reset();
++    shader_interpreter_.temp_registers()[0] = float(vertex_index);
++    shader_interpreter_.Execute();
++    if (sink.vertex_kill().has_value() && (sink.vertex_kill().value() & ~(UINT32_C(1) << 31))) {
++      reject = 20;
++      valid = false;
++      break;
++    }
++    if (!sink.position_x().has_value() || !sink.position_y().has_value()) {
++      reject = 21 + uint32_t(sink.position_x().has_value());
++      valid = false;
++      break;
++    }
++    float x = sink.position_x().value(), y = sink.position_y().value();
++    if (!pa_cl_vte_cntl.vtx_xy_fmt || clipped) {
++      if (!sink.position_w().has_value() || !(sink.position_w().value() > 0.0f)) {
++        reject = sink.position_w().has_value() ? 3 : 24;
++        valid = false;
++        break;
++      }
++    }
++    if (clipped) {
++      // The whole rectangle must be inside the near / far planes (otherwise
++      // it's clipped by depth, not only to the viewport).
++      if (!sink.position_z().has_value()) {
++        reject = 23;
++        valid = false;
++        break;
++      }
++      float z = sink.position_z().value(), w = sink.position_w().value();
++      if (!(z <= w && z >= (pa_cl_clip_cntl.dx_clip_space_def ? 0.0f : -w))) {
++        reject = 3;
++        valid = false;
++        break;
++      }
++    }
++    if (!pa_cl_vte_cntl.vtx_xy_fmt) {
++      x /= sink.position_w().value();
++      y /= sink.position_w().value();
++    }
++    xs[i] = x * x_scale + x_offset + center_offset + window_x;
++    ys[i] = y * y_scale + y_offset + center_offset + window_y;
++    if (!std::isfinite(xs[i]) || !std::isfinite(ys[i])) {
++      reject = 25;
++      valid = false;
++      break;
++    }
++  }
++  shader_interpreter_.SetExportSink(nullptr);
++  if (!valid) {
++    return false;
++  }
++  // The vertex opposite to v0 (for the bowtie check below).
++  uint32_t opposite_of_0 =
++      vgt_draw_initiator.prim_type == xenos::PrimitiveType::kQuadList ? 2 : 3;
++  if (vertex_count == 3) {
++    // Rectangle list: the longest edge is the diagonal, the fourth corner is
++    // its endpoints minus the right-angle corner (as Xenia expands them).
++    float d01 = (xs[1] - xs[0]) * (xs[1] - xs[0]) + (ys[1] - ys[0]) * (ys[1] - ys[0]);
++    float d02 = (xs[2] - xs[0]) * (xs[2] - xs[0]) + (ys[2] - ys[0]) * (ys[2] - ys[0]);
++    float d12 = (xs[2] - xs[1]) * (xs[2] - xs[1]) + (ys[2] - ys[1]) * (ys[2] - ys[1]);
++    uint32_t corner = (d12 >= d01 && d12 >= d02) ? 0 : (d02 >= d01 ? 1 : 2);
++    uint32_t a = corner == 0 ? 1 : 0, b = corner == 2 ? 1 : 2;
++    xs[3] = xs[a] + xs[b] - xs[corner];
++    ys[3] = ys[a] + ys[b] - ys[corner];
++    // The derived corner is opposite to the right-angle one by construction.
++    opposite_of_0 = UINT32_MAX;
++  }
++  float x0 = std::min(std::min(xs[0], xs[1]), std::min(xs[2], xs[3]));
++  float x1 = std::max(std::max(xs[0], xs[1]), std::max(xs[2], xs[3]));
++  float y0 = std::min(std::min(ys[0], ys[1]), std::min(ys[2], ys[3]));
++  float y1 = std::max(std::max(ys[0], ys[1]), std::max(ys[2], ys[3]));
++  // Every vertex must be a distinct corner of the bounding box (an axis-aligned
++  // rectangle).
++  uint32_t corners = 0;
++  for (uint32_t i = 0; i < 4; ++i) {
++    bool at_x0 = xs[i] == x0, at_x1 = xs[i] == x1, at_y0 = ys[i] == y0, at_y1 = ys[i] == y1;
++    if (at_x0 == at_x1 || at_y0 == at_y1) {
++      reject = 4;
++      return false;
++    }
++    corners |= uint32_t(1) << (uint32_t(at_x1) | (uint32_t(at_y1) << 1));
++  }
++  if (corners != 0b1111) {
++    reject = 4;
++    return false;
++  }
++  // The two triangles must not form a bowtie: the vertex opposite to v0 is v3
++  // for rectangle lists (derived) and triangle strips, v2 for quad lists.
++  if (opposite_of_0 != UINT32_MAX &&
++      (xs[opposite_of_0] == xs[0] || ys[opposite_of_0] == ys[0])) {
++    reject = 4;
++    return false;
++  }
++  if (clipped) {
++    // Clipping to the viewport (the guard band only avoids clipping the
++    // primitive, it's still rasterized only within the viewport).
++    float viewport_x0 = x_offset - std::abs(x_scale) + center_offset + window_x;
++    float viewport_x1 = x_offset + std::abs(x_scale) + center_offset + window_x;
++    float viewport_y0 = y_offset - std::abs(y_scale) + center_offset + window_y;
++    float viewport_y1 = y_offset + std::abs(y_scale) + center_offset + window_y;
++    x0 = std::max(x0, viewport_x0);
++    x1 = std::min(x1, viewport_x1);
++    y0 = std::max(y0, viewport_y0);
++    y1 = std::min(y1, viewport_y1);
++  }
++  reject = 5;
++  // Pixel i is covered if its center i + 0.5 is in [x0, x1).
++  left_out = int32_t(std::ceil(x0 - 0.5f));
++  right_out = int32_t(std::ceil(x1 - 0.5f));
++  top_out = int32_t(std::ceil(y0 - 0.5f));
++  bottom_out = int32_t(std::ceil(y1 - 0.5f));
++  if (right_out <= left_out || bottom_out <= top_out) {
++    return false;
++  }
++  reject = 0;
++  return true;
++}
++
+ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
+                                            const Shader& vertex_shader) {
+   SCOPE_profile_cpu_f("gpu");
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index f423cfe..52fa7db 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -65,6 +65,9 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
+                     "Submit command buffer when PM4 primary buffer ends")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_submission_start_full_barrier, false, "GPU/Vulkan",
++                    "Diagnostic: a full pipeline barrier at the start of every submission.");
++
+ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
+                     "device (falls back to render passes otherwise)")
+@@ -4582,6 +4585,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
++  render_target_cache_->SetUpdatePixelShader(pixel_shader);
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
+     return draw_fail("render_target_update");
+@@ -5916,6 +5920,16 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     // the end of the submission (when async pipeline object creation requests
+     // are fulfilled).
+     deferred_command_buffer_.Reset();
++    if (REXCVAR_GET(vulkan_submission_start_full_barrier)) {
++      // Diagnostic: order everything in this submission after everything in the
++      // previous ones.
++      VkMemoryBarrier full_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++      full_barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++      full_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++      deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                                                    VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
++                                                    &full_barrier, 0, nullptr, 0, nullptr);
++    }
+ 
+     // Reset cached state of the command buffer.
+     dynamic_viewport_update_needed_ = true;
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 59b0119..623e687 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -45,6 +45,11 @@ REXCVAR_DEFINE_BOOL(gpu_debug_skip_transfers, false, "GPU/Vulkan",
+ REXCVAR_DEFINE_UINT32(gpu_debug_skip_transfers_mask, 0, "GPU/Vulkan",
+                       "Diagnostics: skip ownership transfers by direction, bits: 1 = color "
+                       "to color, 2 = color to depth, 4 = depth to color, 8 = depth to depth.");
++REXCVAR_DEFINE_BOOL(vulkan_resolve_full_barrier_before_copy, false, "GPU/Vulkan",
++                    "Diagnostic: a full pipeline barrier right before every resolve copy.");
++REXCVAR_DEFINE_BOOL(vulkan_rt_barrier_new_pass, false, "GPU/Vulkan",
++                    "Diagnostic: attachment -> attachment image barriers for the render "
++                    "targets of every new guest render pass instance.");
+ REXCVAR_DEFINE_BOOL(vulkan_resolve_clear_full_barrier, false, "GPU/Vulkan",
+                     "Diagnostic: full pipeline barriers before and after every resolve clear.");
+ REXCVAR_DEFINE_UINT32(vulkan_resolve_feed_debug, 0, "GPU/Vulkan",
+@@ -1503,6 +1508,16 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+           }
+           command_processor_.GpuTimingRestoreOpTag(resolve_op_tag);
+           command_processor_.SubmitBarriers(true);
++          if (REXCVAR_GET(vulkan_resolve_full_barrier_before_copy)) {
++            // Diagnostic: wait for and make visible everything before the
++            // resolve reads the render target.
++            VkMemoryBarrier full_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++            full_barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++            full_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++            command_buffer.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
++                                                &full_barrier, 0, nullptr, 0, nullptr);
++          }
+           command_processor_.GpuTimingMark(VulkanCommandProcessor::GpuTimingCategory::kResolves);
+           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+ 
+@@ -1748,7 +1763,8 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+           last_update_accumulated_render_targets();
+ 
+       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+-                                       depth_and_color_render_targets, last_update_transfers());
++                                       depth_and_color_render_targets, last_update_transfers(),
++                                       nullptr, last_update_transfer_cutout());
+ 
+       if (depth_and_color_render_targets[0]) {
+         render_pass_key.depth_and_color_used |= 1 << 0;
+@@ -1833,8 +1849,15 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+             ui::vulkan::util::InitializeSubresourceRange(
+                 i ? VK_IMAGE_ASPECT_COLOR_BIT
+                   : (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)),
+-            vulkan_rt.src_stage_mask(rt_dst_stage_mask), rt_dst_stage_mask, vulkan_rt.src_access_mask(rt_dst_stage_mask),
+-            rt_dst_access_mask, vulkan_rt.current_layout(), rt_new_layout);
++            vulkan_rt.src_stage_mask(rt_dst_stage_mask), rt_dst_stage_mask,
++            vulkan_rt.src_access_mask(rt_dst_stage_mask), rt_dst_access_mask,
++            vulkan_rt.current_layout(), rt_new_layout,
++            VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED,
++            // Diagnostic (vulkan_rt_barrier_new_pass): a real attachment ->
++            // attachment image barrier whenever a new render pass instance will
++            // begin, even if the usage doesn't change.
++            !(REXCVAR_GET(vulkan_rt_barrier_new_pass) &&
++              !command_processor_.IsInRenderTargetCacheRenderPass(framebuffer)));
+         vulkan_rt.SetUsage(rt_dst_stage_mask, rt_dst_access_mask, rt_new_layout);
+       }
+     } break;
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 185992a..2f7db05 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -2439,10 +2439,6 @@ bool VulkanTextureCache::PrepareResolveFeed(const draw_util::ResolveInfo& resolv
+       host_format.format_unsigned.block_compressed) {
+     return reject("host format", host_format.format_unsigned.format);
+   }
+-  // Must be valid now: only this resolve's write may make it outdated.
+-  if (texture->outdated_mask()) {
+-    return reject("texture already outdated", texture->outdated_mask());
+-  }
+   if (!static_cast<VulkanTexture*>(texture)->feed_attachment()) {
+     return reject("texture can't be drawn into");
+   }
+@@ -2454,15 +2450,24 @@ bool VulkanTextureCache::PrepareResolveFeed(const draw_util::ResolveInfo& resolv
+     return reject("dest offset outside", uint64_t(dest_x) << 32 | uint32_t(dest_y),
+                   uint64_t(texture_width) << 32 | texture_height);
+   }
++  uint32_t width = std::min(uint32_t(resolve_info.coordinate_info.width_div_8 * 8),
++                            texture_width - uint32_t(dest_x));
++  uint32_t height =
++      std::min(uint32_t(resolve_info.height_div_8 * 8), texture_height - uint32_t(dest_y));
++  // The texture must be valid now (only this resolve's write may make it
++  // outdated), unless the resolve overwrites all of it (fed textures have a
++  // single level).
++  if (texture->outdated_mask() &&
++      (dest_x || dest_y || width < texture_width || height < texture_height)) {
++    return reject("texture already outdated, resolve covers part",
++                  texture->outdated_mask(), uint64_t(width) << 32 | height);
++  }
+   feed_out.texture = static_cast<VulkanTexture*>(texture);
+   feed_out.swap_red_blue = dest_info.copy_dest_swap != 0;
+   feed_out.dest_x = dest_x;
+   feed_out.dest_y = dest_y;
+-  feed_out.width =
+-      std::min(uint32_t(resolve_info.coordinate_info.width_div_8 * 8),
+-               texture_width - uint32_t(dest_x));
+-  feed_out.height =
+-      std::min(uint32_t(resolve_info.height_div_8 * 8), texture_height - uint32_t(dest_y));
++  feed_out.width = width;
++  feed_out.height = height;
+   return feed_out.width && feed_out.height;
+ }
+ 

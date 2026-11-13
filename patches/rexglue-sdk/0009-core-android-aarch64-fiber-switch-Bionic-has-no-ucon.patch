@@ -1,0 +1,162 @@
+From 67d6b945431984bcf157f68410dd82a9b12a9368 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:22:44 +0800
+Subject: [PATCH 009/108] core(android): aarch64 fiber switch (Bionic has no
+ ucontext functions)
+
+Bionic does not implement getcontext/makecontext/swapcontext. On Android the
+Fiber stores a saved SP and switches with a small asm routine that saves and
+restores the AAPCS64 callee-saved registers (x19-x30, d8-d15). New fibers
+start in Fiber::Trampoline via a prepared frame on their stack. Other
+platforms keep the ucontext path unchanged (Trampoline was only moved).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index 352af67..417ba13 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -20,7 +20,9 @@
+ // before including <ucontext.h>.
+ #define _XOPEN_SOURCE 700
+ #endif
++#if !REX_PLATFORM_ANDROID
+ #include <ucontext.h>
++#endif
+ #include <cstdint>
+ #include <vector>
+ #endif
+@@ -57,7 +59,13 @@ struct Fiber {
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_ANDROID
++  // Bionic has no getcontext/makecontext/swapcontext; fiber_posix.cpp uses a
++  // small aarch64 callee-saved-register switch and stores the saved SP here.
++  void* sp_ = nullptr;
++#else
+   ucontext_t context_{};
++#endif
+   std::vector<uint8_t> stack_;
+   void (*entry_)(void*) = nullptr;
+   void* arg_ = nullptr;
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 4fe1ca6..5df0d82 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -27,6 +27,94 @@ namespace rex::thread {
+ 
+ thread_local Fiber* Fiber::tls_current_ = nullptr;
+ 
++/*static*/ void Fiber::Trampoline() {
++  // tls_current_ was updated by SwitchTo before swapcontext returned here.
++  Fiber* f = tls_current_;
++  f->entry_(f->arg_);
++#if REX_PLATFORM_ANDROID
++  // Entered via ret with no caller frame: returning is undefined (as with
++  // uc_link == nullptr on the ucontext path), so fail loudly.
++  __builtin_trap();
++#endif
++}
++
++#if REX_PLATFORM_ANDROID
++#if !REX_ARCH_ARM64
++#error "Android fibers are only implemented for arm64"
++#endif
++
++// Bionic lacks the ucontext functions. rex_fiber_switch(&from->sp_, to->sp_)
++// saves the AAPCS64 callee-saved state (x19-x30, d8-d15) on the current stack,
++// stores SP, loads the target SP, restores its state and returns into it.
++extern "C" void rex_fiber_switch(void** save_sp, void* load_sp);
++asm(R"(
++  .text
++  .p2align 4
++  .globl rex_fiber_switch
++  .hidden rex_fiber_switch
++  .type rex_fiber_switch, %function
++rex_fiber_switch:
++  sub sp, sp, #160
++  stp x19, x20, [sp, #0]
++  stp x21, x22, [sp, #16]
++  stp x23, x24, [sp, #32]
++  stp x25, x26, [sp, #48]
++  stp x27, x28, [sp, #64]
++  stp x29, x30, [sp, #80]
++  stp d8, d9, [sp, #96]
++  stp d10, d11, [sp, #112]
++  stp d12, d13, [sp, #128]
++  stp d14, d15, [sp, #144]
++  mov x2, sp
++  str x2, [x0]
++  mov sp, x1
++  ldp x19, x20, [sp, #0]
++  ldp x21, x22, [sp, #16]
++  ldp x23, x24, [sp, #32]
++  ldp x25, x26, [sp, #48]
++  ldp x27, x28, [sp, #64]
++  ldp x29, x30, [sp, #80]
++  ldp d8, d9, [sp, #96]
++  ldp d10, d11, [sp, #112]
++  ldp d12, d13, [sp, #128]
++  ldp d14, d15, [sp, #144]
++  add sp, sp, #160
++  ret
++  .size rex_fiber_switch, .-rex_fiber_switch
++)");
++
++Fiber* Fiber::ConvertCurrentThread() {
++  auto* f = new Fiber();  // sp_ is filled by the first SwitchTo away from it.
++  f->is_thread_fiber_ = true;
++  tls_current_ = f;
++  return f;
++}
++
++Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++  auto* f = new Fiber();
++  f->entry_ = entry;
++  f->arg_ = arg;
++  f->stack_.resize(stack_size);
++  auto top = reinterpret_cast<uintptr_t>(f->stack_.data() + f->stack_.size()) & ~uintptr_t(15);
++  auto* frame = reinterpret_cast<uint64_t*>(top - 160);
++  for (int i = 0; i < 20; ++i) {
++    frame[i] = 0;
++  }
++  // First switch "returns" into Trampoline (x30 slot, [sp, #88]) with SP at the
++  // 16-byte aligned top of the fiber stack; x29 = 0 terminates frame chains.
++  frame[11] = reinterpret_cast<uint64_t>(&Fiber::Trampoline);
++  f->sp_ = frame;
++  return f;
++}
++
++void Fiber::SwitchTo(Fiber* target) {
++  Fiber* from = tls_current_;
++  tls_current_ = target;
++  rex_fiber_switch(&from->sp_, target->sp_);
++}
++
++#else  // !REX_PLATFORM_ANDROID
++
+ Fiber* Fiber::ConvertCurrentThread() {
+   auto* f = new Fiber();
+   if (getcontext(&f->context_) == -1) {
+@@ -56,18 +144,14 @@ Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
+   return f;
+ }
+ 
+-/*static*/ void Fiber::Trampoline() {
+-  // tls_current_ was updated by SwitchTo before swapcontext returned here.
+-  Fiber* f = tls_current_;
+-  f->entry_(f->arg_);
+-}
+-
+ void Fiber::SwitchTo(Fiber* target) {
+   Fiber* from = tls_current_;
+   tls_current_ = target;
+   swapcontext(&from->context_, &target->context_);
+ }
+ 
++#endif  // REX_PLATFORM_ANDROID
++
+ void Fiber::Destroy() {
+   // Thread fibers are destroyed from the owning thread itself.
+   if (is_thread_fiber_) {

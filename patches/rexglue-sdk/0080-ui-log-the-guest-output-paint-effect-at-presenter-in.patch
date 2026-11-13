@@ -1,0 +1,21 @@
+From dbaee7a9ad2a9e860336891ce64a3b25be85392c Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 9 Nov 2026 10:59:39 +0800
+Subject: [PATCH 080/108] ui: log the guest output paint effect at presenter
+ initialization
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 32c8a10..2b501b6 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -812,6 +812,8 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
+   {
+     std::lock_guard<std::mutex> config_lock(guest_output_paint_config_mutex_);
+     guest_output_paint_config_ = BuildGuestOutputPaintConfigFromCVar();
++    REXLOG_INFO("Presenter: guest output effect '{}' (present_effect), dither {}",
++                REXCVAR_GET(present_effect), guest_output_paint_config_.GetDither());
+   }
+ 
+   // Initialize UI frame rate limiting.

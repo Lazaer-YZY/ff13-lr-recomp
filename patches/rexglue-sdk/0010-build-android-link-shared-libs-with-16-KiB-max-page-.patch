@@ -1,0 +1,57 @@
+From 5943d056263201dce68c044843ee871fddcc8bdc Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 14:22:44 +0800
+Subject: [PATCH 010/108] build(android): link shared libs with 16 KiB
+ max-page-size
+
+rexruntime, rexgpu-xenos and SDL3-shared get -Wl,-z,max-page-size=16384 on
+Android for 16 KiB-page devices.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index da7ae1a..4fd4ce3 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -113,6 +113,11 @@ target_include_directories(rexgpu-xenos PRIVATE
+ 
+ target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)
+ 
++if(ANDROID)
++    # 16 KiB-page-device compatible ELF segment alignment.
++    target_link_options(rexgpu-xenos PRIVATE -Wl,-z,max-page-size=16384)
++endif()
++
+ rex_target_pch(rexgpu-xenos
+     <mutex>
+     <unordered_map>
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index 05979a3..dfcdd1d 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -108,6 +108,11 @@ if(REXGLUE_ENABLE_PERF_COUNTERS)
+         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
+ endif()
+ 
++if(ANDROID)
++    # 16 KiB-page-device compatible ELF segment alignment.
++    target_link_options(rexruntime PRIVATE -Wl,-z,max-page-size=16384)
++endif()
++
+ if(WIN32)
+     target_link_libraries(rexruntime PRIVATE ws2_32)
+     target_link_libraries(rexruntime PUBLIC dxgi dxguid)
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index 06f7450..597a784 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -318,6 +318,9 @@ elseif(UNIX AND NOT APPLE)
+ endif()
+ 
+ add_subdirectory(sdl3)
++if(ANDROID AND TARGET SDL3-shared)
++    target_link_options(SDL3-shared PRIVATE -Wl,-z,max-page-size=16384)
++endif()
+ 
+ #=============================================================================
+ # DXC API headers (vendored from DirectXShaderCompiler, runtime-loaded)

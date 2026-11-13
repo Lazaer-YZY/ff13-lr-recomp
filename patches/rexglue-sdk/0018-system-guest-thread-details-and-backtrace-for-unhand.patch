@@ -1,0 +1,113 @@
+From 2f79cbabf07a6a0dae10ed642e9f63d838db5ae3 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 16:37:40 +0800
+Subject: [PATCH 018/108] system: guest thread details and backtrace for
+ unhandled guest AVs
+
+- XThread::DescribeCurrentForFault (registered by Runtime::Setup as the fault
+  context provider) adds the guest thread name, id, entry address, start
+  context and the last stored PPC lr/r1/r3-r5.
+- Memory::AccessViolationCallback logs the full crash context right after
+  'Unhandled guest access violation' and still returns false, so the fault
+  propagates exactly as before.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/include/rex/system/xthread.h b/include/rex/system/xthread.h
+index a72911e..178f9ca 100644
+--- a/include/rex/system/xthread.h
++++ b/include/rex/system/xthread.h
+@@ -317,6 +317,10 @@ class XThread : public XObject {
+   static uint32_t GetCurrentThreadHandle();
+   static uint32_t GetCurrentThreadId();
+ 
++  // Fault-report provider (rex::arch::SetFaultContextProvider): appends the
++  // current guest thread's name/id/entry and last stored PPC registers.
++  static void DescribeCurrentForFault(std::string& out);
++
+   // If the title is terminating and this is a running guest thread, self-exits
+   // via Exit(0) and DOES NOT RETURN. Called from the kernel wait primitives.
+   static void CheckTitleTermination();
+@@ -333,6 +337,7 @@ class XThread : public XObject {
+   bool is_running() const { return running_; }
+ 
+   uint32_t thread_id() const { return thread_id_; }
++  const std::string& thread_name() const { return thread_name_; }
+   uint32_t last_error();
+   void set_last_error(uint32_t error_code);
+   void set_name(const std::string_view name);
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index c10694c..80e477c 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
++#include <rex/exception_handler.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
+ #include <rex/filesystem/vfs.h>
+@@ -94,6 +95,8 @@ X_STATUS Runtime::Setup(RuntimeConfig config) {
+     return X_STATUS_UNSUCCESSFUL;
+   }
+   instance_ = this;
++  // Guest thread details for crash reports of unresolved host faults.
++  rex::arch::SetFaultContextProvider(&system::XThread::DescribeCurrentForFault);
+ 
+   auto fail = [this](X_STATUS status, std::string_view reason) {
+     REXSYS_ERROR("Runtime::Setup failed: {}", reason);
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 76cc877..d0a97c9 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/exception_handler.h>
+ #include <rex/assert.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+@@ -547,6 +548,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
+         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
+         rex::thread::current_thread_id());
++    // Host PC, guest thread and host backtrace (once per fault; the fault
++    // itself still propagates unchanged).
++    rex::arch::LogCurrentFaultContext("unhandled guest access violation");
+     return false;
+   }
+ 
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 77bce25..091c738 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -119,6 +119,27 @@ XThread* GetBoundCurrentXThread() {
+ 
+ }  // namespace
+ 
++void XThread::DescribeCurrentForFault(std::string& out) {
++  XThread* thread = GetBoundCurrentXThread();
++  if (!thread) {
++    out += "  guest thread: none (host thread)\n";
++    return;
++  }
++  const CreationParams* params = thread->creation_params();
++  out += fmt::format("  guest thread: '{}' id=0x{:08X} entry=0x{:08X} start_context=0x{:08X}{}\n",
++                     thread->thread_name(), thread->thread_id(), params->start_address,
++                     params->start_context, thread->main_thread() ? " (main)" : "");
++  if (auto* state = runtime::ThreadState::Get()) {
++    if (const ::PPCContext* ctx = state->context()) {
++      // Registers the recompiled code last stored to the context; locals-only
++      // registers (skip_lr, *_as_local) may be stale.
++      out += fmt::format("  guest ctx (last stored): lr=0x{:08X} r1=0x{:08X} r3=0x{:08X} "
++                         "r4=0x{:08X} r5=0x{:08X}\n",
++                         uint32_t(ctx->lr), ctx->r1.u32, ctx->r3.u32, ctx->r4.u32, ctx->r5.u32);
++    }
++  }
++}
++
+ bool XThread::IsInThread() {
+   return GetBoundCurrentXThread() != nullptr;
+ }

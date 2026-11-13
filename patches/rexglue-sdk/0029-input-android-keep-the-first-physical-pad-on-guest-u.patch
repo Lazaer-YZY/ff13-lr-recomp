@@ -1,0 +1,48 @@
+From df325f02eaa1f7ded8c7c5880536c02b4cf78488 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 7 Nov 2026 17:47:57 +0800
+Subject: [PATCH 029/108] input(android): keep the first physical pad on guest
+ user 0 (behaviour informed by lr-ffxiii-port's Android patch, re-implemented)
+
+Android reports a USB pad twice at start (its own input device, then SDL's
+HIDAPI one, after which the first is dropped), so the surviving pad kept
+ordinal 1 and the game, reading user 0, saw nothing. On Android physical
+ordinals are shifted down so the lowest is 0. Desktop unchanged.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 40740ee..89d5961 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -151,6 +151,30 @@ void InputSystem::RefreshDevices() {
+     fresh[i] = false;
+   }
+ 
++#if REX_PLATFORM_ANDROID
++  // Guest user 0 must not stay empty while a physical pad is connected.
++  // Android announces a USB pad twice at start (its own input device, then
++  // SDL's HIDAPI device, after which the first goes away), leaving the
++  // remaining pad on ordinal 1 while the game reads user 0. Shift physical
++  // ordinals down so the lowest one is 0.
++  {
++    uint32_t lowest = kSyntheticOrdinal;
++    for (const auto& d : seen) {
++      if (!d.synthetic) {
++        lowest = std::min(lowest, d.ordinal);
++      }
++    }
++    if (lowest != kSyntheticOrdinal && lowest > 0) {
++      for (auto& d : seen) {
++        if (!d.synthetic) {
++          d.ordinal -= lowest;
++        }
++      }
++      changed = true;
++    }
++  }
++#endif
++
+   for (const auto& old : devices_) {
+     if (std::none_of(seen.begin(), seen.end(),
+                      [&](const DeviceInfo& d) { return d.id == old.id; })) {
