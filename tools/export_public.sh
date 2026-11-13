@@ -36,7 +36,7 @@ rev=$(git -C "$SRC" rev-parse --short "$REF")
 echo "exporting $REF ($rev) to $PUBLIC_REPO"
 
 # 1. Working copy of the public repo (its own history; empty on the first export).
-rm -rf "$OUT/repo"; mkdir -p "$OUT/repo"
+mkdir -p "$OUT/repo"; find "$OUT/repo" -mindepth 1 -maxdepth 1 -exec rm -rf {} +   # contents only: the folder may be open elsewhere
 git -C "$OUT/repo" init -q -b main
 pgit remote add origin "$URL"
 if pgit ls-remote --exit-code origin main >/dev/null 2>&1; then
@@ -53,6 +53,10 @@ if [ -f "$SRC/tools/public_exclude.txt" ]; then
     rm -rf "$OUT/repo/$p"
   done < "$SRC/tools/public_exclude.txt"
 fi
+
+# Public defaults for a fresh install (60 fps, debug logging off): see android/app/build.gradle.
+sed -i 's/^lrPublicDefaults=false$/lrPublicDefaults=true/' "$OUT/repo/android/gradle.properties"
+grep -qx 'lrPublicDefaults=true' "$OUT/repo/android/gradle.properties" || { echo "lrPublicDefaults not set" >&2; exit 1; }
 
 # 3. Personal-data check on exactly what will be published.
 bash "$SRC/tools/check_personal.sh" "$OUT/repo"

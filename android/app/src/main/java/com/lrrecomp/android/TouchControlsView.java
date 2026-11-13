@@ -493,7 +493,7 @@ final class TouchControlsView extends View {
         renderTitle.setText(strings.getString(R.string.touch_render_title));
         renderTitle.setPadding(0, padding, 0, 0);
         content.addView(renderTitle);
-        String fps = render.getString("fps", "30");
+        String fps = render.getString("fps", RuntimeActivity.DEFAULT_FPS);
         RadioButton fps30 = radio(content, strings.getString(R.string.touch_frame_rate),
             strings.getString(R.string.touch_fps_30), strings.getString(R.string.touch_fps_40),
             strings.getString(R.string.touch_fps_60), "40".equals(fps) ? 1 : "60g".equals(fps) ? 2 : 0);
@@ -530,7 +530,7 @@ final class TouchControlsView extends View {
         // Diagnostics (the owner, 2026-11-11: off for regular play): read at start, so from the next start.
         CheckBox debugLog = new CheckBox(activity);
         debugLog.setText(strings.getString(R.string.touch_debug_log));
-        debugLog.setChecked(render.getBoolean("debug_log", true));
+        debugLog.setChecked(render.getBoolean("debug_log", RuntimeActivity.DEFAULT_DEBUG_LOG));
         content.addView(debugLog);
 
         // Qualcomm and Mali devices: open the GPU driver page (download / switch Turnip or PanVK).

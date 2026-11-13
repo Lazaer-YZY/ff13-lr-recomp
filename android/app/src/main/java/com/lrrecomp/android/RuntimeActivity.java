@@ -65,6 +65,11 @@ public final class RuntimeActivity extends SDLActivity {
         return context.getSharedPreferences("render_settings", Context.MODE_PRIVATE);
     }
 
+    /** Frame rate on a fresh install: 60 fps in gameplay for the public build, 30 for the owner's. */
+    static final String DEFAULT_FPS = BuildConfig.PUBLIC_DEFAULTS ? "60g" : "30";
+    /** Debug logging on a fresh install: off in the public build (~4% CPU), on in the owner's. */
+    static final boolean DEFAULT_DEBUG_LOG = !BuildConfig.PUBLIC_DEFAULTS;
+
     /**
      * 40 fps needs the panel's 120 Hz mode (every third refresh; the runtime's vertical blank runs
      * at 120 Hz then, see LrFrameRateStartup). Requested for the window when "40" is saved. A
@@ -84,7 +89,7 @@ public final class RuntimeActivity extends SDLActivity {
             requestDisplayMode120();
             return;
         }
-        if (!"40".equals(render.getString("fps", "30"))) return;
+        if (!"40".equals(render.getString("fps", DEFAULT_FPS))) return;
         if (render.getBoolean("fps40_trial", false)) {
             render.edit().putString("fps", "30").putBoolean("fps40_trial", false).apply();
             Toast.makeText(this, R.string.touch_fps_40_fallback, Toast.LENGTH_LONG).show();
@@ -97,7 +102,7 @@ public final class RuntimeActivity extends SDLActivity {
 
     /** "Smoother 60 fps" is on and the frame rate setting is 60 (in gameplay or everywhere). */
     static boolean panel120Active(SharedPreferences render) {
-        String fps = render.getString("fps", "30");
+        String fps = render.getString("fps", DEFAULT_FPS);
         return render.getBoolean("panel120", false) && ("60g".equals(fps) || "60".equals(fps));
     }
 
@@ -383,7 +388,7 @@ public final class RuntimeActivity extends SDLActivity {
         // Display settings from the CTRL dialog (renderPrefs): the hooks read LR_FPS / LR_AA at
         // start, the presenter's upscaler is the present_effect cvar (restart only).
         SharedPreferences render = renderPrefs(this);
-        nativeSetenv("LR_FPS", render.getString("fps", "30"));
+        nativeSetenv("LR_FPS", render.getString("fps", DEFAULT_FPS));
         // "Smoother 60 fps" (CTRL dialog): 60 fps as 2 vertical blanks of the 120 Hz panel mode.
         nativeSetenv("LR_VBLANK120", panel120Active(render) ? "1" : "0");
         nativeSetenv("LR_AA", render.getString("aa", "off"));
@@ -397,10 +402,11 @@ public final class RuntimeActivity extends SDLActivity {
         // ON by default until the project concludes (the owner, 2026-11-11: their sessions must carry the
         // statistics when a glitch shows up). Installs that saved "off" with the CTRL dialog's Apply
         // are switched on once (debug_log_default_on); the player's later choice sticks.
-        if (!render.getBoolean("debug_log_default_on", false)) {
+        // The public build (BuildConfig.PUBLIC_DEFAULTS) skips that and starts with logging off.
+        if (!BuildConfig.PUBLIC_DEFAULTS && !render.getBoolean("debug_log_default_on", false)) {
             render.edit().putBoolean("debug_log", true).putBoolean("debug_log_default_on", true).apply();
         }
-        boolean diag = render.getBoolean("debug_log", true);
+        boolean diag = render.getBoolean("debug_log", DEFAULT_DEBUG_LOG);
         if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0
                 && getIntent().getStringExtra("LR_DIAG") != null) {
             diag = !"0".equals(getIntent().getStringExtra("LR_DIAG"));

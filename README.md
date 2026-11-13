@@ -12,7 +12,7 @@ A native Android (arm64) port of the Xbox 360 version of *Lightning Returns: Fin
 ## Highlights
 - **Second screen on dual-screen devices** (AYN Thor and others): the active schema, ATB and abilities, enemy HP, EP and Libra weaknesses in battle; an area map that follows the camera in the field. Tap to switch schemata or map views. Costs no measurable performance.
 - **Playable**: title, movies, field, battles, saves. Played from the prologue through Luxerion, Yusnaan and the Ark.
-- **30, 40 or 60 fps** in gameplay (cutscenes stay at the original 30). 60 fps holds in the field on the Thor; 30 fps runs cool and quiet.
+- **60 fps in gameplay out of the box**, with four frame-rate options from cool and quiet to smoothest (see [below](#four-frame-rate-options)). Cutscenes stay at the original 30.
 - **720p, upscaled** to the screen with bilinear, AMD FSR 1.0 or AMD CAS; optional FXAA.
 - **No shader stutter after the first start**: every shader the game uses is compiled in the background at the title screen and kept between sessions.
 - **Runs well in the Thor's lowest power mode**: every number below is measured in AYN's *Standard* mode, not Performance or High Performance.
@@ -78,7 +78,20 @@ Other measurements from the project log ([`DECISIONS.md`](DECISIONS.md)):
 | Start-up after the first run | title screen in ~20 s; GPU setup 0.45 s |
 | First start after installing | ~16 s to compile the shaders used in play; the rest (~5 min) continues quietly at the title |
 
-**Battery:** at 30 fps the Thor draws about 6 W in the field, at 60 fps about 9-10 W. On battery, 30 or 40 fps lasts much longer; on a charger, 60 is the smoothest.
+### Four frame-rate options
+Choose under **CTRL > Frame rate** (and the *Smoother 60 fps* box). Cutscenes always run at the game's original 30 fps. The frame-rate choice applies to gameplay and menus. Measured on the Thor in Standard mode, standing in the plaza for 90 s, with whole-device power over USB.
+
+| | **30 fps** | **40 fps** | **60 fps** (default) | **60 fps + Smoother 60** |
+|---|---|---|---|---|
+| Power, whole device | **6.2 W** | 7.6 W | 10.2-10.4 W | 9.1-10.1 W |
+| Chip temperature, standing | ~70 °C | ~84 °C | 91-94 °C | about the same as 60 |
+| How it holds | a locked 30 | steady 40, 1% low 35.5 fps | 1% low 27 fps when the GPU is maxed out | 1% low 37 fps in the same scene |
+| Display | 60 Hz | 120 Hz panel mode, 3 refreshes per frame | 60 Hz | 120 Hz panel mode, 2 refreshes per frame |
+| Best for | battery play: about 40% less power than 60, cool and quiet | a middle ground: much smoother than 30 for about 2.7 W less than 60 | the default: full smoothness on a charger or for shorter sessions | the smoothest: a late frame shows after 25 ms instead of 33 |
+
+- **Why Smoother 60 helps:** at 60 Hz, a frame that misses its 16.7 ms slot waits for the next refresh and shows after 33 ms, a visible hitch. On the 120 Hz panel mode it shows after 25 ms. In the Ark warp cutscene that cut the frames held longer than 33 ms from 48 to 1. It draws about the same power, but one warp test ran warmer, so it stays a choice and is off by default.
+- **40 fps and Smoother 60 need a screen with a 120 Hz mode** (the Thor has one). The app switches the panel to it on its own. On a 60 Hz-only screen, pick 30 or 60. If a start at 40 fps doesn't get going, the app falls back to 30 fps the next time.
+- **On battery** the frame rate is the biggest lever: 30 fps uses about 6 W and 60 fps about 10 W. The 10-minute walk table above shows the same gap while moving (5.9 W against 9.1 W).
 
 ## Install
 ### What you need
@@ -107,8 +120,8 @@ The game's own Settings menu is the Xbox 360 release's, unchanged. The port's op
 
 | Option | Choices (default first) | Notes |
 |---|---|---|
-| Frame rate | 30 · 40 · 60 fps in gameplay | Cutscenes stay at 30. 40 uses the 120 Hz panel mode. Applies at the next start. |
-| Smoother 60 fps | off · on | 60 fps on the 120 Hz panel mode: a late frame shows after 25 ms instead of 33 ms. No extra power. Recommended with 60. |
+| Frame rate | 60 · 40 · 30 fps in gameplay | Cutscenes stay at 30. 40 uses the 120 Hz panel mode. Applies at the next start. See [Four frame-rate options](#four-frame-rate-options). |
+| Smoother 60 fps | off · on | 60 fps on the 120 Hz panel mode: a late frame shows after 25 ms instead of 33 ms. About the same power. |
 | Upscaling | Bilinear · AMD FSR 1.0 · AMD CAS | FSR gives the sharpest edges. Restart required. |
 | Anti-aliasing | Off · FXAA | FXAA runs at 720p before upscaling, so it softens the picture. |
 | Performance overlay | off · on | fps and a frame-time graph. |
@@ -116,7 +129,7 @@ The game's own Settings menu is the Xbox 360 release's, unchanged. The port's op
 | Touch controls | shown when no controller is connected | Size, opacity and layout are editable. |
 | GPU driver | Stable Turnip v2 (bundled) | Installed and selected automatically on first start (Adreno 6xx/7xx/8xx; sysmem mode on Adreno 710/720/722). Other Turnip builds can be installed; Qualcomm's drivers are not supported. |
 | Second screen | on | The bottom-screen companion on dual-screen devices (see above). |
-| Debug logging | on | Writes frame and GPU statistics to the log; turning it off saves ~4% CPU. |
+| Debug logging | off | Writes frame and GPU statistics to the log, for reporting a problem. Costs ~4% CPU. |
 
 **Buttons on AYN handhelds (Thor, Odin 2):** in the handheld's Nintendo button layout, face buttons act by position (bottom = A, right = B, left = X, top = Y) so they match the on-screen prompts. In Xbox mode nothing is swapped.
 

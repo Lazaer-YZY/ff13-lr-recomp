@@ -42,6 +42,10 @@ def lrVersionCode = lrVersionMatch.find()
 // to point at the same keystore every time so updates install over each other;
 // unset, AGP's own debug keystore is used.
 def lrDebugKeystore = System.getenv('LR_ANDROID_DEBUG_KEYSTORE')
+// Fresh-install defaults (gradle.properties lrPublicDefaults, or -PlrPublicDefaults=true):
+// the public build starts at 60 fps with debug logging off; the development build keeps 30 fps and
+// logging on until the project concludes. tools/export_public.sh sets it to true in the public copy.
+def lrPublicDefaults = (project.findProperty('lrPublicDefaults') ?: 'false').toString().toBoolean()
 
 android {
     namespace 'com.lrrecomp.android'
@@ -55,7 +59,9 @@ android {
         versionCode lrVersionCode
         versionName lrVersionName
         ndk { abiFilters 'arm64-v8a' }
+        buildConfigField 'boolean', 'PUBLIC_DEFAULTS', lrPublicDefaults.toString()
     }
+    buildFeatures { buildConfig true }
     if (lrDebugKeystore) {
         signingConfigs.debug.storeFile = file(lrDebugKeystore)
     }
