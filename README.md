@@ -45,24 +45,25 @@ On a device with a second display, the bottom screen becomes a live companion to
 - **Font:** the bottom screen's text uses Verdana when the build machine has it (copied from Windows at build time, never in the repository). Otherwise it uses the system sans font.
 
 ## Performance on the AYN Thor
-**Every number here is measured in the Thor's _Standard_ performance mode**, the lowest of its three (Standard, Performance, High Performance), with the fan on *Smart*, on the Snapdragon 8 Gen 2. Nothing is overclocked and no settings were changed for the tests. Measured with the scripts in `tools/`: 10-minute walks through the Luxerion plaza (the busiest town square), the hottest CPU/GPU temperature sensor, and power drawn over USB with a full battery (which equals what the device uses). No figure comes from a screen-recorded run, because recording both screens itself costs ~10 fps in 1% lows.
+**Every number here is measured in the Thor's _Standard_ performance mode**, the lowest of its three (Standard, Performance, High Performance), with the fan on *Smart*, on the Snapdragon 8 Gen 2. Nothing is overclocked and no settings were changed for the tests. Measured with the scripts in `tools/`: 10-minute walks through Luxerion from the North Station plaza (the busiest town square), with the public build's default settings and the second screen on. CPU and GPU temperatures are the hottest sensor of each. Power is drawn over USB with a full battery, which equals what the device uses. No figure comes from a screen-recorded run, because recording both screens itself costs ~10 fps in 1% lows.
 
-<p align="center"><img src="docs/images/heat.svg" width="760" alt="Temperature over a 10-minute walk at 60 and 30 fps"></p>
+<p align="center"><img src="docs/images/heat.svg" width="760" alt="CPU and GPU temperature over a 10-minute walk at 60 and 30 fps"></p>
 
-| 10-minute plaza walk (2026-11-13) | 60 fps | 30 fps |
+| 10-minute Luxerion walk (2026-11-13) | 60 fps | 30 fps |
 |---|---|---|
-| Frames rendered | 36,476 (60.0 fps) | 18,328 (30.0 fps) |
-| Frames over 45 ms | **0** | **0** |
-| 1% low | 41.8 fps | 26.2 fps |
-| Power, whole device | **9.1 W** | **5.9 W** |
-| Chip temperature, average / peak | 88 / 95 °C | 65 / 75 °C |
-| GPU clock / busy | 578 MHz / 81% | 401 MHz / 54% |
+| Average frame rate | **58.8 fps** (36,032 frames) | **30.0 fps** (18,312 frames) |
+| 1% low | 37.3 fps | 25.8 fps |
+| Frames over 45 ms | 2 | 7 (battle starts) |
+| Power, whole device, average | **9.6 W** | **5.8 W** |
+| CPU temperature, average / peak | 92 / 97 °C | 71 / 77 °C |
+| GPU temperature, average / peak | 77 / 81 °C | 59 / 61 °C |
+| GPU clock / busy | 593 MHz / 80% | 401 MHz / 53% |
 
-The temperatures are the hottest sensor *inside* the Snapdragon chip, which is what decides throttling; the case you hold runs far cooler. The walk is also a worst case: non-stop movement through the busiest square, with no menus, cutscenes or pauses. For comparison, a normal 9-minute play session, also at 60 fps:
+The walk is a worst case: non-stop running and turning, with no menus, cutscenes or pauses. The in-game clock passes midnight during the 10 minutes, so night-time enemies appear and both runs include a few short battles. The few frames over 45 ms are the battle-start transition. The CPU runs hotter than the GPU (the game's main thread and its effect workers keep the big cores busy). These are sensors *inside* the Snapdragon chip, which is what decides throttling; the case you hold runs far cooler. For comparison, a normal 9-minute play session, also at 60 fps:
 
 | Normal play, 9 minutes | Average | Peak |
 |---|---|---|
-| Chip | 72 °C | 86 °C |
+| Chip (hottest sensor) | 72 °C | 86 °C |
 | Mainboard, next to the chip | 50 °C | 56 °C |
 | Battery | 27 °C | 28 °C |
 
@@ -91,7 +92,7 @@ Choose under **CTRL > Frame rate** (and the *Smoother 60 fps* box). Cutscenes al
 
 - **Why Smoother 60 helps:** at 60 Hz, a frame that misses its 16.7 ms slot waits for the next refresh and shows after 33 ms, a visible hitch. On the 120 Hz panel mode it shows after 25 ms. In the Ark warp cutscene that cut the frames held longer than 33 ms from 48 to 1. It draws about the same power, but one warp test ran warmer, so it stays a choice and is off by default.
 - **40 fps and Smoother 60 need a screen with a 120 Hz mode** (the Thor has one). The app switches the panel to it on its own. On a 60 Hz-only screen, pick 30 or 60. If a start at 40 fps doesn't get going, the app falls back to 30 fps the next time.
-- **On battery** the frame rate is the biggest lever: 30 fps uses about 6 W and 60 fps about 10 W. The 10-minute walk table above shows the same gap while moving (5.9 W against 9.1 W).
+- **On battery** the frame rate is the biggest lever: 30 fps uses about 6 W and 60 fps about 10 W. The 10-minute walk above shows the same gap while moving (5.8 W against 9.6 W).
 
 ## Install
 ### What you need

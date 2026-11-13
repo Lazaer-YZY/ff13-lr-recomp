@@ -773,3 +773,10 @@ Also removed the `ep=` export: member+0x60 was the HP number's digit count (alwa
 - The owner: the public build starts at 60 fps with debug logging off and FXAA off. A build switch keeps the development build as it was (30 fps, logging on until the project concludes): `lrPublicDefaults` in android/gradle.properties (false here; `tools/export_public.sh` sets it to true in the public copy, or `-PlrPublicDefaults=true`) becomes `BuildConfig.PUBLIC_DEFAULTS`, read by `RuntimeActivity.DEFAULT_FPS` ("60g") and `DEFAULT_DEBUG_LOG`; the one-time "switch logging on" migration is skipped in the public build. FXAA already defaulted to off in code.
 - Defaults only apply to fresh installs (or ones never saved with the CTRL dialog's Apply): saved choices stick.
 - README: a "Four frame-rate options" section (30 / 40 / 60 / 60 + Smoother 60) with the power, temperature and 1% low of each from the power bench logged above (90-s plaza standing view, Standard mode).
+
+## 2026-11-13 — README walks re-run in the new report format (CPU / GPU separately)
+- 10-minute walks (tools/thor_bench_walk.sh, bench save lux_plaza, Standard mode, public defaults: bilinear, no AA, no overlay, second screen on, LR_DIAG 1), USB power with the battery full:
+  - 60 fps: avg 58.8 fps (36,032 frames), 1% low 37.3 fps, 2 frames over 45 ms; 9.64 W; CPU avg 91.9 / peak 96.7 C, GPU 77.1 / 80.8 C; GPU 593 MHz 80% busy.
+  - 30 fps: avg 30.0 fps (18,312 frames), 1% low 25.8 fps, 7 over 45 ms (battle-start transitions, 214-259 ms); 5.75 W; CPU 71.0 / 77.3 C, GPU 58.5 / 61.0 C; GPU 401 MHz 53%.
+- The old "hottest sensor" (88/95 C at 60 fps) was the CPU: CPU sensors run ~15 C above the GPU's. At idle on USB the hottest sensor is a PMIC (53 C with CPU 37 / GPU 34), hence the separate columns.
+- The save (21:07 in game) crosses midnight during a 10-minute walk: night-time enemies and the "follow the disciples" stealth objective appear, so the runs include short battles. First attempt stuck on a QUEST INFORMATION screen (walking into a quest giver); the walk now taps B once per 12-s cycle (closes the prompt; in battle B is Attack, which is harmless).

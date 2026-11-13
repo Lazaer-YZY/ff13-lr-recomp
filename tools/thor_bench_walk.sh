@@ -46,6 +46,9 @@ heat_pid=$!
 # Walk: forward 4 s, turn ~90 degrees, forward 4 s, ... (the Ark plaza is open; walls are fine).
 ( end=$(( $(date +%s) + WALK )); while [ "$(date +%s)" -lt "$end" ]; do
     lstick 0 -32767 4; rstick 32767 0 0.8; lstick 0 -32767 4; rstick 32767 0 0.8; lstick 32767 0 2; rstick -32767 0 0.6
+    # B (cancel) once per cycle: walking into a quest giver opens QUEST INFORMATION (Accept / Cancel),
+    # which otherwise holds the rest of the walk on a menu (2026-11-13, "Where Are You, Holmes?").
+    press 304 0.15
   done ) &
 walk_pid=$!
 # USB input power every 5 s during the walk (the whole device with a full battery).
@@ -73,4 +76,8 @@ lows=$(grep -a "LR frame times (10 s)" "$F.lr.log" | awk -v m="$mark" 'substr($0
 stats="$stats; $lows"
 pwr=$(awk 'NF>=3 {p+=$1/1e6*$2/1e6; b+=$3/1e3; n++} END{if (n) printf "USB input %.2f W, battery %.0f mA", p/n, b/n}' "$F.pwr" 2>/dev/null)
 echo "[$LABEL] $stats; $pwr; temp $T0 -> $T1 C" | tee "$F.txt"
+# The owner's report format (2026-11-13): average fps, 1% low, CPU and GPU temperature separately, power draw.
+fps=$(echo "$stats" | sed -n 's/.* \([0-9.]*\) ms per frame.*/\1/p' | awk '$1 > 0 {printf "%.1f", 1000 / $1}')
+temps=$(grep -E '^  (CPU|GPU):' "$F.heat.txt" 2>/dev/null | sed 's/^  //; s/, end [0-9.]* C//' | paste -sd ';' - | sed 's/;/; /g')
+echo "[$LABEL] report: avg ${fps:-?} fps; $lows; ${temps:-no CPU/GPU temperatures}; $pwr" | tee -a "$F.txt"
 echo "[$LABEL] profile: $(ls -t /c/lr/out/thor/profile/${LABEL}_walk_*.txt | head -1); heat: $F.heat.txt; log: $F.lr.log"
