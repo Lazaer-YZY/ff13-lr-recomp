@@ -63,6 +63,16 @@ bash "$SRC/tools/check_personal.sh" "$OUT/repo"
 
 # 4. Commit (nothing to do if the tree is unchanged).
 pgit add -A
+# git archive leaves submodules out (an empty folder only), so add each submodule's link at the
+# commit REF pins. Without it a clone has .gitmodules but no submodule, and
+# `git submodule update --init thirdparty/libadrenotools` fails with "pathspec ... did not match".
+git -C "$SRC" ls-tree -r "$REF" | awk '$2 == "commit" { print $3, $4 }' | while read -r sha path; do
+  [ -e "$OUT/repo/$path" ] || continue   # left out of the public copy
+  pgit update-index --add --cacheinfo "160000,$sha,$path"
+done
+for p in $(git -C "$OUT/repo" config -f .gitmodules --get-regexp '\.path$' | awk '{ print $2 }'); do
+  pgit ls-files --error-unmatch "$p" >/dev/null 2>&1 || { echo "submodule $p has no link in the export" >&2; exit 1; }
+done
 if pgit diff --cached --quiet; then
   echo "no changes since the last public export"
 else

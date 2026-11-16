@@ -46,7 +46,19 @@ if [ -x /c/dev/llvm/bin/clang.exe ] && [ -x /c/dev/cmake/bin/cmake.exe ] && [ -x
 else bash tools/fetch_toolchain.sh; fi
 if [ -d /c/dev/xwin/VC/Tools/MSVC ] && [ -d /c/dev/android-sdk/ndk/28.2.13676358 ]; then skip "C:\\dev\\xwin, NDK 28.2"
 else bash tools/setup_sdks.sh all; fi
-git submodule update --init thirdparty/libadrenotools
+# libadrenotools (custom GPU driver loader) and its own submodule linkernsbypass. Public snapshots
+# up to 2026-11-13 lacked the submodule link ("pathspec 'thirdparty/libadrenotools' did not match"):
+# clone the pinned commit directly then.
+if [ ! -f thirdparty/libadrenotools/lib/linkernsbypass/CMakeLists.txt ]; then
+  if git ls-files --error-unmatch thirdparty/libadrenotools >/dev/null 2>&1; then
+    git submodule update --init --recursive thirdparty/libadrenotools
+  else
+    rm -rf thirdparty/libadrenotools
+    git clone -q https://github.com/bylaws/libadrenotools thirdparty/libadrenotools
+    git -C thirdparty/libadrenotools checkout -q 8fae8ce254dfc1344527e05301e43f37dea2df80
+    git -C thirdparty/libadrenotools submodule update --init --recursive
+  fi
+fi
 # shellcheck disable=SC1091
 set +u; source /c/lr/tools/env.sh >/dev/null || true; set -u
 

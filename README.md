@@ -165,7 +165,7 @@ Tried and dropped: half-precision shaders, forcing Turnip's tiled (GMEM) renderi
    ```bash
    mkdir -p /c/dev/dl /c/dev/logs && cd /c/lr
    bash tools/fetch_toolchain.sh && bash tools/setup_sdks.sh all
-   git submodule update --init thirdparty/libadrenotools
+   git submodule update --init --recursive thirdparty/libadrenotools
    ```
 2. **ReXGlue SDK v0.10.1** (commit `546a082`) with this project's patches from `patches/rexglue-sdk/`:
    ```bash
