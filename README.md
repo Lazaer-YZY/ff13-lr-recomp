@@ -16,7 +16,7 @@ A native Android (arm64) port of the Xbox 360 version of *Lightning Returns: Fin
 - **720p, upscaled** to the screen with bilinear, AMD FSR 1.0 or AMD CAS; optional FXAA.
 - **No shader stutter after the first start**: on the first start a screen at the title compiles every shader the game uses for your GPU driver, showing the progress and the time left; they are kept between sessions.
 - **Runs well in the Thor's lowest power mode**: every number below is measured in AYN's *Standard* mode, not Performance or High Performance.
-- **Controller or touch**: built-in, Bluetooth and USB controllers work, and on-screen touch buttons appear when none is connected (size, opacity and layout editable under CTRL).
+- **Controller or touch**: built-in, Bluetooth and USB controllers work, and on-screen touch buttons appear when none is connected (size, opacity and layout editable under CTRL; see the [screenshots](#screenshots)).
 - **GPU driver bundled**: the open-source Turnip (Mesa) driver ships in the APK and is used automatically on Adreno.
 - **Download and play**: install the APK, pick your ISO in the app, play. No PC needed. Or build it yourself with one command (`tools/quickstart.sh`).
 
@@ -24,9 +24,9 @@ A native Android (arm64) port of the Xbox 360 version of *Lightning Returns: Fin
 | | |
 |---|---|
 | <img src="docs/images/title.jpg" alt="Title menu"> | <img src="docs/images/yusnaan.jpg" alt="Yusnaan, the Patron's palace"> |
-| <img src="docs/images/ark.jpg" alt="The Ark, with Hope"> | |
+| <img src="docs/images/ark.jpg" alt="The Ark, with Hope"> | <img src="docs/images/phone_touch_battle.jpg" alt="A battle on a phone with the on-screen touch controls"> |
 
-Captured on the Thor at the panel's 1920x1080, with the app's optional performance overlay in the top right.
+Captured on the Thor at the panel's 1920x1080, with the app's optional performance overlay in the top right. The battle (bottom right) is on a phone without a controller: the on-screen touch controls appear by themselves, and their size, opacity and layout are editable under CTRL.
 
 ## Second screen (AYN Thor and other dual-screen devices)
 On a device with a second display, the bottom screen becomes a live companion to the game. It reads the game's own state while you play, so it is always in step with the top screen.
