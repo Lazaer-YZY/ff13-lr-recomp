@@ -41,6 +41,7 @@ public final class RuntimeActivity extends SDLActivity {
     /** Why the renderer could not start with the selected driver; set from native code. */
     private volatile String graphicsFailure;
     private final Handler bootHandler = new Handler(Looper.getMainLooper());
+    private volatile BootOverlay bootOverlay;
     private final Runnable bootSettled = () -> {
         GpuDriverStore.clearBootPending(this);
         PlayerLogs.publish(this);
@@ -49,6 +50,8 @@ public final class RuntimeActivity extends SDLActivity {
     static native void nativeSetTouchInput(int buttons, int leftTrigger, int rightTrigger,
                                            int leftX, int leftY, int rightX, int rightY);
     static native boolean nativeHasConnectedController();
+    /** BootOverlay: 0 not started, 1 running but nothing shown, 2 something on screen, 3 fallback. */
+    static native int nativeBootProgress();
     /** Live render options from the CTRL dialog: "fps" = 30 | 60g, "aa" = off | fxaa. */
     static native void nativeSetOption(String name, String value);
     /** Second screen: what the game shows now (src/lr_companion.inc), key=value pairs. */
@@ -171,6 +174,11 @@ public final class RuntimeActivity extends SDLActivity {
         GameStorage.prepare(this);
         GpuDriverStore.markBootPending(this);
         if (mLayout != null && !mBrokenLibraries) {
+            // "Loading…" over the black screen at boot, under the touch controls (CTRL stays reachable).
+            bootOverlay = new BootOverlay(this);
+            mLayout.addView(bootOverlay, new RelativeLayout.LayoutParams(
+                RelativeLayout.LayoutParams.MATCH_PARENT,
+                RelativeLayout.LayoutParams.MATCH_PARENT));
             touchControls = new TouchControlsView(this);
             mLayout.addView(touchControls, new RelativeLayout.LayoutParams(
                 RelativeLayout.LayoutParams.MATCH_PARENT,
@@ -449,6 +457,8 @@ public final class RuntimeActivity extends SDLActivity {
         File cacheRoot = new File(appRoot, "cache");
         File metadataRoot = new File(appRoot, "metadata");
         userRoot.mkdirs(); cacheRoot.mkdirs(); metadataRoot.mkdirs();
+        // Public APKs carry a shader cache, so the first start precompiles at the title (ShaderSeed).
+        if (ShaderSeed.install(this, cacheRoot) && bootOverlay != null) bootOverlay.setFirstStart();
         java.util.ArrayList<String> args = new java.util.ArrayList<>(java.util.Arrays.asList(
             "--game_data_root=" + game.getAbsolutePath(),
             "--user_data_root=" + userRoot.getAbsolutePath(),

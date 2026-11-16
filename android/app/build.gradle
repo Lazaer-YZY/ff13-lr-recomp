@@ -46,6 +46,13 @@ def lrDebugKeystore = System.getenv('LR_ANDROID_DEBUG_KEYSTORE')
 // the public build starts at 60 fps with debug logging off; the development build keeps 30 fps and
 // logging on until the project concludes. tools/export_public.sh sets it to true in the public copy.
 def lrPublicDefaults = (project.findProperty('lrPublicDefaults') ?: 'false').toString().toBoolean()
+// Redistributable APK (-PlrRedistributable=true, tools/build_release_apk.sh): leaves out the HUD font
+// (Verdana, copied from the builder's Windows: its licence forbids passing it on; the second screen
+// then uses a Verdana on the device or the bundled DejaVu Sans in assets/fonts_free). The area maps
+// and HUD pieces stay in (the owner, DECISIONS 2026-11-16).
+def lrRedistributable = (project.findProperty('lrRedistributable') ?: 'false').toString().toBoolean()
+// -PlrAppIdSuffix=.test installs beside the normal app with its own data folder (a first start).
+def lrAppIdSuffix = (project.findProperty('lrAppIdSuffix') ?: '').toString()
 
 android {
     namespace 'com.lrrecomp.android'
@@ -60,8 +67,14 @@ android {
         versionName lrVersionName
         ndk { abiFilters 'arm64-v8a' }
         buildConfigField 'boolean', 'PUBLIC_DEFAULTS', lrPublicDefaults.toString()
+        if (lrAppIdSuffix) applicationIdSuffix lrAppIdSuffix
     }
     buildFeatures { buildConfig true }
+    if (lrRedistributable) {
+        // aapt's default ignore list plus the fonts folder.
+        androidResources.ignoreAssetsPattern =
+            '!.svn:!.git:!.ds_store:!*.scc:.*:<dir>_*:!CVS:!thumbs.db:!picasa.ini:!*~:!<dir>fonts'
+    }
     if (lrDebugKeystore) {
         signingConfigs.debug.storeFile = file(lrDebugKeystore)
     }

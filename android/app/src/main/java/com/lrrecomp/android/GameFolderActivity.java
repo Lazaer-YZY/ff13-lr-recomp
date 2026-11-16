@@ -368,21 +368,32 @@ public final class GameFolderActivity extends Activity {
                     return;
                 }
                 if (opened == null) message("Cannot import this file", failure);
-                else checkTitle(opened);
+                else checkDisc(opened);
             });
         }, "ISO check").start();
     }
 
-    private void checkTitle(IsoImport.Disc disc) {
-        if (disc.titleId == IsoImport.TITLE_ID) { checkTarget(disc); return; }
-        String id = disc.titleId < 0 ? "unknown" : String.format("%08X", disc.titleId);
-        new AlertDialog.Builder(this).setTitle("Not Lightning Returns?")
-            .setMessage("This disc's title ID is " + id + "; Lightning Returns is 5351081B. "
-                + "The game will not run from another disc.")
-            .setPositiveButton("Import anyway", (dialog, which) -> checkTarget(disc))
-            .setNegativeButton("Cancel", (dialog, which) -> disc.close())
-            .setOnCancelListener(dialog -> disc.close())
-            .show();
+    /**
+     * Only the disc release this app's game code was compiled from can run (its default.xex,
+     * byte for byte); any other disc is refused before anything is copied.
+     */
+    private void checkDisc(IsoImport.Disc disc) {
+        if (disc.titleId == IsoImport.TITLE_ID && IsoImport.TESTED_XEX_SHA256.equals(disc.xexSha256)) {
+            checkTarget(disc);
+            return;
+        }
+        disc.close();
+        if (disc.titleId != IsoImport.TITLE_ID) {
+            String id = disc.titleId < 0 ? "unknown" : String.format("%08X", disc.titleId);
+            message("Not Lightning Returns", "This disc's title ID is " + id
+                + "; Lightning Returns is 5351081B. Nothing was imported.");
+        } else {
+            String sha = disc.xexSha256.isEmpty() ? "unknown" : disc.xexSha256.substring(0, 16) + "…";
+            message("Different release of the game", "This app's game code was compiled from the USA "
+                + "disc's default.xex, and this disc's default.xex is a different version (sha256 " + sha
+                + "), so the game would crash. Nothing was imported.\n\nOther releases need their own "
+                + "build from the source code.");
+        }
     }
 
     /**
@@ -440,7 +451,18 @@ public final class GameFolderActivity extends Activity {
         if (job.finished()) {
             getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             IsoImport.clearFinished();
-            if (job.state == IsoImport.State.DONE) {
+            if (job.state == IsoImport.State.DONE && !fromGame) {
+                // The next step is starting the game (the page's Start button is below the fold).
+                new AlertDialog.Builder(this).setTitle("Game imported")
+                    .setMessage("The game is ready. Its first start prepares the shaders for this device, "
+                        + "which takes a few minutes; later starts are quick.")
+                    .setPositiveButton("Start game", (dialog, which) -> {
+                        startActivity(new Intent(this, RuntimeActivity.class));
+                        finish();
+                    })
+                    .setNegativeButton("Not now", null)
+                    .show();
+            } else if (job.state == IsoImport.State.DONE) {
                 message("Game imported", job.message == null ? "The game is ready."
                     : "The game is in place, but: " + job.message);
             } else if (job.state == IsoImport.State.FAILED) {

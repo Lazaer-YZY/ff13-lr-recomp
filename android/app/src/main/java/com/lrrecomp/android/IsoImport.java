@@ -28,8 +28,14 @@ import java.util.Locale;
  */
 final class IsoImport {
     static final long TITLE_ID = 0x5351081BL;
-    /** sha256 of default.xex of the tested USA disc (as in tools/quickstart.sh). */
+    /**
+     * sha256 of default.xex of the tested USA disc (as in tools/quickstart.sh). The app's game
+     * code is compiled from this file (lr_manifest.toml), so a disc with any other default.xex
+     * is refused: it would crash.
+     */
     static final String TESTED_XEX_SHA256 = "52d3c11378fa041e086dabfd79994e7eaa63e47f28e5c98878c71573823d5afb";
+    /** default.xex is read whole to hash it before the import (16.8 MB on the USA disc). */
+    private static final long MAX_XEX_BYTES = 64L << 20;
     /** Free space kept beyond the game's size. */
     static final long SPACE_MARGIN = 256L << 20;
 
@@ -43,14 +49,17 @@ final class IsoImport {
         final int fileCount;
         /** -1 when default.xex has no readable title ID. */
         final long titleId;
+        /** sha256 of the disc's default.xex ("" when it is too large to be this game's). */
+        final String xexSha256;
 
         private Disc(ParcelFileDescriptor descriptor, FileInputStream stream, XdvdfsReader reader,
-                List<XdvdfsReader.Entry> entries, long titleId) {
+                List<XdvdfsReader.Entry> entries, long titleId, String xexSha256) {
             this.descriptor = descriptor;
             this.stream = stream;
             this.reader = reader;
             this.entries = entries;
             this.titleId = titleId;
+            this.xexSha256 = xexSha256;
             long total = 0;
             int files = 0;
             for (XdvdfsReader.Entry entry : entries) if (!entry.isDir) { total += entry.size; ++files; }
@@ -92,7 +101,8 @@ final class IsoImport {
             if (xex == null || xex.isDir)
                 throw new IOException("This disc has no default.xex, so it is not a game disc.");
             long titleId = XdvdfsReader.xexTitleId(reader.head(xex, 64 << 10));
-            return new Disc(descriptor, stream, reader, entries, titleId);
+            String xexSha256 = xex.size <= MAX_XEX_BYTES ? sha256(reader.head(xex, (int) xex.size)) : "";
+            return new Disc(descriptor, stream, reader, entries, titleId, xexSha256);
         } catch (IOException | RuntimeException e) {
             try { stream.close(); } catch (IOException ignored) {}
             descriptor.close();
@@ -187,11 +197,16 @@ final class IsoImport {
                 return;
             }
             currentFile = "";
+            // The disc's default.xex was checked before the import; this catches a bad read.
             String sha = sha256(new File(staging, xexName(staging)));
+            if (!TESTED_XEX_SHA256.equals(sha)) {
+                finishCleaning(staging, State.FAILED, "default.xex was not copied intact (sha256 "
+                    + sha.substring(0, 16) + "…). Try again; if it fails again, copy the ISO to the "
+                    + "device's internal storage and import it from there.");
+                return;
+            }
             moveIntoPlace(staging, target);
-            message = TESTED_XEX_SHA256.equals(sha) ? null
-                : "default.xex is not the tested USA release (sha256 " + sha + "). Other releases "
-                    + "need their own build; the game will likely fail or crash.";
+            message = null;
             state = State.DONE;
         } catch (IOException | RuntimeException e) {
             String text = e.getMessage() != null ? e.getMessage() : e.toString();
@@ -262,6 +277,21 @@ final class IsoImport {
         try (InputStream input = new FileInputStream(file)) {
             for (int n; (n = input.read(buffer)) > 0; ) digest.update(buffer, 0, n);
         }
+        return hex(digest);
+    }
+
+    static String sha256(byte[] bytes) throws IOException {
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new IOException(e);
+        }
+        digest.update(bytes);
+        return hex(digest);
+    }
+
+    private static String hex(MessageDigest digest) {
         StringBuilder hex = new StringBuilder();
         for (byte b : digest.digest()) hex.append(String.format(Locale.ROOT, "%02x", b));
         return hex.toString();

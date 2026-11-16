@@ -4,20 +4,21 @@ A native Android (arm64) port of the Xbox 360 version of *Lightning Returns: Fin
 
 <p align="center"><img src="docs/images/plaza_60fps.jpg" width="820" alt="Luxerion plaza at 60 fps on the AYN Thor, with the performance overlay on"></p>
 
-<p align="center"><b><a href="https://github.com/Lazaer-YZY/ff13-lr-recomp/releases/latest/download/lr_thor_showcase_1080p60.mp4">▶ Watch the 2-minute video, both screens at 60 fps (MP4, 114 MB)</a></b> · <a href="https://github.com/Lazaer-YZY/ff13-lr-recomp/releases/latest/download/lr_thor_showcase_phone.mp4">smaller version (27 MB)</a></p>
+<p align="center"><b><a href="https://github.com/Lazaer-YZY/ff13-lr-recomp/releases/download/v1.0/lr_thor_showcase_1080p60.mp4">▶ Watch the 2-minute video, both screens at 60 fps (MP4, 114 MB)</a></b> · <a href="https://github.com/Lazaer-YZY/ff13-lr-recomp/releases/download/v1.0/lr_thor_showcase_phone.mp4">smaller version (27 MB)</a></p>
 
 > [!IMPORTANT]
-> **No game code or data is included.** You need your own copy of the game (USA disc, see below). The APK you build contains code generated from your game's executable, so treat it like the game itself and don't share it.
+> **You need your own copy of the game:** the USA Xbox 360 disc, dumped to an ISO. The ready-made APK ([Download](#download-the-apk)) contains the game's code, recompiled, and the second screen's maps, but none of the game's data: the app imports that from your ISO. This repository itself contains no game code or data.
 
 ## Highlights
 - **Second screen on dual-screen devices** (AYN Thor and others): the active schema, ATB and abilities, enemy HP, EP and Libra weaknesses in battle; an area map that follows the camera in the field. Tap to switch schemata or map views. Costs no measurable performance.
 - **Playable**: title, movies, field, battles, saves. Played from the prologue through Luxerion, Yusnaan and the Ark.
 - **60 fps in gameplay out of the box**, with four frame-rate options from cool and quiet to smoothest (see [below](#four-frame-rate-options)). Cutscenes stay at the original 30.
 - **720p, upscaled** to the screen with bilinear, AMD FSR 1.0 or AMD CAS; optional FXAA.
-- **No shader stutter after the first start**: every shader the game uses is compiled in the background at the title screen and kept between sessions.
+- **No shader stutter after the first start**: on the first start a screen at the title compiles every shader the game uses for your GPU driver, showing the progress and the time left; they are kept between sessions.
 - **Runs well in the Thor's lowest power mode**: every number below is measured in AYN's *Standard* mode, not Performance or High Performance.
+- **Controller or touch**: built-in, Bluetooth and USB controllers work, and on-screen touch buttons appear when none is connected (size, opacity and layout editable under CTRL).
 - **GPU driver bundled**: the open-source Turnip (Mesa) driver ships in the APK and is used automatically on Adreno.
-- **One-command build**: `tools/quickstart.sh` sets up the toolchain, recompiles the game and installs it on your device.
+- **Download and play**: install the APK, pick your ISO in the app, play. No PC needed. Or build it yourself with one command (`tools/quickstart.sh`).
 
 ## Screenshots
 | | |
@@ -41,8 +42,8 @@ On a device with a second display, the bottom screen becomes a live companion to
 
 - **Which devices:** the companion opens on any Android *presentation* display. That includes the bottom screen of dual-screen handhelds and, in principle, a second display attached over USB-C or HDMI. The layout scales to the display. It is tested on the AYN Thor (1240x1080 touch screen); other devices should work but are untested. Touch works on touch screens.
 - **Cost:** measured on a 10-minute plaza walk at 60 fps: 1% low 44.4 fps with the second screen against 44.5 without, and +0.4 W. It draws on its own thread at 30-40 fps, never on the game's threads.
-- **Setup:** none. The maps and screen artwork come from your game files. They are either built into the APK at build time or, if the APK has none, generated on the device at the first start (about two minutes, in the background). Turn the second screen off with CTRL > Second screen.
-- **Font:** the bottom screen's text uses Verdana when the build machine has it (copied from Windows at build time, never in the repository). Otherwise it uses the system sans font.
+- **Setup:** none. The maps and screen artwork are built into the downloadable APK. A self-built APK bundles them from your game files at build time or, if it has none, generates them on the device at the first start (about two minutes, in the background). Turn the second screen off with CTRL > Second screen.
+- **Font:** the game's HUD text is closest to Verdana. A self-built APK bundles the build PC's Verdana; the downloadable APK cannot (Verdana's licence forbids passing it on), so it uses a Verdana installed on the device, then your own copy, then the bundled [DejaVu Sans](https://dejavu-fonts.github.io/), which is close. For the exact look, copy `verdana.ttf` and `verdanab.ttf` from a Windows PC (`C:\Windows\Fonts`) into `Android/data/com.lrrecomp.android/files/fonts/` on the device.
 
 ## Performance on the AYN Thor
 **Every number here is measured in the Thor's _Standard_ performance mode**, the lowest of its three (Standard, Performance, High Performance), with the fan on *Smart*, on the Snapdragon 8 Gen 2. Nothing is overclocked and no settings were changed for the tests. Measured with the scripts in `tools/`: 10-minute walks through Luxerion from the North Station plaza (the busiest town square), with the public build's default settings and the second screen on. CPU and GPU temperatures are the hottest sensor of each. Power is drawn over USB with a full battery, which equals what the device uses. No figure comes from a screen-recorded run, because recording both screens itself costs ~10 fps in 1% lows.
@@ -95,13 +96,22 @@ Choose under **CTRL > Frame rate** (and the *Smoother 60 fps* box). Cutscenes al
 - **On battery** the frame rate is the biggest lever: 30 fps uses about 6 W and 60 fps about 10 W. The 10-minute walk above shows the same gap while moving (5.8 W against 9.6 W).
 
 ## Install
+### Download the APK
+No PC needed.
+1. **On the device**, download [`lr-recomp-android-arm64.apk`](https://github.com/Lazaer-YZY/ff13-lr-recomp/releases/latest/download/lr-recomp-android-arm64.apk) from the [latest release](https://github.com/Lazaer-YZY/ff13-lr-recomp/releases/latest) and open it to install (allow your browser or file manager to install apps when Android asks).
+2. **Put your ISO on the device** (internal storage or SD card): the USA disc, dumped from your own copy (see [What you need](#what-you-need)). The app runs only that release, because its game code was compiled from that disc's executable; it checks the disc and refuses any other before copying anything.
+3. **Start *Lightning Returns*.** On Adreno devices the GPU driver page opens first: keep the bundled Turnip driver. Then the *Game folder* page: tap **Import from ISO…** and pick your ISO. The app extracts the 7 GB of game files (about 30 s on the Thor, longer from an SD card); you can delete the ISO afterwards.
+4. **The first start** takes a few minutes, with the progress on screen: *Loading…* while the shader cache loads, then a *Preparing shaders* screen that compiles the shaders for your GPU driver (the game continues by itself when it is done), then the rest compiles in the background at the title while you can already play. See [Shader cache](#shader-cache).
+
+Newer releases install over the old one and keep your saves and game files.
+
 ### What you need
 - **The game**: *Lightning Returns: Final Fantasy XIII*, USA Xbox 360 disc, dumped to an ISO from your own copy (title ID `5351081B`, media ID `4A99274C`, XEX version 0.0.0.8, no title update). Other regions need their own manifest and are untested.
 - **A Windows 10/11 PC** with [Git for Windows](https://git-scm.com/download/win) and [Python 3](https://www.python.org/downloads/) (tick "Add to PATH"). No admin rights needed: everything else is downloaded portably into `C:\dev`. About **30 GB** free disk space.
-- **An Android phone or handheld with a Snapdragon chip** (Adreno 6xx, 7xx or 8xx GPU; Snapdragon 8 Gen 2 or newer recommended; tested on the AYN Thor), about 8 GB free, and a controller (built-in or Bluetooth/USB; touch controls also work). Devices with Mali GPUs (Dimensity, Exynos, Tensor) are untested.
+- **An Android phone or handheld with a Snapdragon chip** (Adreno 6xx, 7xx or 8xx GPU; Snapdragon 8 Gen 2 or newer recommended; tested on the AYN Thor), about 8 GB free. **A controller is optional:** without one the game shows on-screen touch buttons; built-in, Bluetooth and USB controllers work too. Devices with Mali GPUs (Dimensity, Exynos, Tensor) are untested.
 - **Time**: the first build compiles the recompiled game, which takes **one to several hours** on a laptop.
 
-### Steps
+### Build it yourself
 1. **On the PC**, turn on Developer Mode (Settings > System > For developers) so Git can create symlinks.
 2. **On the device**, turn on USB debugging (Settings > About > tap *Build number* 7 times, then Developer options > USB debugging), connect it with a USB cable and accept the prompt.
 3. **In Git Bash**, clone the repository, then run the build with the path to your ISO:
@@ -112,9 +122,9 @@ Choose under **CTRL > Frame rate** (and the *Smoother 60 fps* box). Cutscenes al
    bash /c/lr/tools/quickstart.sh "/c/Users/you/Downloads/Lightning Returns (USA).iso" --install
    ```
    This downloads the toolchain, builds the recompiler, extracts your ISO, recompiles the game, builds the APK, installs it and copies the 7 GB of game files to the device. Steps that are already done are skipped, so if anything fails or you stop it, run the same command again. Leave out `--install` to only build the APK (`C:\lr\android\app\build\outputs\apk\debug\app-debug.apk`).
-4. **Start the game** from the app drawer. The first start shows "Preparing shaders" at the title screen; wait for "Shaders ready" before starting and you won't get first-visit hitches.
+4. **Start the game** from the app drawer. The first start shows a *Preparing shaders* screen at the title (a few minutes, with the time left); the game continues by itself when it is done.
 
-**Game files without a USB copy:** install the APK on its own, put your ISO on the device, and on the first start (the *Game folder* page, also under CTRL) tap **Import from ISO…**. The app checks the disc's title ID and executable and extracts the game itself, in about 30 s on the Thor. Keep the app open until it finishes.
+**Game files without a USB copy:** install the APK on its own, put your ISO on the device, and on the first start (the *Game folder* page, also under CTRL) tap **Import from ISO…**. The app checks the disc's title ID and executable (it refuses any disc but the USA release) and extracts the game itself, in about 30 s on the Thor.
 
 ### Options (the CTRL button)
 The game's own Settings menu is the Xbox 360 release's, unchanged. The port's options are behind the **CTRL** button at the top of the screen:
@@ -201,6 +211,8 @@ The project's profile-guided optimisation data (`out/pgo/lr.profdata`) is derive
 </details>
 
 ## Shader cache
+**First start of the downloadable APK.** It carries a shader cache collected by playing through the game, so a fresh install compiles everything once at the start instead of stuttering (and drawing white menus) on first sight. On the Thor: about 45 s of *Loading…* while the cache loads, about 45 s of the *Preparing shaders* screen (play is held; START + BACK for 2 s skips it), then about 3.5 minutes of *Compiling the remaining shaders* in the corner of the title, where you can already play (starting the game pauses it until the next start). Later starts are quick. A self-built APK has no bundled cache and builds its own as you play.
+
 Everything compiled is kept in `files/cache/shaders/shareable/` on the device:
 
 | File | What it holds | Shareable |
@@ -219,7 +231,7 @@ bash tools/shader_cache.sh push friend.zip
 
 ## Troubleshooting
 - **Logs** are in `Android/data/com.lrrecomp.android/files/logs/lr.log`: `adb pull /sdcard/Android/data/com.lrrecomp.android/files/logs`
-- **Hitches in new areas right after installing:** the background shader compile hadn't finished. Wait at the title for "Shaders ready" once.
+- **Hitches in new areas right after installing:** the shader screen was skipped (START + BACK). It continues at the title on the next start; let it finish once.
 - **Wrong colours, black or flashing pixels:** turn on CTRL > Exact Xbox shader math (shaders rebuild once).
 - **Build fails after a codegen:** run `python -I tools/patch_generated.py`; it is needed after every `rexglue codegen`.
 - **Several devices connected:** set `LR_ADB_SERIAL=<serial>` for the scripts.
@@ -229,7 +241,7 @@ bash tools/shader_cache.sh push friend.zip
 - `src/`: game-side code (hooks, Android glue) compiled with the recompiled C++.
 - `android/`: the Android app (Gradle): activities, CTRL dialog, GPU driver store, touch controls, the second-screen companion and the ISO import.
 - `docs/`: notes on how the shader pipeline works and on the game memory the second screen reads (`dual_screen_*_re.md`).
-- `patches/rexglue-sdk/`: this project's 108 changes to the ReXGlue SDK (Android port, renderer, shaders, performance), as `git am` patches.
+- `patches/rexglue-sdk/`: this project's 109 changes to the ReXGlue SDK (Android port, renderer, shaders, performance), as `git am` patches.
 - `tools/`: build, install, benchmark and analysis scripts. `lr_manifest.toml`: the recompiler's manifest for this executable.
 - [`DECISIONS.md`](DECISIONS.md), [`REFERENCE_NOTES.md`](REFERENCE_NOTES.md): dated log of every choice and measurement, research notes on the projects listed below.
 - Git-ignored: `Input - Data/` (your game files), `generated/` (recompiled C++), `sdk/`, `refs/`, `out/`.
@@ -237,15 +249,15 @@ bash tools/shader_cache.sh push friend.zip
 ## References and credits
 Ordered by how much this port relies on them.
 
-1. **[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)** (BSD-style), derived from **[Xenia](https://xenia.jp)**: the recompiler, runtime and Vulkan GPU emulation everything is built on. This project carries 108 patches on v0.10.1.
+1. **[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)** (BSD-style), derived from **[Xenia](https://xenia.jp)**: the recompiler, runtime and Vulkan GPU emulation everything is built on. This project carries 109 patches on v0.10.1.
 2. **[lr-ffxiii-port](https://github.com/leftisthominid/lr-ffxiii-port)** by leftisthominid (GPL-3.0): an earlier ReXGlue port of this exact title. Its function analysis set, codegen flags and runtime hooks (including the movie/graphics-interrupt deadlock fix) were the starting point.
 3. **[Lost Odyssey Recomp](https://github.com/freefrank/LostOdysseyRecomp)** (GPL-3.0): the Android app layer (activities, GPU driver store, game folder, touch overlay, Turnip loading) is adapted from it; also ideas for render-target handling and thread placement on phones.
 4. **[Turnip / Mesa](https://docs.mesa3d.org/drivers/freedreno.html)** (MIT), packaged by **[whitebelyash](https://github.com/whitebelyash/AdrenoToolsDrivers)** (Stable Turnip v2): the bundled GPU driver, loaded with **[libadrenotools](https://github.com/bylaws/libadrenotools)** (BSD-2).
 5. **[Lighthing-Recomp](https://github.com/naubasurq/Lighthing-Recomp)** (MIT): Final Fantasy XIII on the same engine; project layout, the codegen workflow and the texture `exp_adjust` fix.
-6. **[SDL3](https://github.com/libsdl-org/SDL)** (zlib): windowing, input, audio and app lifecycle on Android.
+6. **[SDL3](https://github.com/libsdl-org/SDL)** (zlib): windowing, input, audio and app lifecycle on Android. **[DejaVu Sans](https://dejavu-fonts.github.io/)** (Bitstream Vera licence): the second screen's font in the downloadable APK.
 7. **[Xendroid+](https://github.com/phforner0/Xendroid-Plus)** and **[XeniOS](https://github.com/xenios-jp/XeniOS)**: ideas for mobile GPUs (texture sign specialisation, direct host resolve), re-implemented here.
 8. **[UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp)**, **[XenonRecomp](https://github.com/hedge-dev/XenonRecomp)**, **[XenosRecomp](https://github.com/hedge-dev/XenosRecomp)**: reference implementations of static and shader recompilation (register flags, shader precompile approach).
 9. **[xenia-edge](https://github.com/has207/xenia-edge)**, **[Theft4](https://github.com/KoreanSeats1/Theft4)** and X360-Mobile: corroborating notes on resolve and transfer optimisations.
 
 ## Licence
-GNU GPL v3 (see [`LICENSE`](LICENSE)). *Lightning Returns: Final Fantasy XIII* is © Square Enix. This project is not affiliated with Square Enix; no game code or data is distributed here.
+GNU GPL v3 (see [`LICENSE`](LICENSE)). *Lightning Returns: Final Fantasy XIII* is © Square Enix. This project is not affiliated with Square Enix. The repository contains no game code or data; the release APK contains code recompiled from the game's executable and the second screen's images made from the game files, and runs only with the player's own disc image.

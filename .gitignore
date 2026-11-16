@@ -30,6 +30,7 @@ android/app/src/main/assets/gpu_driver/
 android/app/src/main/assets/navimap/
 android/app/src/main/assets/hud/
 android/app/src/main/assets/fonts/
+android/app/src/main/assets/shader_seed/
 
 # built locally by tools/native/build_xxh3.sh
 tools/native/*.dll

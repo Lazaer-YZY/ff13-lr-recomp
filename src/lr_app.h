@@ -114,6 +114,8 @@ inline const char* Start() {
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <deque>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -133,6 +135,13 @@ inline const char* Start() {
 extern std::atomic<bool> g_lr_keyboard_mode;  // lr_hooks.cpp: keystrokes made from the pad state
 extern std::atomic<bool> g_lr_screenshot_request;  // lr_hooks.cpp: take a screenshot now (Android button)
 extern std::atomic<int> g_lr_controls_open;   // lr_keyboard_menu.inc: Settings > Gamepad Controls
+// lr_hooks.cpp: the first-start shader screen holds play (1; 2 = skipped, waiting for the buttons
+// to be released), how long START + BACK has been held to skip it, and whether it was skipped.
+extern std::atomic<int> g_lr_precompile_hold;
+extern std::atomic<int> g_lr_precompile_skip_ms;
+extern std::atomic<bool> g_lr_precompile_skipped;
+extern std::atomic<bool> g_lr_precompile_screen_drawn;  // the notice drew something (loading view goes)
+uint64_t lr_frame_count();  // lr_hooks.cpp: the game's frames so far (none while the shader storage loads)
 extern std::function<void(bool)> g_lr_controls_ui;  // shows/hides the picture (set by the app)
 // Shows/hides the frame rate and frame time overlay (set by the app; on Android the CTRL
 // dialog's "Performance overlay" setting, LR_FRAME_OVERLAY=1 at start).
@@ -276,15 +285,29 @@ class LrControlsOverlay final : public rex::ui::ImGuiDialog {
   LrControlsPictureTexture* picture_;
 };
 
-// "Preparing shaders" notice in the top-left corner at the title while the boot shader library
-// precompile runs: the first launch after an update that changes the shaders or after a GPU driver
-// change (~7 min on the Thor). Playing during it hitched badly (the warp bench: 48% of frames over
-// 45 ms instead of 2%), so the title asks the player to wait. If the game starts anyway, the
-// precompile stops and resumes at the next launch (vulkan_precompile_in_game). It is a toast, not a
-// persistent box (the owner, 2026-11-11): shown for kToastS once the precompile has run kDelayS (a rerun
-// with nothing to build shows nothing), hidden while it runs, then "Shaders ready" for kReadyS
-// when it ends at the title. The dialog closes (deleting
-// itself) after that, when the game leaves the title, or 30 s after start when none runs.
+// Shader screens at the title while the boot shader library precompile runs: the first launch
+// after an install (the APK seeds the shader cache, android ShaderSeed), an update that changes the
+// shaders, or a GPU driver change (~5-7 min on the Thor). The precompile does the shaders used in
+// play first (rex_precompile_permille), then the rest in the background (rex_precompile_all_permille).
+// Playing during the first part hitched badly (the warp bench: 48% of frames over 45 ms instead of
+// 2%), and a phone that played through it showed broken textures until a restart, so (the owner,
+// 2026-11-16):
+//  - first part: a centred panel says what runs and how long it has left, and the game sees no
+//    input until it ends (g_lr_precompile_hold, lr_hooks.cpp); holding START + BACK for 2 s skips it;
+//  - then "Shaders ready" (or "skipped") for kReadyS;
+//  - then, while the rest compiles (the fans run at full speed at the title), a corner line with its
+//    progress and time left. Starting the game stops it until the next launch
+//    (vulkan_precompile_in_game).
+// This replaces the 12-s corner toast of 2026-11-11, drawn in the drawer's ProggyTiny at 10 px: on a
+// phone, a dark strip with unreadable text. A rerun with nothing to build (done within kDelayS)
+// shows nothing. The dialog closes (deleting itself) when everything is done, when the game leaves
+// the title, or 30 s after start when no precompile runs.
+// Fonts for the app's own screens (LrApp::OnConfigureFonts): Android's Roboto baked at two sizes;
+// null on systems without it (the drawer's ProggyTiny is scaled instead).
+inline ImFont* g_lr_font_large = nullptr;
+inline ImFont* g_lr_font_body = nullptr;
+extern "C" volatile int rex_precompile_all_permille;
+
 class LrPrecompileNotice final : public rex::ui::ImGuiDialog {
  public:
   LrPrecompileNotice(rex::ui::ImGuiDrawer* drawer, LrPrecompileNotice** owner)
@@ -292,79 +315,266 @@ class LrPrecompileNotice final : public rex::ui::ImGuiDialog {
 
  protected:
   void OnClose() override {
+    g_lr_precompile_hold.store(0);
     if (owner_) *owner_ = nullptr;
   }
   void OnDraw(ImGuiIO& io) override {
     using clock = std::chrono::steady_clock;
     const int permille = rex_precompile_permille;
+    const int all = rex_precompile_all_permille;
     const auto now = clock::now();
     auto secs = [&](clock::time_point t) { return std::chrono::duration<double>(now - t).count(); };
-    if (!lr_at_title() || (!seen_ && permille < 0 && now - created_ > std::chrono::seconds(30))) {
+    // The 30-s wait for a precompile starts with the game: the shader storage loads before it
+    // (~50 s on a first start with the bundled cache), and the notice used to give up during it.
+    if (!seen_ && lr_frame_count() == 0) created_ = now;
+    if (!lr_at_title() || (!seen_ && permille < 0 && all < 0 && now - created_ > std::chrono::seconds(30))) {
       Close();
       return;
     }
     if (!seen_) {
-      if (permille < 0) return;
+      if (permille < 0 && all < 0) return;
       seen_ = true;
       first_ = now;
-      first_permille_ = permille;
     }
     if (permille >= 0) last_permille_ = permille;
-    if (permille < 0 && !done_) {
-      done_ = true;
-      done_at_ = now;
-      // A rerun with everything already built takes ~0.2 s: no toast at all.
-      if (secs(first_) < kDelayS) {
-        Close();
+    const float s = std::max(0.5f, io.DisplaySize.y / 1080.0f);
+
+    // First part: the shaders used in play, behind the panel that holds play.
+    if (!ended_) {
+      const bool skipped = g_lr_precompile_skipped.load(std::memory_order_relaxed);
+      if (permille < 0 || skipped) {
+        ended_ = true;
+        ended_at_ = now;
+        ended_by_skip_ = skipped && permille >= 0;
+        g_lr_precompile_hold.store(0);
+        REXLOG_INFO("LR precompile: the shaders used in play are {} after {:.0f} s",
+                    ended_by_skip_ ? "skipped by the player" : "ready", secs(first_));
+      } else {
+        if (secs(first_) < kDelayS) return;
+        if (g_lr_precompile_hold.load(std::memory_order_relaxed) == 0) {
+          g_lr_precompile_hold.store(1);
+          REXLOG_INFO("LR precompile: holding play at the title until the shaders are ready");
+        }
+        const double t = secs(first_);
+        if (last_permille_ / 100 > logged_tenth_) {
+          logged_tenth_ = last_permille_ / 100;
+          REXLOG_INFO("LR precompile: {}% after {:.0f} s", logged_tenth_ * 10, t);
+        }
+        screen_eta_.Update(t, last_permille_);
+        screen_shown_ = true;
+        DrawScreen(io, s, t);
         return;
       }
     }
-    if (!done_ && secs(first_) < kDelayS) return;
-    // Which toast is up, and its opacity (fades out over the last kFadeS).
-    double shown = done_ ? secs(done_at_) : secs(first_) - kDelayS;
-    double length = done_ ? kReadyS : kToastS;
-    if (shown >= length) {
-      if (done_) Close();
-      return;  // Hidden while the precompile runs.
+    // Then a short note, if the panel was up.
+    if (screen_shown_ && secs(ended_at_) < kReadyS) {
+      if (ended_by_skip_)
+        DrawToast(io, s, IM_COL32(240, 200, 110, 255), "Shaders skipped: expect stutters in new areas", secs(ended_at_));
+      else
+        DrawToast(io, s, IM_COL32(140, 230, 140, 255), "Shaders ready", secs(ended_at_));
+      return;
     }
-    float alpha = float(std::min(1.0, (length - shown) / kFadeS));
-    // No minutes estimate: the first shaders compile faster than the rest, so the rate over the
-    // toast's first seconds said "about 3 min" for a 5.5-min precompile on the Thor.
-    float s = std::max(1.0f, io.DisplaySize.y / 1080.0f);
-    float pad = 12.0f * s;
-    ImGui::SetNextWindowPos(ImVec2(pad, pad), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.6f);
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f * s, 8.0f * s));
-    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                                   ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
-                                   ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing;
-    if (ImGui::Begin("##lr_precompile_notice", nullptr, flags)) {
-      ImGui::SetWindowFontScale(s);
-      if (done_) {
-        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(140, 230, 140, 255));
-        ImGui::Text("Shaders ready");
-        ImGui::PopStyleColor();
-      } else {
-        ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(240, 220, 110, 255));
-        ImGui::Text("Preparing shaders: %d%%", last_permille_ / 10);
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::TextDisabled("(takes a few minutes)");
-        ImGui::TextDisabled("Once after an update or a GPU driver change.");
-        ImGui::TextDisabled("Wait at the title for smooth play.");
+    // Then the rest, in the background.
+    if (all >= 0) {
+      if (!background_seen_) {
+        background_seen_ = true;
+        background_first_ = now;
       }
+      const double t = secs(background_first_);
+      background_eta_.Update(t, all);
+      if (all / 100 > background_logged_tenth_) {
+        background_logged_tenth_ = all / 100;
+        REXLOG_INFO("LR precompile: all shaders {}% ({:.0f} s in the background)", all / 10, t);
+      }
+      DrawBackground(io, s, all);
+      return;
     }
-    ImGui::End();
-    ImGui::PopStyleVar(2);
+    if (background_seen_ && !background_done_) {
+      background_done_ = true;
+      background_done_at_ = now;
+      REXLOG_INFO("LR precompile: all shaders compiled ({:.0f} s in the background)", secs(background_first_));
+    }
+    if (background_done_ && secs(background_done_at_) < kReadyS) {
+      DrawToast(io, s, IM_COL32(140, 230, 140, 255), "All shaders compiled", secs(background_done_at_));
+      return;
+    }
+    Close();
   }
 
  private:
-  static constexpr double kDelayS = 2.0, kToastS = 12.0, kReadyS = 4.0, kFadeS = 1.5;
+  static constexpr double kDelayS = 2.0, kReadyS = 4.0, kFadeS = 1.0;
+
+  // Time left from the rate over the last kWindowS, not since the start: the cheapest shaders come
+  // first and the chip warms up, so the rate since the start said "about 3 min" for a 5.5-min
+  // precompile on the Thor. kSlowdown allows for the rate falling further; smoothed so it counts
+  // down steadily instead of jumping with each batch of shaders.
+  struct Eta {
+    static constexpr double kWindowS = 40.0, kSlowdown = 1.15;
+    std::deque<std::pair<double, int>> samples;  // (seconds, permille), one a second
+    double left = -1.0, at = 0.0;                // seconds left, and when that was computed
+
+    void Update(double t, int permille) {
+      if (!samples.empty() && t - samples.back().first < 1.0) return;
+      samples.emplace_back(t, permille);
+      while (samples.size() > 2 && t - samples.front().first > kWindowS) samples.pop_front();
+      if (t < 15.0) return;
+      const double dt = samples.back().first - samples.front().first;
+      const double dp = double(samples.back().second - samples.front().second);
+      if (dt < 5.0 || dp <= 0.0) return;
+      const double raw = (1000.0 - permille) * dt / dp * kSlowdown;
+      left = left < 0.0 ? raw : 0.8 * std::max(0.0, left - (t - at)) + 0.2 * raw;
+      at = t;
+    }
+    std::string Text() const {
+      if (left < 0.0) return "estimating the time left\xE2\x80\xA6";
+      if (left < 60.0) return "less than a minute left";
+      return "about " + std::to_string(int(std::ceil(left / 60.0))) + " min left";
+    }
+  };
+
+  static std::string Minutes(double seconds) {
+    const int total = int(seconds);
+    char text[16];
+    std::snprintf(text, sizeof(text), "%d:%02d", total / 60, total % 60);
+    return text;
+  }
+
+  // The screen font at px pixels (at 1080p): Roboto when loaded, else the drawer's own font.
+  static void PushScreenFont(ImFont* font, float px, float s) {
+    ImGui::PushFont(font ? font : ImGui::GetIO().Fonts->Fonts[0], px * s);
+  }
+
+  static constexpr ImGuiWindowFlags kOverlayFlags =
+      ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing;
+  static constexpr ImU32 kGold = IM_COL32(240, 220, 110, 255), kText = IM_COL32(236, 232, 224, 255),
+                         kDim = IM_COL32(170, 164, 156, 255);
+
+  void DrawScreen(ImGuiIO& io, float s, double t) {
+    g_lr_precompile_screen_drawn.store(true, std::memory_order_relaxed);
+    const float width = std::min(io.DisplaySize.x * 0.74f, 1280.0f * s);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(width, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.88f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(36.0f * s, 28.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 14.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12.0f * s, 14.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f * s);
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(176, 141, 87, 255));
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, IM_COL32(233, 196, 106, 255));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(60, 52, 40, 255));
+    if (ImGui::Begin("##lr_precompile_screen", nullptr, kOverlayFlags)) {
+      PushScreenFont(g_lr_font_large, 44.0f, s);
+      ImGui::PushStyleColor(ImGuiCol_Text, kGold);
+      ImGui::TextUnformatted("Preparing shaders for this device");
+      ImGui::PopStyleColor();
+      ImGui::PopFont();
+
+      PushScreenFont(g_lr_font_body, 30.0f, s);
+      char percent[16];
+      std::snprintf(percent, sizeof(percent), "%d%%", last_permille_ / 10);
+      // The percentage sits right of the fill (on the dark track) until the fill nears the end.
+      ImGui::PushStyleColor(ImGuiCol_Text, last_permille_ < 880 ? kText : IM_COL32(30, 24, 16, 255));
+      ImGui::ProgressBar(last_permille_ / 1000.0f, ImVec2(-FLT_MIN, 46.0f * s), percent);
+      ImGui::PopStyleColor();
+      const std::string status = Minutes(t) + " elapsed   \xC2\xB7   " + screen_eta_.Text();
+      ImGui::PushStyleColor(ImGuiCol_Text, kText);
+      ImGui::TextUnformatted(status.c_str());
+      ImGui::PopStyleColor();
+      ImGui::PopFont();
+
+      PushScreenFont(g_lr_font_body, 25.0f, s);
+      ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+      ImGui::TextWrapped(
+          "The game's graphics shaders are being compiled for this GPU driver, so that new areas, "
+          "battles and effects don't stutter the first time they appear. This runs once after "
+          "installing, and again after an update or a GPU driver change.");
+      ImGui::PopStyleColor();
+      ImGui::PushStyleColor(ImGuiCol_Text, kText);
+      ImGui::TextWrapped("The game continues by itself when this is done.");
+      ImGui::PopStyleColor();
+      const int held_ms = g_lr_precompile_skip_ms.load(std::memory_order_relaxed);
+      ImGui::PushStyleColor(ImGuiCol_Text, held_ms > 0 ? kGold : kDim);
+      if (held_ms > 0) {
+        char line[64];
+        std::snprintf(line, sizeof(line), "Keep holding to skip\xE2\x80\xA6 %.1f s",
+                      std::max(0.0, 2.0 - held_ms / 1000.0));
+        ImGui::TextUnformatted(line);
+      } else {
+        ImGui::TextWrapped("To play now anyway, hold START + BACK for 2 seconds (expect stutters in "
+                           "new areas until a later start finishes this).");
+      }
+      ImGui::PopStyleColor();
+      ImGui::PopFont();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(3);
+    ImGui::PopStyleVar(5);
+  }
+
+  // The rest of the shaders, compiling in the background at the title: a corner panel.
+  void DrawBackground(ImGuiIO& io, float s, int all) {
+    g_lr_precompile_screen_drawn.store(true, std::memory_order_relaxed);
+    const float pad = 16.0f * s;
+    ImGui::SetNextWindowPos(ImVec2(pad, pad), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(std::min(io.DisplaySize.x * 0.5f, 760.0f * s), 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.72f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f * s, 12.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * s);
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f * s, 8.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 5.0f * s);
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, IM_COL32(233, 196, 106, 255));
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, IM_COL32(60, 52, 40, 255));
+    if (ImGui::Begin("##lr_precompile_background", nullptr, kOverlayFlags)) {
+      PushScreenFont(g_lr_font_body, 24.0f, s);
+      char line[96];
+      std::snprintf(line, sizeof(line), "Compiling the remaining shaders: %d%%", all / 10);
+      ImGui::PushStyleColor(ImGuiCol_Text, kGold);
+      ImGui::TextUnformatted(line);
+      ImGui::PopStyleColor();
+      ImGui::ProgressBar(all / 1000.0f, ImVec2(-FLT_MIN, 10.0f * s), "");
+      PushScreenFont(g_lr_font_body, 20.0f, s);
+      const std::string status = background_eta_.Text() +
+                                 ". You can play now: starting the game pauses this until the next start.";
+      ImGui::PushStyleColor(ImGuiCol_Text, kDim);
+      ImGui::TextWrapped("%s", status.c_str());
+      ImGui::PopStyleColor();
+      ImGui::PopFont();
+      ImGui::PopFont();
+    }
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(4);
+  }
+
+  void DrawToast(ImGuiIO& io, float s, ImU32 color, const char* text, double shown) {
+    g_lr_precompile_screen_drawn.store(true, std::memory_order_relaxed);
+    const float alpha = float(std::min(1.0, (kReadyS - shown) / kFadeS));
+    const float pad = 16.0f * s;
+    ImGui::SetNextWindowPos(ImVec2(pad, pad), ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.7f);
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, alpha);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(18.0f * s, 12.0f * s));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * s);
+    if (ImGui::Begin("##lr_precompile_notice", nullptr, kOverlayFlags | ImGuiWindowFlags_AlwaysAutoResize)) {
+      PushScreenFont(g_lr_font_body, 30.0f, s);
+      ImGui::PushStyleColor(ImGuiCol_Text, color);
+      ImGui::TextUnformatted(text);
+      ImGui::PopStyleColor();
+      ImGui::PopFont();
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(3);
+  }
+
   LrPrecompileNotice** owner_;
-  std::chrono::steady_clock::time_point created_, first_, done_at_;
-  int first_permille_ = 0, last_permille_ = 0;
-  bool seen_ = false, done_ = false;
+  std::chrono::steady_clock::time_point created_, first_, ended_at_, background_first_, background_done_at_;
+  int last_permille_ = 0, logged_tenth_ = 0, background_logged_tenth_ = 0;
+  bool seen_ = false, ended_ = false, ended_by_skip_ = false, screen_shown_ = false;
+  bool background_seen_ = false, background_done_ = false;
+  Eta screen_eta_, background_eta_;
 };
 
 // Frame rate and frame time graph in the top-right corner (F2, bind_lr_frame_overlay). The
@@ -932,6 +1142,29 @@ class LrApp : public rex::ReXApp {
     g_lr_controls_ui = nullptr;
     controls_overlay_.reset();
     controls_picture_.texture.reset();
+  }
+
+  // A readable face for the app's own screens (the shader screen): the drawer's font is ProggyTiny
+  // at 10 px. Android's Roboto (on every device), baked at two sizes; the renderer cannot add sizes
+  // later, so LockBakedSizes makes other sizes scale the closest bake. The drawer's font stays the
+  // default (added first).
+  void OnConfigureFonts(ImFontAtlas* atlas) override {
+    static const ImWchar ranges[] = {0x0020, 0x00FF, 0x2010, 0x2027, 0};
+    for (const char* path : {"/system/fonts/Roboto-Regular.ttf", "/system/fonts/RobotoStatic-Regular.ttf",
+                             "/system/fonts/DroidSans.ttf"}) {
+      std::error_code ec;
+      if (!std::filesystem::is_regular_file(path, ec)) continue;
+      ImFontConfig config;
+      config.OversampleH = config.OversampleV = 2;
+      config.Flags |= ImFontFlags_LockBakedSizes;
+      g_lr_font_large = atlas->AddFontFromFileTTF(path, 48.0f, &config, ranges);
+      g_lr_font_body = atlas->AddFontFromFileTTF(path, 30.0f, &config, ranges);
+      if (g_lr_font_large && g_lr_font_body) {
+        REXLOG_INFO("LR fonts: {} for the app's screens", path);
+        return;
+      }
+    }
+    g_lr_font_large = g_lr_font_body = nullptr;
   }
 
   // F2: frame rate and frame time graph (rebindable as bind_lr_frame_overlay in the F4 settings).

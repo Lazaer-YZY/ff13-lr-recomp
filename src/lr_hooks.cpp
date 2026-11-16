@@ -1924,6 +1924,12 @@ std::unique_lock<std::mutex> lr_input_lock() {
 
 std::atomic<bool> g_lr_input_blocked{false};
 std::atomic<bool> g_lr_screenshot_request{false};  // lr_app.h takes one when set
+// The first-start shader screen (lr_app.h LrPrecompileNotice): 1 = holds play, 2 = skipped, input
+// still held until START + BACK are released; how long they have been held; whether it was skipped.
+std::atomic<int> g_lr_precompile_hold{0};
+std::atomic<int> g_lr_precompile_skip_ms{0};
+std::atomic<bool> g_lr_precompile_skipped{false};
+std::atomic<bool> g_lr_precompile_screen_drawn{false};  // the panel is on screen (loading view hides)
 extern std::atomic<int> g_lr_controls_open;  // lr_keyboard_menu.inc: the Gamepad Controls picture
 extern std::function<void(bool)> g_lr_controls_ui;
 #if defined(__ANDROID__)
@@ -1965,6 +1971,31 @@ REX_HOOK_RAW(sub_82D329C0) {
   // Settings > Keyboard Settings is waiting for a key (lr_keyboard_menu.inc): the game sees no
   // buttons until it is released.
   if (g_lr_input_blocked.load(std::memory_order_relaxed) && ctx.r3.u32 == 0 && lr_state) {
+    std::memset(base + lr_state + 4, 0, 12);
+  }
+  // The first-start shader screen (LrPrecompileNotice, lr_app.h) holds play: the game sees no input
+  // (pad or on-screen controls) until the shaders are built, or until START + BACK (0x0030) have
+  // been held for 2 s; then nothing until they are released, so the title does not act on them.
+  if (int hold = g_lr_precompile_hold.load(std::memory_order_relaxed); hold && ctx.r3.u32 == 0 && lr_state) {
+    static std::chrono::steady_clock::time_point held_since{};
+    const uint16_t buttons = uint16_t(base[lr_state + 4] << 8 | base[lr_state + 5]);
+    const auto now = std::chrono::steady_clock::now();
+    if (hold == 1 && (buttons & 0x0030) == 0x0030) {
+      if (held_since == std::chrono::steady_clock::time_point{}) held_since = now;
+      const int ms = int(std::chrono::duration_cast<std::chrono::milliseconds>(now - held_since).count());
+      g_lr_precompile_skip_ms.store(std::max(ms, 1));
+      if (ms >= 2000) {
+        g_lr_precompile_skipped.store(true);
+        g_lr_precompile_hold.store(2);
+        g_lr_precompile_skip_ms.store(0);
+        held_since = {};
+      }
+    } else if (hold == 1) {
+      held_since = {};
+      g_lr_precompile_skip_ms.store(0);
+    } else if (hold == 2 && !buttons) {
+      g_lr_precompile_hold.store(0);
+    }
     std::memset(base + lr_state + 4, 0, 12);
   }
   // The Gamepad Controls picture is up (drawn by the app): A, B, Start, or Back closes it, and the
@@ -5532,6 +5563,10 @@ REX_HOOK_RAW(sub_82E0C480) {
               barrier, (t1 - t0) / 1000.0, caller, gate, signals.empty() ? " (no noted release)" : "",
               signals, visits.empty() ? " none" : visits, worker_waits);
 }
+
+// The game's frames so far: the app's loading view (android_glue.cpp nativeBootProgress) stays
+// up until the game draws (none run while the shader storage loads at boot).
+uint64_t lr_frame_count() { return g_lr_frames.load(std::memory_order_relaxed); }
 
 REX_EXTERN(__imp__sub_829CB8F0);
 REX_HOOK_RAW(sub_829CB8F0) {

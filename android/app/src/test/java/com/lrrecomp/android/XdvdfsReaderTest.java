@@ -139,6 +139,14 @@ public class XdvdfsReaderTest {
                 assertTrue(reader.copy(xex, output.getChannel(), ByteBuffer.allocateDirect(8 << 20), null));
             }
             assertEquals(IsoImport.TESTED_XEX_SHA256, IsoImport.sha256(out));
+            // The pre-import check hashes default.xex straight from the disc.
+            assertEquals(IsoImport.TESTED_XEX_SHA256, IsoImport.sha256(reader.head(xex, (int) xex.size)));
         }
+    }
+
+    @Test
+    public void sha256OfBytes() throws IOException {
+        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            IsoImport.sha256("abc".getBytes(StandardCharsets.US_ASCII)));
     }
 }

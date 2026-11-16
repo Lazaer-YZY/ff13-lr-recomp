@@ -19,6 +19,8 @@ import android.os.Environment;
 import android.os.SystemClock;
 import android.view.View;
 import java.io.File;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 
 /**
@@ -49,7 +51,12 @@ final class CompanionView extends View {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
     private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint glow = new Paint(Paint.ANTI_ALIAS_FLAG);
-    /** The game's text face (closest match Verdana): assets/fonts/hud_text.ttf when the build bundled one. */
+    /**
+     * The game's text face (closest match Verdana), first found of: assets/fonts/hud_text.ttf
+     * (private builds copy the builder's Verdana), a Verdana on the device ({@link #findVerdana}),
+     * DejaVu Sans (assets/fonts_free; Bitstream Vera's design, close to Verdana and free to
+     * bundle), the system sans.
+     */
     private Typeface hudFont;
 
     private Typeface hudBold;
@@ -57,24 +64,60 @@ final class CompanionView extends View {
     /** The battle HUD's heavier command and schema lettering (Verdana Bold match). */
     private Typeface hudBold() {
         if (hudBold == null) {
-            try {
-                hudBold = Typeface.createFromAsset(getContext().getAssets(), "fonts/hud_bold.ttf");
-            } catch (RuntimeException e) {
-                hudBold = Typeface.create(hudFont(), Typeface.BOLD);
-            }
+            hudBold = fromAsset("fonts/hud_bold.ttf");
+            if (hudBold == null) hudBold = fromFile(findVerdana(true));
+            if (hudBold == null) hudBold = fromAsset("fonts_free/DejaVuSans-Bold.ttf");
+            if (hudBold == null) hudBold = Typeface.create(hudFont(), Typeface.BOLD);
         }
         return hudBold;
     }
 
     private Typeface hudFont() {
         if (hudFont == null) {
-            try {
-                hudFont = Typeface.createFromAsset(getContext().getAssets(), "fonts/hud_text.ttf");
-            } catch (RuntimeException e) {
-                hudFont = Typeface.create("sans-serif", Typeface.NORMAL);
-            }
+            hudFont = fromAsset("fonts/hud_text.ttf");
+            if (hudFont == null) hudFont = fromFile(findVerdana(false));
+            if (hudFont == null) hudFont = fromAsset("fonts_free/DejaVuSans.ttf");
+            if (hudFont == null) hudFont = Typeface.create("sans-serif", Typeface.NORMAL);
         }
         return hudFont;
+    }
+
+    private Typeface fromAsset(String path) {
+        try {
+            return Typeface.createFromAsset(getContext().getAssets(), path);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Verdana ("verdana.ttf", bold "verdanab.ttf") installed on the device, or the player's own
+     * copy (from a Windows PC's Fonts folder) in the app folder's fonts/, i.e.
+     * Android/data/com.lrrecomp.android/files/fonts/; null when neither is there. Android itself
+     * ships no Verdana, and the public APK cannot carry it (its licence forbids passing it on).
+     */
+    private File findVerdana(boolean bold) {
+        String want = bold ? "verdanab.ttf" : "verdana.ttf";
+        List<File> dirs = new ArrayList<>();
+        for (String dir : new String[] { "/system/fonts", "/product/fonts", "/system_ext/fonts" })
+            dirs.add(new File(dir));
+        File app = getContext().getExternalFilesDir(null);
+        if (app != null) dirs.add(new File(app, "fonts"));
+        for (File dir : dirs) {
+            String[] names = dir.list();
+            if (names == null) continue;
+            for (String name : names) if (name.equalsIgnoreCase(want)) return new File(dir, name);
+        }
+        return null;
+    }
+
+    private static Typeface fromFile(File file) {
+        if (file == null) return null;
+        try {
+            return Typeface.createFromFile(file);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
     private final RectF[] cards = { new RectF(), new RectF(), new RectF() };
     private final RectF tmp = new RectF();

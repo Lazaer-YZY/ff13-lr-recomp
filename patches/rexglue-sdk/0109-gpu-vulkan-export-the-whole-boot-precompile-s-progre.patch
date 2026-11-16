@@ -1,0 +1,66 @@
+From 590cc8a6dc5d20a2661734df722f64a7d5263ac5 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 16 Nov 2026 19:56:40 +0800
+Subject: [PATCH] gpu/vulkan: export the whole boot precompile's progress
+ (rex_precompile_all_permille) for the app's background indicator
+
+---
+ src/graphics/vulkan/pipeline_cache.cpp     | 6 ++++++
+ src/kernel/xboxkrnl/xboxkrnl_threading.cpp | 3 +++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 90999b2..1fb1695 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -5328,6 +5328,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+ // (xboxkrnl_threading.cpp) so that both libraries link them.
+ extern "C" volatile int rex_game_interactive;
+ extern "C" volatile int rex_precompile_permille;
++extern "C" volatile int rex_precompile_all_permille;
+ namespace {
+ // Pipeline creation (the driver's shader compiler) runs in bursts when the game reaches new
+ // areas or battles. The Android app pins every thread to the middle cluster so that the game's
+@@ -5479,6 +5480,7 @@ void VulkanPipelineCache::PrecompileThread() {
+   };
+ #if defined(__ANDROID__)
+   rex_precompile_permille = 0;
++  rex_precompile_all_permille = 0;
+   const int in_game_mode = REXCVAR_GET(vulkan_precompile_in_game);
+ #endif
+   auto worker = [&]() {
+@@ -5527,6 +5529,9 @@ void VulkanPipelineCache::PrecompileThread() {
+       if (index >= work_total) {
+         break;
+       }
++#if defined(__ANDROID__)
++      rex_precompile_all_permille = int(index * 1000 / work_total);
++#endif
+       // Counts this entry towards the used-in-play set when the iteration ends (any path).
+       PriorityGuard priority_guard{index < priority_total ? &priority_item_done : nullptr};
+       if (index && index % 1000 == 0) {
+@@ -5715,6 +5720,7 @@ void VulkanPipelineCache::PrecompileThread() {
+   bool finished = !precompile_shutdown_ && !stopped_in_game;
+ #if defined(__ANDROID__)
+   rex_precompile_permille = -1;
++  rex_precompile_all_permille = -1;
+ #endif
+   REXGPU_INFO("VulkanPipelineCache: pixel shader library precompile {}: {} libraries compiled, "
+               "{} shader variants already done, {} shaders skipped (no metadata / dynamic "
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 6a94600..34714a7 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -489,6 +489,9 @@ extern "C" __attribute__((visibility("default"))) volatile int rex_game_interact
+ // The boot pipeline library precompile's progress in permille while it runs, else -1 (set in
+ // graphics/vulkan/pipeline_cache.cpp, shown by the app at the title).
+ extern "C" __attribute__((visibility("default"))) volatile int rex_precompile_permille = -1;
++// The whole precompile's progress in permille (rex_precompile_permille covers only the shaders
++// used in play, which come first; the rest continues in the background), else -1.
++extern "C" __attribute__((visibility("default"))) volatile int rex_precompile_all_permille = -1;
+ 
+ u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
+   if (auto observer = rex_set_event_observer) observer(0, event_ptr.guest_address());
+-- 
+2.51.0.windows.1
+

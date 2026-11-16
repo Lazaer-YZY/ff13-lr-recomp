@@ -341,6 +341,26 @@ bool LoadCustomVulkanDriver() {
 // JNI: com.lrrecomp.android.RuntimeActivity
 // ---------------------------------------------------------------------------
 
+uint64_t lr_frame_count();                                  // lr_hooks.cpp
+extern std::atomic<bool> g_lr_precompile_screen_drawn;      // lr_hooks.cpp, set by lr_app.h
+extern "C" volatile int rex_precompile_permille;            // the runtime: -1 = none running
+extern "C" volatile int rex_precompile_all_permille;        // the whole precompile, -1 = none
+
+// The app's loading view (RuntimeActivity BootOverlay) over the black screen at boot, while the
+// runtime loads the shader storage (no game frames run then; ~50 s on a first start with the
+// bundled shader cache): 0 = the game has not started, 1 = it runs but shows nothing yet,
+// 2 = something is on screen (the shader notice drew, or 300 frames ran with no precompile
+// running: the boot logos; the precompile starts a moment after the game), 3 = 1200 frames
+// ran (a fallback).
+extern "C" __attribute__((visibility("default"))) JNIEXPORT jint JNICALL
+Java_com_lrrecomp_android_RuntimeActivity_nativeBootProgress(JNIEnv*, jclass) {
+  if (g_lr_precompile_screen_drawn.load(std::memory_order_relaxed)) return 2;
+  const uint64_t frames = lr_frame_count();
+  if (frames >= 1200) return 3;
+  if (frames >= 300 && rex_precompile_permille < 0 && rex_precompile_all_permille < 0) return 2;
+  return frames > 0 ? 1 : 0;
+}
+
 extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
 Java_com_lrrecomp_android_RuntimeActivity_nativeSetTouchInput(
     JNIEnv*, jclass, jint buttons, jint leftTrigger, jint rightTrigger, jint leftX, jint leftY,
