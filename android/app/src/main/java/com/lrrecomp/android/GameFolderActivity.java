@@ -262,7 +262,7 @@ public final class GameFolderActivity extends Activity {
             .setTitle("Allow file access")
             .setMessage("The game reads its files directly, so folders outside "
                 + "the app folder need the \"All files access\" permission. Android opens the "
-                + "setting now; turn it on for Lightning Returns Recomp and come back.")
+                + "setting now; turn it on for " + getString(R.string.app_name) + " and come back.")
             .setPositiveButton("Open setting", (dialog, which) -> requestStorage(next))
             .setNegativeButton("Cancel", null)
             .show();

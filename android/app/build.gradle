@@ -51,6 +51,10 @@ def lrPublicDefaults = (project.findProperty('lrPublicDefaults') ?: 'false').toS
 // then uses a Verdana on the device or the bundled DejaVu Sans in assets/fonts_free). The area maps
 // and HUD pieces stay in (the owner, DECISIONS 2026-11-16).
 def lrRedistributable = (project.findProperty('lrRedistributable') ?: 'false').toString().toBoolean()
+// Launcher icon: out/branding/res when it exists (tools/make_icon.py; git-ignored, since the release
+// icon is the game's emblem and the repository holds no game artwork), else the placeholder bolt.
+def lrBrandingRes = rootProject.file('../out/branding/res')
+def lrBranded = new File(lrBrandingRes, 'mipmap-anydpi-v26/ic_launcher_lr.xml').isFile()
 // -PlrAppIdSuffix=.test installs beside the normal app with its own data folder (a first start).
 def lrAppIdSuffix = (project.findProperty('lrAppIdSuffix') ?: '').toString()
 
@@ -68,6 +72,7 @@ android {
         ndk { abiFilters 'arm64-v8a' }
         buildConfigField 'boolean', 'PUBLIC_DEFAULTS', lrPublicDefaults.toString()
         if (lrAppIdSuffix) applicationIdSuffix lrAppIdSuffix
+        manifestPlaceholders = [lrIcon: lrBranded ? '@mipmap/ic_launcher_lr' : '@mipmap/ic_launcher']
     }
     buildFeatures { buildConfig true }
     if (lrRedistributable) {
@@ -80,6 +85,7 @@ android {
     }
     sourceSets.main {
         java.srcDir layout.buildDirectory.dir('generated/sdl-java')
+        if (lrBranded) res.srcDir lrBrandingRes
     }
     lint { lintConfig = file('../lint.xml') }
     // Bottom-screen previews on the PC (CompanionPreviewTest, Robolectric native graphics):

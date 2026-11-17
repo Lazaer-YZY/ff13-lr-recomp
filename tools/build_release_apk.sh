@@ -16,6 +16,9 @@
 # Signed with this PC's Android debug keystore (DECISIONS 2026-11-16): keep a backup of it, since
 # an update installs over the previous release only when both carry the same signature.
 #
+# Launcher icon: out/branding (tools/make_icon.py; the game's emblem for the releases, git-ignored
+# like every piece of game artwork); the script fails without it. App name: strings.xml app_name.
+#
 # It also carries a shader cache seed (out/shader_seed, see below), so a fresh install precompiles
 # every shader at the title instead of drawing white menus and stuttering on first sight.
 #
@@ -49,6 +52,8 @@ cd /c/lr
 # shellcheck disable=SC1091
 set +u; source /c/lr/tools/env.sh >/dev/null; set -u
 [ -s "$PAT" ] || die "no personal patterns in $PAT"
+[ -f out/branding/res/mipmap-anydpi-v26/ic_launcher_lr.xml ] \
+  || die "no launcher icon in out/branding (python -I tools/make_icon.py IMAGE; the releases use the game's emblem)"
 if [ "$TEST" = 0 ] && ! git diff --quiet HEAD -- . ':!lr_manifest.toml'; then
   die "uncommitted changes: a release APK is built from a commit"
 fi
@@ -106,6 +111,13 @@ badging=$("$BT/aapt2.exe" dump badging "$APK")
 grep -q "name='com.lrrecomp.android$SUFFIX' versionCode='[0-9]*' versionName='$VERSION'" <<<"$badging" \
   || die "unexpected package/version: $(head -1 <<<"$badging")"
 ! grep -q "application-debuggable" <<<"$badging" || die "APK is debuggable"
+# The launcher icon is out/branding's (tools/make_icon.py) and the label is the app_name.
+icon_id=$("$BT/aapt2.exe" dump resources "$APK" | sed -n 's|.*resource \(0x[0-9a-f]*\) mipmap/ic_launcher_lr\b.*|\1|p' | head -1)
+[ -n "$icon_id" ] && "$BT/aapt2.exe" dump xmltree --file AndroidManifest.xml "$APK" | grep -q "android:icon([^)]*)=@$icon_id" \
+  || die "the launcher icon is not out/branding's (mipmap/ic_launcher_lr)"
+app_name=$(sed -n 's|.*<string name="app_name">\(.*\)</string>.*|\1|p' android/app/src/main/res/values/strings.xml)
+grep -qF "application-label:'$app_name'" <<<"$badging" || die "app name is not '$app_name': $(grep -m1 application-label <<<"$badging")"
+echo "   name $app_name, icon mipmap/ic_launcher_lr ($icon_id)"
 # 3. Builder's identifiers or user paths: in the printable strings of the libraries, the dex and
 #    the manifest, and in the JSON assets (images and fonts are compressed data, where random bytes
 #    match short names). Third-party texts that contain a matching name are allowed.
