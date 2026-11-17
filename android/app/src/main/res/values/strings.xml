@@ -32,5 +32,9 @@
     <string name="touch_exact_shader_math">Exact Xbox shader math (slower; only if something renders wrong; from the next start, shaders rebuild once)</string>
     <string name="touch_companion">Second screen: schemata in battle (tap to switch), map in the field, artwork in cutscenes</string>
     <string name="touch_debug_log">Debug logging (frame and wait statistics for troubleshooting; slight extra load; from the next start)</string>
+    <string name="touch_cheats_title">Cheats</string>
+    <string name="touch_cheats_help">Apply at once. Saving while a cheat is on keeps its effects in that save (a frozen clock stays at its time).</string>
+    <string name="cheat_infinite_ep">Infinite EP (EP abilities cost nothing)</string>
+    <string name="cheat_freeze_clock">Freeze the clock (the days do not pass)</string>
     <string name="touch_cancel">Cancel</string>
 </resources>

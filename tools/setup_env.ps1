@@ -7,9 +7,6 @@ $Repo = Split-Path -Parent $PSScriptRoot  # the clone this script lives in
 if (-not (Test-Path 'C:\lr')) {
   New-Item -ItemType Junction -Path 'C:\lr' -Target $Repo | Out-Null
 }
-if (-not (Test-Path 'C:\lrgame')) {
-  New-Item -ItemType Junction -Path 'C:\lrgame' -Target (Join-Path $Repo 'Input - Data\extracted') | Out-Null
-}
 
 $env:PATH = "$Dev\llvm\bin;$Dev\cmake\bin;$Dev\ninja;$Dev\jdk17\bin;$Dev\android-sdk\platform-tools;$Dev\android-sdk\cmdline-tools\latest\bin;$Dev\rexglue\bin;" + $env:PATH
 $env:JAVA_HOME = "$Dev\jdk17"

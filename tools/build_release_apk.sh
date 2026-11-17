@@ -42,9 +42,9 @@ die() { echo "build_release_apk: ERROR: $*" >&2; exit 1; }
 
 REPO=C:/lr
 OUT=$REPO/out/release
-LOG=C:/dev/logs/android_lr_release.log
+LOG=$REPO/out/logs/android_lr_release.log
 PAT=$REPO/out/personal_patterns.txt
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$REPO/out/logs"
 cd /c/lr
 # shellcheck disable=SC1091
 set +u; source /c/lr/tools/env.sh >/dev/null; set -u

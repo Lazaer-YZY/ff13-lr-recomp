@@ -1,13 +1,13 @@
 #!/bin/bash
 # Pushes the extracted game tree to the Thor's app-private game folder over adb, one file at a time with retries.
-# Usage: bash /c/lr/tools/push_game_data.sh [source_dir=C:/lrgame]
+# Usage: bash /c/lr/tools/push_game_data.sh [source_dir="C:/lr/Input - Data/extracted"]
 # Needs: USB debugging on, device authorised (`adb devices` shows it), the app installed once.
 # Thor rule: the screen is woken only while the transfer runs (a sleeping device suspends USB and breaks
 # multi-GB pushes) and is put to sleep at the end, also on failure.
 set -u
 export MSYS_NO_PATHCONV=1   # Git Bash must not rewrite /sdcard/... device paths into C:\... paths
 source /c/lr/tools/env.sh
-SRC=${1:-C:/lrgame}
+SRC=${1:-"C:/lr/Input - Data/extracted"}
 PKG=com.lrrecomp.android
 DST=/sdcard/Android/data/$PKG/files/game
 ADB=(adb ${LR_ADB_SERIAL:+-s "$LR_ADB_SERIAL"})

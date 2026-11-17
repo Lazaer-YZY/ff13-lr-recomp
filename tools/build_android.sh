@@ -11,11 +11,12 @@
 #
 # Env overrides: LR_ANDROID_SDK_PREFIX (default C:/dev/rexglue-android),
 #                LR_ANDROID_BUILD_TYPE (default Release).
-# Logs: C:/dev/logs/android_lr_{configure,build,gradle}.log
+# Logs: $REPO/out/logs/android_lr_{configure,build,gradle}.log (LR_LOGS overrides)
 set -euo pipefail
 
 REPO=${LR_REPO:-C:/lr}   # LR_REPO: another worktree (its own out/build); shared assets stay in C:/lr/out
 MAIN_OUT=C:/lr/out
+GAME_ROOT=${LR_GAME_ROOT:-"C:/lr/Input - Data/extracted"}   # extracted game tree (default.xex, weiss_data/)
 BUILD=${LR_BUILD_DIR:-$REPO/out/build/android-arm64}   # LR_BUILD_DIR: override (testing)
 SDK_PREFIX=${LR_ANDROID_SDK_PREFIX:-C:/dev/rexglue-android}
 BUILD_TYPE=${LR_ANDROID_BUILD_TYPE:-Release}
@@ -27,7 +28,7 @@ JNI_DIR=$REPO/android/app/src/main/jniLibs/arm64-v8a
 APK=$REPO/android/app/build/outputs/apk/debug/app-debug.apk
 PKG=com.lrrecomp.android
 ACTIVITY=${LR_ACTIVITY:-.GpuDriverActivity}   # LAUNCHER activity (forwards to RuntimeActivity); LR_ACTIVITY=.RuntimeActivity skips the GPU-driver page
-LOGS=${LR_LOGS:-C:/dev/logs}
+LOGS=${LR_LOGS:-$REPO/out/logs}
 JOBS=8
 HOOK_TARGETS=(hook_impl main_hook file_redirect_hook gsl_alloc_hook)
 
@@ -152,7 +153,7 @@ if has stage; then
   echo "  bundled GPU driver: Stable Turnip v2 ($(stat -c %s "$TURNIP_ZIP") bytes, sha256 ok)"
   # Second screen: the area maps, built once from the game files (tools/lr_navimap.py). Derived from
   # the game like the generated code, so never in git; bundled as APK assets. Needs a Python with
-  # numpy + Pillow (LR_PY_NUMPY, default out/venv) and the game tree (LR_GAME_ROOT, default C:/lrgame).
+  # numpy + Pillow (LR_PY_NUMPY, default out/venv) and the game tree (LR_GAME_ROOT, default C:/lr/Input - Data/extracted).
   NAVI_DIR=$REPO/android/app/src/main/assets/navimap
   NAVI_PY=${LR_PY_NUMPY:-$REPO/out/venv/Scripts/python.exe}
   NAVI_STAMP=$(cat "$REPO/tools/lr_navimap.py" "$REPO/tools/upscale_assets.py" | sha256sum | cut -c1-16)
@@ -160,7 +161,7 @@ if has stage; then
     if [ -x "$NAVI_PY" ]; then
       rm -rf "$NAVI_DIR"
       mkdir -p "$NAVI_DIR"
-      ( cd "$REPO" && "$NAVI_PY" -I tools/lr_navimap.py "${LR_GAME_ROOT:-C:/lrgame}" "$NAVI_DIR" )         || die "lr_navimap.py failed (the bottom screen's area maps)"
+      ( cd "$REPO" && "$NAVI_PY" -I tools/lr_navimap.py "$GAME_ROOT" "$NAVI_DIR" )         || die "lr_navimap.py failed (the bottom screen's area maps)"
       rm -f "$NAVI_DIR"/_sheet*.png
       echo "$NAVI_STAMP" > "$NAVI_DIR/.stamp"
     else
@@ -175,7 +176,7 @@ if has stage; then
   HUD_STAMP=$(cat "$REPO/tools/companion_hud.py" "$REPO/tools/upscale_assets.py" "$REPO/tools/lr_gui_tex.py" | sha256sum | cut -c1-16)
   if [ -x "$NAVI_PY" ] && { [ ! -f "$HUD_DIR/hud.json" ] || [ "$(cat "$HUD_DIR/.stamp" 2>/dev/null)" != "$HUD_STAMP" ]; }; then
     rm -rf "$HUD_DIR"
-    ( cd "$REPO" && "$NAVI_PY" -I tools/companion_hud.py "${LR_GAME_ROOT:-C:/lrgame}" "$HUD_DIR" )       || die "companion_hud.py failed (the bottom screen's HUD pieces)"
+    ( cd "$REPO" && "$NAVI_PY" -I tools/companion_hud.py "$GAME_ROOT" "$HUD_DIR" )       || die "companion_hud.py failed (the bottom screen's HUD pieces)"
     echo "$HUD_STAMP" > "$HUD_DIR/.stamp"
   fi
   [ -f "$HUD_DIR/hud.json" ] && echo "  HUD pieces: $(ls "$HUD_DIR"/*.png | wc -l) bundled"

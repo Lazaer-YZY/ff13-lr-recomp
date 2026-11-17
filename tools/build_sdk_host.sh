@@ -7,9 +7,9 @@ source /c/lr/tools/env.sh
 SDK=/c/lr/sdk/rexglue-sdk
 BUILD=$SDK/out/build/win-amd64
 PREFIX='C:/dev/rexglue'
-LOG=/c/dev/logs/build_sdk_host.log
+LOG=/c/lr/out/logs/build_sdk_host.log
 step=${1:-all}
-mkdir -p /c/dev/logs
+mkdir -p /c/lr/out/logs
 {
 echo "=== build_sdk_host $step start $(date) ==="
 cd "$SDK"

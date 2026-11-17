@@ -136,6 +136,12 @@ public final class RuntimeActivity extends SDLActivity {
         nativeSetOption("overlay", overlay ? "1" : "0");
     }
 
+    /** CTRL dialog: saves the cheat switches and applies them at once (Cheats.java). */
+    void applyCheats(int bits) {
+        Cheats.save(renderPrefs(this), bits);
+        nativeSetOption("cheats", Cheats.optionValue(bits));
+    }
+
     // Sustained performance mode (on by default; debug extra LR_SUSTAINED=0 turns it off): asks the
     // power HAL for clocks the device can hold indefinitely instead of bursting to peak clocks and
     // then throttling, which on the Thor showed up as temperature spikes and the fan ramping up and
@@ -402,6 +408,14 @@ public final class RuntimeActivity extends SDLActivity {
         nativeSetenv("LR_AA", render.getString("aa", "off"));
         nativeSetenv("REX_PRESENT_EFFECT", render.getString("upscale", "bilinear"));
         nativeSetenv("LR_FRAME_OVERLAY", render.getBoolean("overlay", false) ? "1" : "0");
+        // Cheats (CTRL dialog, off by default): the mask the hooks read at start (LR_CHEATS).
+        // Tests and benches (debug builds): --es LR_CHEATS N for this start only, not saved.
+        int cheats = Cheats.saved(render);
+        if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            int forced = Cheats.parseExtra(getIntent().getStringExtra("LR_CHEATS"));
+            if (forced >= 0) cheats = forced;
+        }
+        nativeSetenv("LR_CHEATS", Cheats.optionValue(cheats));
         // "Debug logging" (CTRL dialog, off by default; the owner, 2026-11-11): the game's frame / wait /
         // CPU statistics and slow-frame reports (LR_DIAG), the command thread's per-draw timers and
         // slow-frame lines (vulkan_slow_frame_ms), the WAIT_REG_MEM statistics, and info-level log

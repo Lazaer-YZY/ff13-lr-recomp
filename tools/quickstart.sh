@@ -9,7 +9,7 @@
 # or an interruption. Force a step again by deleting what it made (paths are printed per step).
 # Needs: Windows 10/11, Git for Windows (run this from Git Bash), Python 3, Developer Mode on
 # (Settings > System > For developers) so Git can create symlinks. No admin rights.
-# Logs: C:/dev/logs/*.log (toolchain and SDK builds), C:/lr/out/quickstart_*.log (recompile).
+# Logs: C:/dev/logs/*.log (toolchain setup), C:/lr/out/logs/*.log (SDK and APK builds), C:/lr/out/quickstart_*.log (recompile).
 set -euo pipefail
 export MSYS_NO_PATHCONV=1
 
@@ -37,7 +37,7 @@ fi
 cd /c/lr
 command -v python >/dev/null || die "Python 3 not found on PATH (install it from python.org, tick 'Add to PATH')."
 command -v git >/dev/null || die "git not found (run this from Git Bash)."
-mkdir -p /c/dev/dl /c/dev/logs out
+mkdir -p /c/dev/dl /c/dev/logs out/logs
 
 # --- 1. Toolchain (portable, into C:\dev; ~6 GB download incl. the Android SDK). ---
 step "1/8 Toolchain into C:\\dev (LLVM, CMake, Ninja, xwin, JDK 17, Android SDK + NDK)"
@@ -82,8 +82,8 @@ step "4/8 Runtime for Android (C:\\dev\\rexglue-android)"
 if [ -f /c/dev/rexglue-android/lib/librexruntime.so ]; then skip "C:\\dev\\rexglue-android\\lib\\librexruntime.so"
 else
   (cd sdk/rexglue-sdk && scripts/configure_android.sh \
-    && cmake --build out/build/android-arm64 --target install --parallel "${JOBS:-8}") > /c/dev/logs/android_sdk_build.log 2>&1 \
-    || die "Android runtime build failed, see C:/dev/logs/android_sdk_build.log"
+    && cmake --build out/build/android-arm64 --target install --parallel "${JOBS:-8}") > /c/lr/out/logs/android_sdk_build.log 2>&1 \
+    || die "Android runtime build failed, see C:/lr/out/logs/android_sdk_build.log"
 fi
 
 # --- 5. Game files from your ISO. ---
@@ -115,7 +115,7 @@ step "7/8 Building the APK (first build: 1 to several hours)"
 APK=android/app/build/outputs/apk/debug/app-debug.apk
 [ -f android/local.properties ] || echo "sdk.dir=C:/dev/android-sdk" > android/local.properties
 bash tools/build_android.sh configure build stage apk
-[ -f "$APK" ] || die "no APK at $APK; see C:/dev/logs/android_lr_*.log"
+[ -f "$APK" ] || die "no APK at $APK; see C:/lr/out/logs/android_lr_*.log"
 step "8/8 Done: C:\\lr\\$APK"
 
 # --- Optional: install on the device and copy the game files (7 GB). ---

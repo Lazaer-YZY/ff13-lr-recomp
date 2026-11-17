@@ -13,6 +13,7 @@
 #if defined(__ANDROID__)
 
 #include "android/android_glue.h"
+#include "lr_cheats.h"
 
 #include <atomic>
 #include <algorithm>
@@ -394,6 +395,7 @@ Java_com_lrrecomp_android_RuntimeActivity_nativeHasConnectedController(JNIEnv*, 
 // lr_hooks.cpp (the game's Settings items on PC; on Android driven from the CTRL dialog).
 bool LrConfigSetFps60(int choice);
 void LrConfigSetAa(int choice);
+void LrConfigSetCheats(int choice);
 // lr_app.h: the frame rate / frame time overlay (F2 on PC), toggled on the UI thread.
 extern std::function<void(bool)> g_lr_frame_overlay_ui;
 
@@ -417,6 +419,9 @@ Java_com_lrrecomp_android_RuntimeActivity_nativeSetOption(JNIEnv* env, jclass,
     LrConfigSetAa(value == "fxaa" ? 1 : value == "extreme" ? 2 : 0);
   } else if (name == "overlay") {
     if (g_lr_frame_overlay_ui) g_lr_frame_overlay_ui(value == "1");
+  } else if (name == "cheats") {
+    // The CTRL dialog's cheat switches (Cheats.java), the kLrCheat* mask in decimal.
+    LrConfigSetCheats(lr_parse_cheats(value));
   } else {
     __android_log_print(ANDROID_LOG_WARN, "lr", "nativeSetOption: unknown option '%s'",
                         name.c_str());

@@ -5,7 +5,7 @@
 Every IN_DIR/*.png is upscaled 4x. Real-ESRGAN works on colour only, so the alpha channel is
 upscaled as its own greyscale image and merged back (colour under fully transparent pixels is
 filled from its neighbours first, so edges don't pick up a dark fringe). MODEL defaults to
-realesr-animevideov3-x4 plus a light unsharp mask (clean shapes, no painted texture). The tool lives in C:/dev/realesrgan
+realesr-animevideov3-x4 plus a light unsharp mask (clean shapes, no painted texture). The tool lives in C:/lr/out/tools/realesrgan
 (realesrgan-ncnn-vulkan-20220424-windows.zip from github.com/xinntao/Real-ESRGAN v0.2.5.0,
 45,474,481 bytes, sha256 abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d).
 Output is derived from the game files: keep it out of git (APK assets, out/).
@@ -19,7 +19,7 @@ import tempfile
 import numpy as np
 from PIL import Image, ImageFilter
 
-EXE = os.environ.get('LR_REALESRGAN', 'C:/dev/realesrgan/realesrgan-ncnn-vulkan.exe')
+EXE = os.environ.get('LR_REALESRGAN', 'C:/lr/out/tools/realesrgan/realesrgan-ncnn-vulkan.exe')
 # the owner, 2026-11-11: x4plus-anime looked painterly ("paintbrush"); animevideov3 keeps the shapes
 # clean, a light unsharp mask restores the crispness (out/dual/cmp/compare_hud2.png).
 DEFAULT_MODEL = 'realesr-animevideov3-x4'

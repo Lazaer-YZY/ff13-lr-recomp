@@ -26,7 +26,7 @@ import org.robolectric.annotation.GraphicsMode;
 
 /**
  * Runs the on-device companion asset builder (CompanionAssets) against the real game files on the
- * PC (LR_GAME_ROOT, default C:/lrgame; skipped without them) into app/build/companion_assets_java/,
+ * PC (LR_GAME_ROOT, default C:/lr/Input - Data/extracted; skipped without them) into app/build/companion_assets_java/,
  * compares it with the Python-built APK assets (src/main/assets/{navimap,hud}, when staged), and
  * renders the CompanionPreviewTest scenes from the Java-built files (build/companion_preview/gen_*.png).
  *   ./gradlew :app:testDebugUnitTest --tests '*CompanionAssetsTest*'
@@ -37,7 +37,7 @@ import org.robolectric.annotation.GraphicsMode;
 public class CompanionAssetsTest {
     private static File gameRoot() {
         String env = System.getenv("LR_GAME_ROOT");
-        return new File(env != null && !env.isEmpty() ? env : "C:/lrgame");
+        return new File(env != null && !env.isEmpty() ? env : "C:/lr/Input - Data/extracted");
     }
 
     private static List<String> files(File dir) {

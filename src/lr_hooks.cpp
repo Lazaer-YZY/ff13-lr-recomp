@@ -21,6 +21,7 @@
 #include <fstream>
 #include <set>
 
+#include "lr_cheats.h"
 #include "lr_steam_saves.h"
 
 #include <string_view>
@@ -2376,7 +2377,7 @@ std::filesystem::path g_lr_settings_dir;
 std::atomic<int> g_lr_voice_jp{0}, g_lr_voice_applied{-1}, g_lr_voice_archives{-1};
 std::atomic<int> g_lr_text_jp{0};
 std::atomic<int> g_lr_aa{0}, g_lr_aa_applied{-1};
-std::atomic<int> g_lr_cheats{0};  // Settings > Cheats: bit 0 free Teleport / Chronostasis, bit 1 freeze clock  // Anti-Aliasing: 0 off, 1 FXAA, 2 FXAA extreme  // Japanese on-screen text (the Steam release's txtres_jp, see below)
+std::atomic<int> g_lr_cheats{0};  // Settings > Cheats: lr_cheats.h bits (1 infinite EP, 2 freeze clock)  // Anti-Aliasing: 0 off, 1 FXAA, 2 FXAA extreme  // Japanese on-screen text (the Steam release's txtres_jp, see below)
 std::atomic<int> g_lr_ui_ps3{0};
 // Button Prompts "Auto": follow the controller in use (lr_app.h tells
 // LrUiStyleForController); -1 = no controller seen yet.
@@ -2687,9 +2688,8 @@ REX_HOOK_RAW(sub_82644A88) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Cheats (Settings > Cheats). The ideas come from two Nexus Mods mods for the Steam release:
-// "Free Teleport and Chronostasis" by dragonkir (lightningreturnsfinalfantasy13/mods/13) and the
-// "Freeze Timer" cheat table (lightningreturnsfinalfantasy13/mods/22).
+// Cheats (Settings > Cheats; the CTRL dialog on Android). The clock idea comes from the "Freeze
+// Timer" cheat table for the Steam release (Nexus Mods lightningreturnsfinalfantasy13/mods/22).
 //
 // Freeze clock: the game clock's update sub_824D01F8(clock) - the 360 build of the Steam function
 // the cheat table patches (same constants: 1024, 10010, 75, 86400, 3600, 300000, 24, the cap
@@ -2697,16 +2697,14 @@ REX_HOOK_RAW(sub_82644A88) {
 // (std r27,0(r25)); the table skips that store. Here the clock is put back to its value from
 // before the update, so it stays where it is.
 //
-// Free Teleport / Chronostasis: the mod sets i17AtbCount of bt_ability's ti810_00 (Teleport) and
-// ti840_00 (Chronostasis) to 0 (6000 in the file). The game keeps bt_ability in memory as a WPD
-// table: 32-byte entries {u32 record, u32 size 0xC4, 8 bytes, name[16]}; the field is bits 4..20
-// of the record's word at +156 (packed low bit first). A host thread finds the two records in the
-// guest's committed memory and keeps the field at 0 while the cheat is on, and gives the game's
-// own value back when it is turned off.
+// Infinite EP (2026-11-18; replaces "free Teleport / Chronostasis", which zeroed i17AtbCount in
+// bt_ability's ti810_00 / ti840_00 records at +156 bits 4..20: on the 360 data those bits are
+// already 0 in the only copy in memory and the cost, 6000 = 3 EP, is nowhere in the record, so it
+// never changed anything): EP itself is held at its maximum once a frame (lr_cheats.h).
 // ---------------------------------------------------------------------------------------
 REX_EXTERN(__imp__sub_824D01F8);
 REX_HOOK_RAW(sub_824D01F8) {
-  if (!(g_lr_cheats.load(std::memory_order_relaxed) & 2)) {
+  if (!(g_lr_cheats.load(std::memory_order_relaxed) & kLrCheatFreezeClock)) {
     __imp__sub_824D01F8(ctx, base);
     return;
   }
@@ -2724,115 +2722,49 @@ REX_HOOK_RAW(sub_824D01F8) {
 }
 
 namespace {
-std::atomic<uint8_t*> g_lr_cheat_base{nullptr};
+// A guest u32 read that cannot fault the host on an unmapped address (a stale party pointer):
+// process_vm_readv on our own process fails with EFAULT instead (as lr_companion.inc reads).
+bool lr_cheat_read_be32(uint8_t* base, uint32_t addr, uint32_t* v) {
+  if (addr < 0x10000 || addr > 0xFFFFFFFCu) return false;
+#if defined(_WIN32)
+  (void)base;
+  (void)v;
+  return false;  // the Windows debug harness: no infinite EP
+#else
+  uint8_t raw[4];
+  struct iovec local {raw, 4};
+  struct iovec remote {base + addr, 4};
+  if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != 4) return false;
+  *v = lr_cheat_load_be32(raw);
+  return true;
+#endif
+}
 
-struct LrCheatRecord {
-  const char* name;
-  const char* label;
-  uint32_t entry = 0, record = 0;
-  uint32_t saved = 0;  // the game's cost while the cheat holds it at 0 (0: nothing saved)
-};
-
-uint32_t lr_cheat_be32(uint8_t* base, uint32_t a) { return lr_load_be32(base, a); }
-
-// memmem (not in the Windows C runtime).
-uint8_t* lr_find_bytes(uint8_t* p, size_t n, const char* pat, size_t m) {
-  if (!m || n < m) return nullptr;
-  for (uint8_t* end = p + n - m + 1; p < end;) {
-    p = static_cast<uint8_t*>(std::memchr(p, pat[0], size_t(end - p)));
-    if (!p) return nullptr;
-    if (std::memcmp(p, pat, m) == 0) return p;
-    ++p;
+// Infinite EP, once a frame on the main thread: EP back to its maximum after the game spent some.
+void lr_cheat_hold_ep(uint8_t* base) {
+  static bool seen = false;
+  static int logged = 0;
+  uint32_t party = 0, ep = 0, ep_max = 0;
+  if (!lr_cheat_read_be32(base, kLrPartyPointer, &party) || !party) return;
+  if (!lr_cheat_read_be32(base, party + kLrPartyEp, &ep) || !lr_cheat_read_be32(base, party + kLrPartyEpMax, &ep_max) ||
+      !lr_ep_pair_valid(ep, ep_max))
+    return;
+  if (!seen) {
+    seen = true;
+    REXLOG_INFO("LR cheats: EP {:.2f} of {:.1f}, held at the maximum from now on", ep / double(kLrEpUnit),
+                ep_max / double(kLrEpUnit));
   }
-  return nullptr;
-}
-
-bool lr_cheat_entry_ok(uint8_t* base, const LrCheatRecord& r) {
-  if (!r.entry) return false;
-  return lr_cheat_be32(base, r.entry + 4) == 0xC4 && lr_cheat_be32(base, r.entry) == r.record &&
-         std::memcmp(base + r.entry + 16, r.name, 9) == 0;
-}
-
-// Finds the bt_ability entries of the records in the guest's committed, readable memory.
-void lr_cheat_scan(uint8_t* base, LrCheatRecord* recs, size_t n) {
-  auto* memory = REX_KERNEL_MEMORY();
-  if (!memory) return;
-  for (uint32_t addr = 0x40000000; addr < 0x80000000;) {
-    auto* heap = memory->LookupHeap(addr);
-    rex::memory::HeapAllocationInfo info{};
-    if (!heap || !heap->QueryRegionInfo(addr, &info) || !info.region_size) {
-      addr += 0x10000;
-      continue;
-    }
-    uint32_t start = info.base_address, size = info.region_size;
-    if ((info.state & rex::memory::kMemoryAllocationCommit) && (info.protect & rex::memory::kMemoryProtectRead)) {
-      for (size_t k = 0; k < n; ++k) {
-        LrCheatRecord& r = recs[k];
-        if (lr_cheat_entry_ok(base, r)) continue;
-        uint8_t* p = base + start;
-        uint8_t* end = p + size;
-        while (p + 16 <= end) {
-          p = lr_find_bytes(p, size_t(end - p), r.name, 9);  // name with its 0
-          if (!p) break;
-          uint32_t name_at = uint32_t(p - base);
-          if (name_at >= start + 16 && lr_cheat_be32(base, name_at - 12) == 0xC4) {
-            r.entry = name_at - 16;
-            r.record = lr_cheat_be32(base, r.entry);
-            break;
-          }
-          ++p;
-        }
-      }
-    }
-    addr = start + size > addr ? start + size : addr + 0x10000;
-  }
-}
-
-void lr_cheat_thread() {
-  LrCheatRecord recs[2] = {{"ti810_00", "Teleport"}, {"ti840_00", "Chronostasis"}};
-  auto last_scan = std::chrono::steady_clock::now() - std::chrono::hours(1);
-  bool reported = false;
-  for (;;) {
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    uint8_t* base = g_lr_cheat_base.load();
-    if (!base) continue;
-    const bool on = g_lr_cheats.load(std::memory_order_relaxed) & 1;
-    const bool held = recs[0].saved || recs[1].saved;
-    if (!on && !held) continue;
-    if ((!lr_cheat_entry_ok(base, recs[0]) || !lr_cheat_entry_ok(base, recs[1])) &&
-        std::chrono::steady_clock::now() - last_scan > std::chrono::seconds(10)) {
-      last_scan = std::chrono::steady_clock::now();
-      lr_cheat_scan(base, recs, 2);
-      if (!reported && lr_cheat_entry_ok(base, recs[0])) {
-        reported = true;
-        REXLOG_INFO("LR cheats: ability table found (Teleport record {:08X}, Chronostasis record {:08X})", recs[0].record,
-                    recs[1].record);
-      }
-    }
-    for (auto& r : recs) {
-      if (!lr_cheat_entry_ok(base, r)) continue;
-      const uint32_t word_at = r.record + 156;
-      uint32_t word = lr_cheat_be32(base, word_at);
-      const uint32_t cost = (word >> 4) & 0x1FFFF;
-      if (on && cost) {
-        r.saved = cost;
-        word &= ~(0x1FFFFu << 4);
-        *reinterpret_cast<uint32_t*>(base + word_at) = __builtin_bswap32(word);
-        REXLOG_INFO("LR cheats: {} cost {} -> 0", r.label, cost);
-      } else if (!on && r.saved) {
-        if (!cost) {
-          word |= (r.saved & 0x1FFFF) << 4;
-          *reinterpret_cast<uint32_t*>(base + word_at) = __builtin_bswap32(word);
-          REXLOG_INFO("LR cheats: {} cost back to {}", r.label, r.saved);
-        }
-        r.saved = 0;
-      }
+  if (const uint32_t to = lr_ep_top_up(ep, ep_max)) {
+    lr_cheat_store_be32(base + party + kLrPartyEp, to);
+    if (logged < 20) {
+      ++logged;
+      REXLOG_INFO("LR cheats: EP {:.2f} -> {:.1f}", ep / double(kLrEpUnit), to / double(kLrEpUnit));
     }
   }
 }
 
 void lr_cheats_frame(uint8_t* base) {
-  if (g_lr_cheat_base.exchange(base) == nullptr) std::thread(lr_cheat_thread).detach();
+  if (g_lr_cheats.load(std::memory_order_relaxed) & kLrCheatInfiniteEp) lr_cheat_hold_ep(base);
 }
 }  // namespace
 
@@ -2912,7 +2844,8 @@ void LrSettingsInit(const std::filesystem::path& dir, bool jp_voice_data) {
       if (const char* d = std::getenv("LR_AA_DEFAULT"); d && d[0]) aa = d;
   }
   g_lr_aa.store(aa == "extreme" ? 2 : aa == "fxaa" ? 1 : 0);
-  // Cheats: LR_CHEATS (0-3) wins and is saved; then cheats.txt; off.
+  // Cheats: LR_CHEATS (the mask, kLrCheat* bits; Android: the CTRL dialog's switches) wins and
+  // is saved (PC); then cheats.txt; off.
   std::string cheats;
   if (const char* env = std::getenv("LR_CHEATS"); env && env[0]) {
     cheats = env;
@@ -2920,7 +2853,11 @@ void LrSettingsInit(const std::filesystem::path& dir, bool jp_voice_data) {
   } else {
     cheats = lr_read_setting("cheats.txt");
   }
-  g_lr_cheats.store(cheats.size() == 1 && cheats[0] >= '0' && cheats[0] <= '3' ? cheats[0] - '0' : 0);
+  g_lr_cheats.store(lr_parse_cheats(cheats));
+  if (g_lr_cheats.load())
+    REXLOG_INFO("LR cheats at start: infinite EP {}, clock {}",
+                g_lr_cheats.load() & kLrCheatInfiniteEp ? "on" : "off",
+                g_lr_cheats.load() & kLrCheatFreezeClock ? "frozen" : "running");
   REXLOG_INFO("LR settings: voice {}, text {}, UI style {}{}, frame rate {} ({})", g_lr_voice_jp.load() ? "Japanese" : "English",
               g_lr_text_jp.load() ? "Japanese" : "English",
               ps3 ? "PS3" : "360", automatic ? " (auto: follows the controller)" : "",
@@ -2976,14 +2913,15 @@ void LrConfigSetAa(int choice) {
   REXLOG_INFO("LR anti-aliasing: {} chosen", choice == 2 ? "FXAA extreme" : choice == 1 ? "FXAA" : "off");
 }
 
-// Settings > Cheats: 0 off, 1 free Teleport / Chronostasis, 2 freeze the clock, 3 both.
+// Cheats, a mask of kLrCheat* bits (lr_cheats.h): PC Settings > Cheats (0 off, 1 infinite EP,
+// 2 freeze the clock, 3 both), Android the CTRL dialog's switches (live).
 int LrConfigGetCheats() { return g_lr_cheats.load(); }
 void LrConfigSetCheats(int choice) {
-  choice = choice < 0 || choice > 3 ? 0 : choice;
+  choice = choice < 0 ? 0 : choice & kLrCheatMask;
   g_lr_cheats.store(choice);
   lr_write_setting("cheats.txt", std::to_string(choice).c_str());
-  REXLOG_INFO("LR cheats: free Teleport / Chronostasis {}, clock {}", choice & 1 ? "on" : "off",
-              choice & 2 ? "frozen" : "running");
+  REXLOG_INFO("LR cheats: infinite EP {}, clock {}", choice & kLrCheatInfiniteEp ? "on" : "off",
+              choice & kLrCheatFreezeClock ? "frozen" : "running");
 }
 
 int LrConfigGetFps60() {

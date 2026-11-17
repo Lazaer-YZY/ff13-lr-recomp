@@ -22,7 +22,7 @@ for i in $(seq 1 "$ITER"); do
   RUNLOG=$ROOT/out/boot_run_$i.log
   rm -f "$RUNLOG"
   log "iter $i: running lr.exe for up to ${RUNSECS}s"
-  (cd "$BUILD" && timeout "$RUNSECS" ./lr.exe --game_data_root=C:/lrgame --gpu_plugin=xenos --log_file="C:/lr/out/boot_run_$i.log" >/dev/null 2>&1)
+  (cd "$BUILD" && timeout "$RUNSECS" ./lr.exe --game_data_root="C:/lr/Input - Data/extracted" --gpu_plugin=xenos --log_file="C:/lr/out/boot_run_$i.log" >/dev/null 2>&1)
   rc=$?
   fatal=$(grep -E "\[FATAL\]" "$RUNLOG" 2>/dev/null | tail -1)
   addr=$(echo "$fatal" | grep -o -E "guest address 0x[0-9A-Fa-f]{8}" | grep -o -E "0x[0-9A-Fa-f]{8}" | tail -1)

@@ -533,6 +533,23 @@ final class TouchControlsView extends View {
         debugLog.setChecked(render.getBoolean("debug_log", RuntimeActivity.DEFAULT_DEBUG_LOG));
         content.addView(debugLog);
 
+        // Cheats (public issue #1): one switch per cheat, applied at once (Cheats.java).
+        TextView cheatsTitle = new TextView(activity);
+        cheatsTitle.setText(strings.getString(R.string.touch_cheats_title));
+        cheatsTitle.setPadding(0, padding, 0, 0);
+        content.addView(cheatsTitle);
+        TextView cheatsHelp = new TextView(activity);
+        cheatsHelp.setText(strings.getString(R.string.touch_cheats_help));
+        content.addView(cheatsHelp);
+        int cheatBits = Cheats.saved(render);
+        CheckBox[] cheatBoxes = new CheckBox[Cheats.ALL.length];
+        for (int i = 0; i < Cheats.ALL.length; ++i) {
+            cheatBoxes[i] = new CheckBox(activity);
+            cheatBoxes[i].setText(strings.getString(Cheats.ALL[i].label));
+            cheatBoxes[i].setChecked((cheatBits & Cheats.ALL[i].bit) != 0);
+            content.addView(cheatBoxes[i]);
+        }
+
         // Qualcomm and Mali devices: open the GPU driver page (download / switch Turnip or PanVK).
         Button driverButton = null;
         if (GpuDriverStore.supported()) {
@@ -565,6 +582,10 @@ final class TouchControlsView extends View {
                     radioChoice(upBilinear) == 1 ? "fsr" : radioChoice(upBilinear) == 2 ? "cas" : "bilinear",
                     perfOverlay.isChecked());
                 if (companionBox != null) activity.applyCompanionSetting(companionBox.isChecked());
+                int cheats = 0;
+                for (int i = 0; i < cheatBoxes.length; ++i)
+                    cheats = Cheats.with(cheats, Cheats.ALL[i].bit, cheatBoxes[i].isChecked());
+                activity.applyCheats(cheats);
             })
             .setNeutralButton(strings.getString(R.string.touch_edit_layout), (dialog, which) -> {
                 applySettings(toggle.isChecked(), size.getProgress() + 60,
