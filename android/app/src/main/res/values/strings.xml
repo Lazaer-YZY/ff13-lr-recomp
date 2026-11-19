@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">LR:FFXIII</string>
+    <string name="app_name">LR: FFXIII</string>
     <string name="touch_hide_all">Hide all touch controls</string>
     <string name="touch_hide_all_help">Reveal the system bars or use Android Back to show CTRL for 4 seconds.</string>
     <string name="touch_settings_title">Controller settings</string>

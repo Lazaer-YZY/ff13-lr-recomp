@@ -123,9 +123,9 @@ Newer releases install over the old one and keep your saves and game files.
    bash /c/lr/tools/quickstart.sh "/c/Users/you/Downloads/Lightning Returns (USA).iso" --install
    ```
    This downloads the toolchain, builds the recompiler, extracts your ISO, recompiles the game, builds the APK, installs it and copies the 7 GB of game files to the device. Steps that are already done are skipped, so if anything fails or you stop it, run the same command again. Leave out `--install` to only build the APK (`C:\lr\android\app\build\outputs\apk\debug\app-debug.apk`).
-4. **Start the game** (*LR:FFXIII*) from the app drawer. The first start shows a *Preparing shaders* screen at the title (a few minutes, with the time left); the game continues by itself when it is done.
+4. **Start the game** (*LR: FFXIII*) from the app drawer. The first start shows a *Preparing shaders* screen at the title (a few minutes, with the time left); the game continues by itself when it is done.
 
-**App icon:** a self-built APK has a plain placeholder icon. The downloadable APK's is the game's emblem, which this repository doesn't hold. To use an image of your own (a PNG, ideally with a transparent background), run `python -I tools/make_icon.py image.png` before building.
+**App icon:** a self-built APK has a plain placeholder icon. The downloadable APK's is the game's key art, which this repository doesn't hold. To use an image of your own, run `python -I tools/make_icon.py logo.png` before building (an emblem or logo, ideally with a transparent background), or `python -I tools/make_icon.py picture.jpg --photo X,Y,SIDE` for a picture (the icon shows the square of SIDE pixels centred on X,Y).
 
 **Game files without a USB copy:** install the APK on its own, put your ISO on the device, and on the first start (the *Game folder* page, also under CTRL) tap **Import from ISO…**. The app checks the disc's title ID and executable (it refuses any disc but the USA release) and extracts the game itself, in about 30 s on the Thor.
 

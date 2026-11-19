@@ -52,7 +52,7 @@ def lrPublicDefaults = (project.findProperty('lrPublicDefaults') ?: 'false').toS
 // and HUD pieces stay in (the owner, DECISIONS 2026-11-16).
 def lrRedistributable = (project.findProperty('lrRedistributable') ?: 'false').toString().toBoolean()
 // Launcher icon: out/branding/res when it exists (tools/make_icon.py; git-ignored, since the release
-// icon is the game's emblem and the repository holds no game artwork), else the placeholder bolt.
+// icon is the game's key art and the repository holds no game artwork), else the placeholder bolt.
 def lrBrandingRes = rootProject.file('../out/branding/res')
 def lrBranded = new File(lrBrandingRes, 'mipmap-anydpi-v26/ic_launcher_lr.xml').isFile()
 // -PlrAppIdSuffix=.test installs beside the normal app with its own data folder (a first start).

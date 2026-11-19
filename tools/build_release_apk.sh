@@ -16,7 +16,7 @@
 # Signed with this PC's Android debug keystore (DECISIONS 2026-11-16): keep a backup of it, since
 # an update installs over the previous release only when both carry the same signature.
 #
-# Launcher icon: out/branding (tools/make_icon.py; the game's emblem for the releases, git-ignored
+# Launcher icon: out/branding (tools/make_icon.py; the game's key art for the releases, git-ignored
 # like every piece of game artwork); the script fails without it. App name: strings.xml app_name.
 #
 # It also carries a shader cache seed (out/shader_seed, see below), so a fresh install precompiles
@@ -53,7 +53,7 @@ cd /c/lr
 set +u; source /c/lr/tools/env.sh >/dev/null; set -u
 [ -s "$PAT" ] || die "no personal patterns in $PAT"
 [ -f out/branding/res/mipmap-anydpi-v26/ic_launcher_lr.xml ] \
-  || die "no launcher icon in out/branding (python -I tools/make_icon.py IMAGE; the releases use the game's emblem)"
+  || die "no launcher icon in out/branding (python -I tools/make_icon.py IMAGE; the releases use the game's key art)"
 if [ "$TEST" = 0 ] && ! git diff --quiet HEAD -- . ':!lr_manifest.toml'; then
   die "uncommitted changes: a release APK is built from a commit"
 fi
