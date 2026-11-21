@@ -554,6 +554,9 @@ final class TouchControlsView extends View {
         RadioButton upBilinear = radio(content, strings.getString(R.string.touch_upscale), false,
             strings.getString(R.string.touch_upscale_bilinear), strings.getString(R.string.touch_upscale_fsr),
             strings.getString(R.string.touch_upscale_cas), "fsr".equals(upscale) ? 1 : "cas".equals(upscale) ? 2 : 0);
+        // Public issue #6: the presenter's letterbox off, so the 16:9 picture fills a wider phone screen.
+        CheckBox stretch = option(content, strings.getString(R.string.touch_stretch),
+            strings.getString(R.string.touch_stretch_help), render.getBoolean(GpuCompat.KEY_STRETCH, false));
 
         // Second screen (dual-screen devices only): schemata in battle, map in the field, fan art otherwise.
         CheckBox companion = null;
@@ -593,6 +596,31 @@ final class TouchControlsView extends View {
         // A zip of lr.log through the system file picker, so a player can attach it to a bug report
         // from the phone (Android 11+ hides Android/data from file managers; public issue #4).
         Button logsButton = pageButton(content, strings.getString(R.string.touch_save_logs));
+
+        // GPU compatibility (testing; public issue #4, Adreno 600 series): renderer paths to switch off
+        // one at a time, read at the next start (GpuCompat). Dev builds only for now: #4 waits for the
+        // DS2 port's Adreno 600 result (the owner, 2026-11-21); public builds keep the defaults.
+        LinearLayout compat = new LinearLayout(activity);
+        compat.setOrientation(LinearLayout.VERTICAL);
+        if (!BuildConfig.PUBLIC_DEFAULTS) content.addView(compat);
+        header(compat, strings.getString(R.string.touch_section_compat));
+        hint(compat, strings.getString(R.string.touch_compat_help)).setPadding(0, 0, 0, padding / 4);
+        CheckBox compatShortcuts = option(compat, strings.getString(R.string.touch_compat_shortcuts),
+            strings.getString(R.string.touch_compat_shortcuts_help), render.getBoolean(GpuCompat.KEY_SHORTCUTS, false));
+        CheckBox compatShaders = option(compat, strings.getString(R.string.touch_compat_shaders),
+            strings.getString(R.string.touch_compat_shaders_help), render.getBoolean(GpuCompat.KEY_SHADERS, false));
+        CheckBox compatGpl = option(compat, strings.getString(R.string.touch_compat_gpl),
+            strings.getString(R.string.touch_compat_gpl_help), render.getBoolean(GpuCompat.KEY_GPL, false));
+        CheckBox compatDynamic = option(compat, strings.getString(R.string.touch_compat_dynrender),
+            strings.getString(R.string.touch_compat_dynrender_help),
+            render.getBoolean(GpuCompat.KEY_DYNAMIC_RENDERING, false));
+        String turnipMode = render.getString(GpuCompat.KEY_TURNIP_MODE, GpuCompat.MODE_AUTO);
+        RadioButton turnipAuto = radio(compat, strings.getString(R.string.touch_compat_tu_mode), false,
+            strings.getString(R.string.touch_compat_tu_auto), strings.getString(R.string.touch_compat_tu_sysmem),
+            strings.getString(R.string.touch_compat_tu_gmem),
+            GpuCompat.MODE_SYSMEM.equals(turnipMode) ? 1 : GpuCompat.MODE_GMEM.equals(turnipMode) ? 2 : 0);
+        CheckBox compatNoUbwc = option(compat, strings.getString(R.string.touch_compat_tu_noubwc), null,
+            render.getBoolean(GpuCompat.KEY_TURNIP_NO_UBWC, false));
         TextView nextStart = hint(content, strings.getString(R.string.touch_next_start_note));
         nextStart.setPadding(0, padding / 2, 0, padding / 2);
 
@@ -606,7 +634,15 @@ final class TouchControlsView extends View {
                               opacity.getProgress() + 25, ctrlAutoHide.isChecked(), hideAll.isChecked());
                 RuntimeActivity.renderPrefs(activity).edit().putBoolean("panel120", panel120.isChecked())
                     .putBoolean("debug_log", debugLog.isChecked())
-                    .putBoolean("exact_shader_math", exactMath.isChecked()).apply();
+                    .putBoolean("exact_shader_math", exactMath.isChecked())
+                    .putBoolean(GpuCompat.KEY_STRETCH, stretch.isChecked())
+                    .putBoolean(GpuCompat.KEY_SHORTCUTS, compatShortcuts.isChecked())
+                    .putBoolean(GpuCompat.KEY_SHADERS, compatShaders.isChecked())
+                    .putBoolean(GpuCompat.KEY_GPL, compatGpl.isChecked())
+                    .putBoolean(GpuCompat.KEY_DYNAMIC_RENDERING, compatDynamic.isChecked())
+                    .putString(GpuCompat.KEY_TURNIP_MODE, radioChoice(turnipAuto) == 1 ? GpuCompat.MODE_SYSMEM
+                        : radioChoice(turnipAuto) == 2 ? GpuCompat.MODE_GMEM : GpuCompat.MODE_AUTO)
+                    .putBoolean(GpuCompat.KEY_TURNIP_NO_UBWC, compatNoUbwc.isChecked()).apply();
                 activity.applyRenderSettings(radioChoice(fps30) == 1 ? "40" : radioChoice(fps30) == 2 ? "60g" : "30",
                     radioChoice(aaOff) == 1 ? "fxaa" : "off",
                     radioChoice(upBilinear) == 1 ? "fsr" : radioChoice(upBilinear) == 2 ? "cas" : "bilinear",

@@ -3,7 +3,7 @@
 # run its cheats? Run after changes to the renderer, codegen / translation, the SDK, src/ hooks
 # or the Android app, and before every release (CLAUDE.md, "Regression tests").
 #
-# Usage: bash tools/thor_regress.sh [LABEL=regress] [--install] [--baseline] [--only boot,field,cheats,battle]
+# Usage: bash tools/thor_regress.sh [LABEL=regress] [--install] [--baseline] [--only boot,field,cheats,battle,bcheats]
 #   --install   install the APK built last (android/app/build/outputs/apk/debug/app-debug.apk) first;
 #               build it with tools/build_android.sh build stage apk (or regress_host.sh --build)
 #   --baseline  keep this run's numbers and pictures as the reference (out/regress/thor/baseline/)
@@ -20,6 +20,8 @@
 #           EP is readable and, when the save's EP is below its maximum, topped up to it
 #   battle  save_0756 (a journal page, then a battle): the battle starts and runs 20 s without a crash,
 #           avg fps / 1% low vs reference
+#   bcheats save_0756 with LR_CHEATS 5: Overclock (LT) in battle is refilled (infinite EP) and
+#           Lightning's HP is held at its maximum (infinite HP), still in battle after 28 s
 # Fails a test on: the game gone, a native crash in logcat, '[critical]' / 'LR hang' lines, the
 # expected log lines missing, fps below the reference (avg < 92 %, 1% low < 75 %), a picture
 # unlike the reference (SSIM below the limit) or black / flat.
@@ -29,7 +31,7 @@
 set -u
 export MSYS_NO_PATHCONV=1
 source /c/lr/tools/env.sh >/dev/null 2>&1
-LABEL=regress INSTALL=0 BASELINE=0 ONLY=boot,field,cheats,battle
+LABEL=regress INSTALL=0 BASELINE=0 ONLY=boot,field,cheats,battle,bcheats
 while [ $# -gt 0 ]; do
   case "$1" in
     --install) INSTALL=1 ;;
@@ -343,6 +345,46 @@ if wanted battle; then
   p=$(problems "$mark"); [ -n "$p" ] && fails+=("$p")
   stop_game
   [ ${#fails[@]} = 0 ] && record battle PASS "$detail" || record battle FAIL "$(IFS='; '; echo "${fails[*]}") | $detail"
+fi
+
+# --- cheats in battle (public #5) ------------------------------------------------------------
+# save_0756 with LR_CHEATS 5 (infinite EP + infinite HP): Overclock (LT, 2 EP) must be refilled in
+# battle, Lightning's HP (656-736 at the start, KO'd within ~40 s without the cheat) held at its maximum.
+if wanted bcheats; then
+  fails=()
+  mark=$(start_game save_0756 "--es LR_CHEATS 5") || fails+=("start failed")
+  wait_log "$mark" 'LR cheats at start: infinite EP on, clock running, infinite HP on' 40 >/dev/null ||
+    fails+=("no 'LR cheats at start ... infinite HP on' line")
+  open_save "$mark"; press A
+  inb=""
+  for _ in $(seq 12); do
+    state "$mark" | grep -q 'battle=1' && { inb=1; break; }
+    alive || break
+    press A 300; sleep 5
+  done
+  if [ -n "$inb" ]; then
+    # The battle's opening camera ignores LT: press it every 5 s until Overclock spent EP (a top-up).
+    m2=$(devtime); ep=""
+    for _ in 1 2 3 4 5; do
+      sleep 4; press LT 600
+      sleep 1; ep=$(since "$m2" 'LR cheats: EP [0-9.]+ -> [0-9.]+' | head -1 | sed 's/.*LR cheats: //')
+      [ -n "$ep" ] && break
+    done
+    sleep 3
+    [ -n "$ep" ] || fails+=("no EP top-up after Overclock in battle")
+    hp=$(since "$mark" 'LR cheats: HP [0-9]+ -> [0-9]+' | head -1 | sed 's/.*LR cheats: //')
+    [ -n "$hp" ] || fails+=("no 'LR cheats: HP' line (Lightning's battle actor not found)")
+    s=$(state "$m2"); cur=$(echo "$s" | grep -o ';hp=[0-9]*' | cut -d= -f2); max=$(echo "$s" | grep -o ';hpmax=[0-9]*' | cut -d= -f2)
+    state "$m2" | grep -q 'battle=1' || fails+=("battle over after 28 s (KO?)")
+    [ -n "$cur" ] && [ -n "$max" ] && [ "$cur" -gt 0 ] || fails+=("HUD HP ${cur:-?} of ${max:-?}")
+    detail="${ep:-no EP top-up}; ${hp:-no HP top-up}; HUD HP ${cur:-?}/${max:-?} after 28 s"
+  else
+    fails+=("no battle (state: $(state "$mark" | cut -c1-120))"); detail=""
+  fi
+  alive || fails+=("game gone")
+  p=$(problems "$mark"); [ -n "$p" ] && fails+=("$p")
+  stop_game
+  [ ${#fails[@]} = 0 ] && record bcheats PASS "$detail" || record bcheats FAIL "$(IFS='; '; echo "${fails[*]}") | $detail"
 fi
 
 pid=$heat_pid; heat_pid=""

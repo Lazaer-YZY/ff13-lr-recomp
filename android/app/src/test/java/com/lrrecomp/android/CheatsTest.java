@@ -22,10 +22,11 @@ public class CheatsTest {
 
     @Test
     public void knownBitsMatchTheGameSide() {
-        // src/lr_cheats.h: kLrCheatInfiniteEp = 1, kLrCheatFreezeClock = 2
-        // (tests/host/check_cheat_bits.py checks the two files against each other).
+        // src/lr_cheats.h: kLrCheatInfiniteEp = 1, kLrCheatFreezeClock = 2, kLrCheatInfiniteHp = 4
+        // (tests/host/check_cheat_bits.py checks the two files against each other). Dialog order: EP, HP, clock.
         assertEquals(1, Cheats.ALL[0].bit);
-        assertEquals(2, Cheats.ALL[1].bit);
+        assertEquals(4, Cheats.ALL[1].bit);
+        assertEquals(2, Cheats.ALL[2].bit);
     }
 
     @Test

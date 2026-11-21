@@ -103,6 +103,16 @@ out/dual/stag1.py .. stag8.py (stag8 checks every dump in out/dual/dumps).
   +0xE0 = 10393 vs shown 8988, trail timer +0x110 = 716 of +0x114 = 1500) is the damage trail, not
   stagger.
 
+## Lightning's battle HP (2026-11-21, public #5 infinite HP)
+Battle actors: table [[0x830D839C] + 0x154] (u32 pointers, all vtable 0x8203BAB0); Lightning's spec name is "pc000"
+(+0x23B8) and she was slot 0 in every battle seen (prologue Anubys, Fanatics, Gremlin). u32 +0x2F0 = current HP;
++0x318 = a copy that follows it, except at the start of the prologue battle (2000 while +0x2F0 = 2500, both 2500 after
+the first exchange); +0x394 (and +0x7F4) = maximum HP in all 15 snapshots, players and enemies (prologue 2500, later
+2967; enemies 5000 / 5600 / 13000). +0x31C is the maximum in most battles but held the pre-battle 2000 in the
+prologue. Infinite HP holds +0x2F0 (and +0x318 while it follows) at +0x394 once a frame; KO (0) is left alone.
+Research switch: LR_DEBUG_ACTORS=1 logs the table every ~2 s ("LR actors: ..."). Snapshot script:
+out/thor/bench/_actor_words.py (git-ignored).
+
 ## EP
 Current EP ("Gp": script functions getPartyGp / getPartyMaxGp) is a u32 at [0x8315817C] + 0x2850, its
 maximum at + 0x2854, both in 1/2000 EP (iGpUnit, battle constants near 0x6DB169B0): 2000 = 1.0, 10000 = 5.0.

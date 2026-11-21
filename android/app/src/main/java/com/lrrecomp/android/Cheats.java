@@ -25,6 +25,7 @@ final class Cheats {
     /** In the dialog's order. Bits must match lr_hooks.cpp (kLrCheat*). */
     static final Cheat[] ALL = {
         new Cheat(1, R.string.cheat_infinite_ep),        // EP stays at its maximum
+        new Cheat(4, R.string.cheat_infinite_hp),        // Lightning's HP stays at its maximum in battle
         new Cheat(2, R.string.cheat_freeze_clock),       // the game clock stands still
     };
 

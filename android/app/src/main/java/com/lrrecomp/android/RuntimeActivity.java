@@ -283,7 +283,8 @@ public final class RuntimeActivity extends SDLActivity {
         String device = PlayerLogs.deviceDescription() + "\napp=" + version
             + "\ngpu=" + GpuDriverStore.gpuModel()
             + "\ndriver=" + (driver != null ? driver.metadata.name : GpuDriverStore.SYSTEM_DRIVER_NAME)
-            + "\ndebug_logging=" + (renderPrefs(this).getBoolean("debug_log", false) ? "on" : "off");
+            + "\ndebug_logging=" + (renderPrefs(this).getBoolean("debug_log", false) ? "on" : "off")
+            + "\ngpu_compat=" + GpuCompat.Choices.from(renderPrefs(this)).summary();
         new Thread(() -> {
             String message;
             try (java.io.OutputStream output = getContentResolver().openOutputStream(uri, "w")) {
@@ -425,16 +426,19 @@ public final class RuntimeActivity extends SDLActivity {
         nativeSetenv("MESA_SHADER_CACHE_DIR", new File(getCacheDir(), "mesa_shader_cache").getAbsolutePath());
         nativeSetenv("MESA_SHADER_CACHE_MAX_SIZE", "256M");
         GpuDriverStore.Installed driver = GpuDriverStore.selectedDriver(this);
+        // CTRL -> GPU compatibility (testing) and Stretch to fill: read at start (GpuCompat).
+        GpuCompat.Choices compat = GpuCompat.Choices.from(renderPrefs(this));
         if (driver != null) {
             nativeSetenv("LR_CUSTOM_DRIVER_DIR", driver.directory.getAbsolutePath() + "/");
             nativeSetenv("LR_VK_CUSTOM_DRIVER", driver.metadata.libraryName);
             nativeSetenv("LR_VK_CUSTOM_DRIVER_MODE", GpuDriverStore.loadMode(this, driver));
-            if (GpuDriverStore.needsAdreno650SyncDraw(GpuDriverStore.gpuModel(), driver.metadata)) {
-                nativeSetenv("LR_VK_ADRENO650_SYNC_DRAW", "1");
-            }
-            if (GpuDriverStore.needsTurnipSysmem(GpuDriverStore.gpuModel(), driver.metadata)) {
-                nativeSetenv("TU_DEBUG", "sysmem");
-            }
+            boolean syncDraw = GpuDriverStore.needsAdreno650SyncDraw(GpuDriverStore.gpuModel(), driver.metadata);
+            if (syncDraw) nativeSetenv("LR_VK_ADRENO650_SYNC_DRAW", "1");
+            // TU_DEBUG: the device's own flags and CTRL's Turnip choices in one list (the native side adds
+            // syncdraw only while TU_DEBUG is unset). Turnip only: other drivers ignore it.
+            String turnipFlags = driver.metadata.isPanVk() ? "" : GpuCompat.turnipDebug(compat, syncDraw,
+                GpuDriverStore.needsTurnipSysmem(GpuDriverStore.gpuModel(), driver.metadata));
+            if (!turnipFlags.isEmpty()) nativeSetenv("TU_DEBUG", turnipFlags);
             // PanVK refuses the Mali GPUs Mesa marks experimental without this.
             if (driver.metadata.isPanVk()) nativeSetenv("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER", "1");
         }
@@ -499,6 +503,9 @@ public final class RuntimeActivity extends SDLActivity {
         // rebuilds the pixel shader libraries once (the shaders used in play first, ~16 s).
         nativeSetenv("REX_VULKAN_SHADER_XENOS_MULTIPLY",
                      render.getBoolean("exact_shader_math", false) ? "true" : "false");
+        for (java.util.Map.Entry<String, String> cvar : GpuCompat.cvars(compat).entrySet()) {
+            nativeSetenv(GpuCompat.environmentName(cvar.getKey()), cvar.getValue());
+        }
         if (!diag) {
             nativeSetenv("REX_VULKAN_SLOW_FRAME_MS", "0");
             nativeSetenv("REX_GPU_LOG_WAIT_REG_MEM", "false");

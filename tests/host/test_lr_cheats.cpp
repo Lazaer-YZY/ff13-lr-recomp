@@ -19,7 +19,9 @@ static void test_parse() {
   CHECK(lr_parse_cheats("1") == kLrCheatInfiniteEp);
   CHECK(lr_parse_cheats("2") == kLrCheatFreezeClock);
   CHECK(lr_parse_cheats("3") == (kLrCheatInfiniteEp | kLrCheatFreezeClock));
-  CHECK(lr_parse_cheats("7") == kLrCheatMask);  // unknown bits dropped
+  CHECK(lr_parse_cheats("4") == kLrCheatInfiniteHp);
+  CHECK(lr_parse_cheats("7") == kLrCheatMask);
+  CHECK(lr_parse_cheats("15") == kLrCheatMask);  // unknown bits dropped
   CHECK(lr_parse_cheats("-1") == 0);
   CHECK(lr_parse_cheats("x") == 0);
   CHECK(lr_parse_cheats("1 ") == 0);
@@ -41,6 +43,21 @@ static void test_ep() {
   CHECK(lr_ep_top_up(1, kLrEpMaxSane + 1) == 0);
 }
 
+static void test_hp() {
+  // Lightning's battle actor: spec "pc000", HP 584 of 2967 (the Thor's battle save, 2026-11-21).
+  CHECK(lr_actor_is_player(0x70633030));   // "pc00"
+  CHECK(lr_actor_is_player(0x70633039));   // "pc09"
+  CHECK(!lr_actor_is_player(0x6D323933));  // "m293": an enemy
+  CHECK(!lr_actor_is_player(0x7063303A));  // "pc0:"
+  CHECK(!lr_actor_is_player(0));
+  CHECK(lr_hp_top_up(584, 2967) == 2967);
+  CHECK(lr_hp_top_up(2967, 2967) == 0);    // full: no write
+  CHECK(lr_hp_top_up(0, 2967) == 0);       // KO'd (or not set up): left to the game
+  CHECK(lr_hp_top_up(5000, 2967) == 0);    // above its maximum: not HP
+  CHECK(lr_hp_top_up(1, 0) == 0);
+  CHECK(lr_hp_top_up(1, kLrHpMaxSane + 1) == 0);
+}
+
 static void test_be32() {
   uint8_t b[4];
   lr_cheat_store_be32(b, 0x12345678);
@@ -51,6 +68,7 @@ static void test_be32() {
 int main() {
   test_parse();
   test_ep();
+  test_hp();
   test_be32();
   if (g_failures) {
     std::printf("test_lr_cheats: %d check(s) failed\n", g_failures);

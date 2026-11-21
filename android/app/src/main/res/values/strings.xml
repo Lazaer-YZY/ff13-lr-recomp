@@ -36,11 +36,14 @@
     <string name="touch_upscale_bilinear">Bilinear</string>
     <string name="touch_upscale_fsr">AMD FSR 1 (sharper edges)</string>
     <string name="touch_upscale_cas">AMD CAS (sharpening)</string>
+    <string name="touch_stretch">Stretch to fill wide screens *</string>
+    <string name="touch_stretch_help">No black bars on phones wider than 16:9; the picture is stretched sideways.</string>
     <!-- Second screen -->
     <string name="touch_companion">Companion</string>
     <string name="touch_companion_help">Schemata in battle (tap to switch), the map in the field, artwork in cutscenes.</string>
     <!-- Cheats -->
     <string name="cheat_infinite_ep">Infinite EP</string>
+    <string name="cheat_infinite_hp">Infinite HP (in battle)</string>
     <string name="cheat_freeze_clock">Freeze the clock</string>
     <string name="touch_cheats_help">A save made with a cheat on keeps its effects.</string>
     <!-- Troubleshooting -->
@@ -55,6 +58,22 @@
     <string name="logs_saved">Logs saved as %1$s. Attach that file to your bug report.</string>
     <string name="logs_save_failed">Could not save the logs: %1$s</string>
     <string name="logs_no_picker">This device has no file picker to save the logs with.</string>
+    <!-- GPU compatibility (testing; GpuCompat.java): renderer paths to try on GPUs that draw the game wrongly -->
+    <string name="touch_section_compat">GPU compatibility (testing)</string>
+    <string name="touch_compat_help">For phones whose picture is wrong or whose game stops with a GPU error (for example the Adreno 600 series). Try one option at a time, with Debug logging on, and save the logs after each try.</string>
+    <string name="touch_compat_shortcuts">Renderer shortcuts off *</string>
+    <string name="touch_compat_shortcuts_help">The faster copies between render targets and textures.</string>
+    <string name="touch_compat_shaders">Shader shortcuts off *</string>
+    <string name="touch_compat_shaders_help">Plainer shader code. Shaders rebuild once (several minutes).</string>
+    <string name="touch_compat_gpl">Pipeline libraries off *</string>
+    <string name="touch_compat_gpl_help">Builds each GPU pipeline in one piece. New effects take longer to appear.</string>
+    <string name="touch_compat_dynrender">Dynamic rendering off *</string>
+    <string name="touch_compat_dynrender_help">Classic Vulkan render passes.</string>
+    <string name="touch_compat_tu_mode">Turnip rendering mode * (Turnip drivers only)</string>
+    <string name="touch_compat_tu_auto">Automatic</string>
+    <string name="touch_compat_tu_sysmem">Direct to memory (sysmem)</string>
+    <string name="touch_compat_tu_gmem">Tiled (gmem)</string>
+    <string name="touch_compat_tu_noubwc">Turnip image compression off * (Turnip drivers only)</string>
     <!-- Buttons -->
     <string name="touch_apply">Apply</string>
     <string name="touch_edit_layout">Edit layout</string>

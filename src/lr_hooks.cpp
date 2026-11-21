@@ -2763,8 +2763,70 @@ void lr_cheat_hold_ep(uint8_t* base) {
   }
 }
 
+// Research (LR_DEBUG_ACTORS=1, #5 infinite HP): every ~2 s, the battle actor table
+// [[0x830D839C] + 0x154] (docs/dual_screen_battle_re.md "Libra") with each actor's spec name and
+// HP fields (+0x2F0 current, +0x318 its copy, +0x31C, +0x394 maximum), to tell Lightning's actor apart.
+void lr_debug_actors(uint8_t* base) {
+  static const bool on = [] { const char* e = std::getenv("LR_DEBUG_ACTORS"); return e && e[0] == '1'; }();
+  static uint32_t calls = 0;
+  if (!on || (calls++ % 60) != 0) return;
+  uint32_t g1 = 0, tbl = 0;
+  if (!lr_cheat_read_be32(base, 0x830D839C, &g1) || !g1 || !lr_cheat_read_be32(base, g1 + 0x154, &tbl) || !tbl) return;
+  std::string line;
+  for (uint32_t i = 0; i < 24; ++i) {
+    uint32_t actor = 0, vt = 0, a = 0, b = 0, c = 0, d = 0, n0 = 0, n1 = 0;
+    if (!lr_cheat_read_be32(base, tbl + 4 * i, &actor) || !actor || !lr_cheat_read_be32(base, actor, &vt)) continue;
+    lr_cheat_read_be32(base, actor + 0x2F0, &a);
+    lr_cheat_read_be32(base, actor + 0x318, &b);
+    lr_cheat_read_be32(base, actor + 0x31C, &c);
+    lr_cheat_read_be32(base, actor + 0x394, &d);
+    lr_cheat_read_be32(base, actor + 0x23B8, &n0);
+    lr_cheat_read_be32(base, actor + 0x23BC, &n1);
+    char name[9];
+    for (int k = 0; k < 4; ++k) {
+      name[k] = char(n0 >> (24 - 8 * k));
+      name[4 + k] = char(n1 >> (24 - 8 * k));
+    }
+    name[8] = 0;
+    for (char& ch : name) if (ch && (ch < 32 || ch > 126)) ch = '?';
+    line += fmt::format(" [{}] {:08X} vt {:08X} '{}' {} {} {} {}", i, actor, vt, name, a, b, c, d);
+  }
+  REXLOG_INFO("LR actors: g1 {:08X} tbl {:08X}{}", g1, tbl, line.empty() ? " (none)" : line);
+}
+
+// Infinite HP, once a frame on the main thread: Lightning's battle actor back to its maximum HP
+// after a hit (lr_cheats.h). A hit larger than her maximum within one frame still knocks her out.
+void lr_cheat_hold_hp(uint8_t* base) {
+  static int logged = 0;
+  uint32_t g1 = 0, tbl = 0;
+  if (!lr_cheat_read_be32(base, kLrBattleGlobal, &g1) || !g1 || !lr_cheat_read_be32(base, g1 + kLrActorTable, &tbl) ||
+      !tbl)
+    return;
+  for (uint32_t slot = 0; slot < kLrActorSlots; ++slot) {
+    uint32_t actor = 0, vt = 0, spec = 0, hp = 0, hp2 = 0, hp_max = 0;
+    if (!lr_cheat_read_be32(base, tbl + 4 * slot, &actor) || !actor || !lr_cheat_read_be32(base, actor, &vt) ||
+        vt != kLrActorVtable || !lr_cheat_read_be32(base, actor + kLrActorSpec, &spec) || !lr_actor_is_player(spec))
+      continue;
+    if (!lr_cheat_read_be32(base, actor + kLrActorHp, &hp) || !lr_cheat_read_be32(base, actor + kLrActorHp2, &hp2) ||
+        !lr_cheat_read_be32(base, actor + kLrActorHpMax, &hp_max))
+      return;
+    const uint32_t to = lr_hp_top_up(hp, hp_max);
+    if (to) lr_cheat_store_be32(base + actor + kLrActorHp, to);
+    // The copy only while it follows the current HP (the prologue battle starts with a stale one).
+    if (hp2 == hp && lr_hp_top_up(hp2, hp_max)) lr_cheat_store_be32(base + actor + kLrActorHp2, hp_max);
+    if (to && logged < 20) {
+      ++logged;
+      REXLOG_INFO("LR cheats: HP {} -> {} (slot {})", hp, to, slot);
+    }
+    return;
+  }
+}
+
 void lr_cheats_frame(uint8_t* base) {
-  if (g_lr_cheats.load(std::memory_order_relaxed) & kLrCheatInfiniteEp) lr_cheat_hold_ep(base);
+  const int cheats = g_lr_cheats.load(std::memory_order_relaxed);
+  if (cheats & kLrCheatInfiniteEp) lr_cheat_hold_ep(base);
+  if (cheats & kLrCheatInfiniteHp) lr_cheat_hold_hp(base);
+  lr_debug_actors(base);
 }
 }  // namespace
 
@@ -2855,9 +2917,10 @@ void LrSettingsInit(const std::filesystem::path& dir, bool jp_voice_data) {
   }
   g_lr_cheats.store(lr_parse_cheats(cheats));
   if (g_lr_cheats.load())
-    REXLOG_INFO("LR cheats at start: infinite EP {}, clock {}",
+    REXLOG_INFO("LR cheats at start: infinite EP {}, clock {}, infinite HP {}",
                 g_lr_cheats.load() & kLrCheatInfiniteEp ? "on" : "off",
-                g_lr_cheats.load() & kLrCheatFreezeClock ? "frozen" : "running");
+                g_lr_cheats.load() & kLrCheatFreezeClock ? "frozen" : "running",
+                g_lr_cheats.load() & kLrCheatInfiniteHp ? "on" : "off");
   REXLOG_INFO("LR settings: voice {}, text {}, UI style {}{}, frame rate {} ({})", g_lr_voice_jp.load() ? "Japanese" : "English",
               g_lr_text_jp.load() ? "Japanese" : "English",
               ps3 ? "PS3" : "360", automatic ? " (auto: follows the controller)" : "",
@@ -2920,8 +2983,8 @@ void LrConfigSetCheats(int choice) {
   choice = choice < 0 ? 0 : choice & kLrCheatMask;
   g_lr_cheats.store(choice);
   lr_write_setting("cheats.txt", std::to_string(choice).c_str());
-  REXLOG_INFO("LR cheats: infinite EP {}, clock {}", choice & kLrCheatInfiniteEp ? "on" : "off",
-              choice & kLrCheatFreezeClock ? "frozen" : "running");
+  REXLOG_INFO("LR cheats: infinite EP {}, clock {}, infinite HP {}", choice & kLrCheatInfiniteEp ? "on" : "off",
+              choice & kLrCheatFreezeClock ? "frozen" : "running", choice & kLrCheatInfiniteHp ? "on" : "off");
 }
 
 int LrConfigGetFps60() {

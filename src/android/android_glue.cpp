@@ -321,6 +321,8 @@ bool LoadCustomVulkanDriver() {
     setenv("TU_DEBUG", "syncdraw", 0);
     LR_ALOG(ANDROID_LOG_INFO, "vulkan: Adreno 650 Turnip default TU_DEBUG=syncdraw applied");
   }
+  // The launcher puts the device's flags and CTRL's GPU compatibility choices here: say which this run used.
+  if (const char* tu_debug = std::getenv("TU_DEBUG")) REXLOG_INFO("vulkan: TU_DEBUG={}", tu_debug);
   // Turnip reserves one of the Adreno 6xx bindless sets for dynamic offsets
   // unless told not to; Mesa reads driconf options from the environment.
   setenv("tu_dont_reserve_descriptor_set", "true", 0);

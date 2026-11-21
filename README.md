@@ -17,7 +17,7 @@ A native Android (arm64) port of the Xbox 360 version of *Lightning Returns: Fin
 - **No shader stutter after the first start**: on the first start a screen at the title compiles every shader the game uses for your GPU driver, showing the progress and the time left; they are kept between sessions.
 - **Runs well in the Thor's lowest power mode**: every number below is measured in AYN's *Standard* mode, not Performance or High Performance.
 - **Controller or touch**: built-in, Bluetooth and USB controllers work, and on-screen touch buttons appear when none is connected (size, opacity and layout editable under CTRL; see the [screenshots](#screenshots)).
-- **Cheats** (optional, off by default): infinite EP and a frozen clock, switched on and off under CTRL while you play.
+- **Cheats** (optional, off by default): infinite EP, infinite HP in battle and a frozen clock, switched on and off under CTRL while you play.
 - **GPU driver bundled**: the open-source Turnip (Mesa) driver ships in the APK and is used automatically on Adreno.
 - **Download and play**: install the APK, pick your ISO in the app, play. No PC needed. Or build it yourself with one command (`tools/quickstart.sh`).
 
@@ -143,7 +143,7 @@ The game's own Settings menu is the Xbox 360 release's, unchanged. The port's op
 | Touch controls | shown when no controller is connected | Size, opacity and layout are editable. |
 | GPU driver | Stable Turnip v2 (bundled) | Installed and selected automatically on first start (Adreno 6xx/7xx/8xx; sysmem mode on Adreno 710/720/722). Other Turnip builds can be downloaded on the GPU driver page but are untested with this game; Qualcomm's drivers are not supported. |
 | Second screen | on | The bottom-screen companion on dual-screen devices (see above). |
-| Cheats | all off | *Infinite EP* (EP stays at its maximum, so EP abilities cost nothing) and *Freeze the clock* (the days do not pass). Apply at once. A save made while a cheat is on keeps its effects (a frozen clock stays at its time). |
+| Cheats | all off | *Infinite EP* (EP stays at its maximum, so EP abilities cost nothing), *Infinite HP (in battle)* (Lightning's HP goes back to its maximum after every hit; a single hit larger than her maximum HP still knocks her out) and *Freeze the clock* (the days do not pass). Apply at once. A save made while a cheat is on keeps its effects (a frozen clock stays at its time). |
 | Debug logging | off | Writes frame and GPU statistics to the log, for reporting a problem. Costs ~4% CPU. |
 
 **Buttons on AYN handhelds (Thor, Odin 2):** in the handheld's Nintendo button layout, face buttons act by position (bottom = A, right = B, left = X, top = Y) so they match the on-screen prompts. In Xbox mode nothing is swapped.

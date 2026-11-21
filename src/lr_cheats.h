@@ -9,7 +9,8 @@
 // Bits of g_lr_cheats (the CTRL dialog's switches, android Cheats.java; on PC Settings > Cheats).
 constexpr int kLrCheatInfiniteEp = 1;   // EP stays at its maximum (EP abilities cost nothing)
 constexpr int kLrCheatFreezeClock = 2;  // the game clock stands still
-constexpr int kLrCheatMask = kLrCheatInfiniteEp | kLrCheatFreezeClock;
+constexpr int kLrCheatInfiniteHp = 4;   // Lightning's HP stays at its maximum in battle (public #5)
+constexpr int kLrCheatMask = kLrCheatInfiniteEp | kLrCheatFreezeClock | kLrCheatInfiniteHp;
 
 // LR_CHEATS / cheats.txt / nativeSetOption("cheats"): the mask in decimal. Unknown bits are
 // dropped; anything that is not a plain non-negative number is 0 (all off).
@@ -51,4 +52,30 @@ inline bool lr_ep_pair_valid(uint32_t ep, uint32_t ep_max) { return ep_max > 0 &
 // or the pair is not EP).
 inline uint32_t lr_ep_top_up(uint32_t ep, uint32_t ep_max) {
   return lr_ep_pair_valid(ep, ep_max) && ep < ep_max ? ep_max : 0;
+}
+
+// Infinite HP (public #5). Battle actors sit in the table [[0x830D839C] + 0x154] (u32 pointers;
+// docs/dual_screen_battle_re.md "Libra"); all share one vtable. Lightning's has the spec name "pc000"
+// at +0x23B8 (enemies "m293", "m300", ...) and was slot 0 in every battle seen. Current HP: u32 +0x2F0;
+// +0x318 is a copy that follows it (except at the start of the prologue battle: 2000 while +0x2F0 is
+// 2500). Maximum: u32 +0x394, right in 15 snapshots of 5 battles, Lightning and enemies (2500 in the
+// prologue, 2967 later); +0x31C, which is the maximum in most battles, still held the pre-battle
+// 2000 there.
+constexpr uint32_t kLrBattleGlobal = 0x830D839C;
+constexpr uint32_t kLrActorTable = 0x154;
+constexpr uint32_t kLrActorSlots = 4;  // Lightning is looked for in the first slots only
+constexpr uint32_t kLrActorVtable = 0x8203BAB0;
+constexpr uint32_t kLrActorHp = 0x2F0;
+constexpr uint32_t kLrActorHp2 = 0x318;
+constexpr uint32_t kLrActorHpMax = 0x394;
+constexpr uint32_t kLrActorSpec = 0x23B8;
+constexpr uint32_t kLrHpMaxSane = 1000000;
+
+// The first 4 bytes of the spec name (big-endian u32) name a player character ("pc0" + digit).
+inline bool lr_actor_is_player(uint32_t spec_be) { return (spec_be & 0xFFFFFF00u) == 0x70633000u && ((spec_be & 0xFF) - '0') < 10u; }
+
+// The HP to store to hold it at its maximum, or 0 when nothing is to be written (full, KO'd at 0 is
+// left alone too: reviving is the game's business, and 0 can be a battle not set up yet).
+inline uint32_t lr_hp_top_up(uint32_t hp, uint32_t hp_max) {
+  return hp_max > 0 && hp_max <= kLrHpMaxSane && hp > 0 && hp < hp_max ? hp_max : 0;
 }

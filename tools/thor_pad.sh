@@ -3,7 +3,7 @@
 #   thor_pad.sh start ["--cvar=v ..."] -> wake the Thor and (re)start the game, optionally with extra runtime cvars
 #   thor_pad.sh driver system|<id>     -> select the GPU driver for the next start (system or an installed package id)
 #   thor_pad.sh shot [name]            -> screenshot to out/thor/live/<name or timestamp>.png, prints the path
-#   thor_pad.sh press A|B|X|Y|START|BACK(=SELECT)|UP|DOWN|LEFT|RIGHT|LB|RB [hold_ms=600]
+#   thor_pad.sh press A|B|X|Y|START|BACK(=SELECT)|UP|DOWN|LEFT|RIGHT|LB|RB|LT|RT [hold_ms=600]
 #   thor_pad.sh grep PATTERN [n]       -> last n (5) lines of the game log matching PATTERN
 #   thor_pad.sh native                 -> native backtraces of all game threads (debuggerd) to out/thor/live/native_*.txt
 #   thor_pad.sh threads                -> top 12 threads of the game by CPU right now (thread names)
@@ -51,9 +51,14 @@ case "${1:-}" in
     # The Thor in its Nintendo button mode: the SDK swaps the face buttons back to positions
     # (gamepad_face_buttons_by_position), so the game's A is BTN_EAST 305, B 304, X 308, Y 307.
     case "${2:-}" in A) c=305;; B) c=304;; X) c=308;; Y) c=307;; START) c=315;; SELECT|BACK) c=314;; LB) c=310;; RB) c=311;;
-      UP) c=544;; DOWN) c=545;; LEFT) c=546;; RIGHT) c=547;; *) echo "unknown button ${2:-}"; exit 1;; esac
+      UP) c=544;; DOWN) c=545;; LEFT) c=546;; RIGHT) c=547;; LT) c=abs10;; RT) c=abs9;; *) echo "unknown button ${2:-}"; exit 1;; esac
     ms=${3:-600}; secs=$(awk "BEGIN{printf \"%.3f\", $ms/1000}")
-    A shell "$GUARD sendevent $DEV 1 $c 1; sendevent $DEV 0 0 0; sleep $secs; sendevent $DEV 1 $c 0; sendevent $DEV 0 0 0" && echo "pressed $2 for ${ms}ms" ;;
+    # The triggers are axes on the Thor: LT = ABS_BRAKE (10), RT = ABS_GAS (9), 0..32767 (LT is Overclock in battle).
+    if [ "${c#abs}" != "$c" ]; then
+      A shell "$GUARD sendevent $DEV 3 ${c#abs} 32767; sendevent $DEV 0 0 0; sleep $secs; sendevent $DEV 3 ${c#abs} 0; sendevent $DEV 0 0 0" && echo "pressed $2 for ${ms}ms"
+    else
+      A shell "$GUARD sendevent $DEV 1 $c 1; sendevent $DEV 0 0 0; sleep $secs; sendevent $DEV 1 $c 0; sendevent $DEV 0 0 0" && echo "pressed $2 for ${ms}ms"
+    fi ;;
   stick)
     x=$(( ${2:-0} * 32767 / 100 )); y=$(( ${3:-0} * 32767 / 100 )); ms=${4:-1000}; secs=$(awk "BEGIN{printf \"%.3f\", $ms/1000}")
     A shell "$GUARD sendevent $DEV 3 0 $x; sendevent $DEV 3 1 $y; sendevent $DEV 0 0 0; sleep $secs; sendevent $DEV 3 0 0; sendevent $DEV 3 1 0; sendevent $DEV 0 0 0" && echo "stick $2,$3 for ${ms}ms" ;;
