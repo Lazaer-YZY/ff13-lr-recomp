@@ -1,0 +1,73 @@
+From 5c4dd128e0d91bb87d8146cb74ce955c35d73233 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 21 Nov 2026 08:10:34 +0800
+Subject: [PATCH 110/115] core/memory: commit pages on kernels before 4.17
+ (MAP_FIXED_NOREPLACE taken as a hint)
+
+Kernels before 4.17 ignore MAP_FIXED_NOREPLACE and map an occupied range elsewhere, so a commit
+inside a reservation never reached mprotect and a released stack guard page stayed no-access
+(endless loading on a 4.14 phone in the sister project DS2, issue #4). A result at another
+address is unmapped and handled as EEXIST. REX_DEBUG_MMAP_HINT_ONLY=1/2 emulates the old kernel
+with/without the fallback.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index 2cdcd55..f36a7ec 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -9,9 +9,11 @@
+  * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
+  */
+ 
++#include <atomic>
+ #include <cerrno>
+ #include <cstddef>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <fstream>
+ #include <functional>
+@@ -284,7 +286,13 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+     flags |= MAP_FIXED;
+   }
+ #elif defined(MAP_FIXED_NOREPLACE)
+-  if (base_address) {
++  // Debug launches: REX_DEBUG_MMAP_HINT_ONLY=1 behaves like a kernel before 4.17 (the address only a
++  // hint), =2 the same without the fallback below (reproduces the endless loading of DS2 issue #4).
++  static const int debug_hint_only = [] {
++    const char* value = std::getenv("REX_DEBUG_MMAP_HINT_ONLY");
++    return value ? std::atoi(value) : 0;
++  }();
++  if (base_address && !debug_hint_only) {
+     flags |= MAP_FIXED_NOREPLACE;
+   }
+ #else
+@@ -294,6 +302,27 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+ #endif
+ 
+   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
++#if !REX_PLATFORM_MAC && defined(MAP_FIXED_NOREPLACE)
++  // Kernels before 4.17 don't know MAP_FIXED_NOREPLACE and take the address as a hint: an occupied
++  // range comes back mapped somewhere else instead of failing with EEXIST, so a commit inside a
++  // reservation never reached the mprotect below and kept the pages' old protection (the sister
++  // project's issue #4, a 4.14 kernel: a released stack guard page stayed no-access, and filling the
++  // next thread's stack faulted forever). Undo the stray mapping and take the EEXIST path, as newer
++  // kernels do.
++  if (result != MAP_FAILED && base_address && result != base_address) {
++    static std::atomic<uint32_t> hint_results{0};
++    const uint32_t count = ++hint_results;
++    if (count <= 3) {
++      REXSYS_WARN("AllocFixed: the kernel took {} as a hint (mapped at {}; kernel before 4.17?){}", base_address,
++                  result, debug_hint_only == 2 ? ", fallback off (REX_DEBUG_MMAP_HINT_ONLY=2)" : "");
++    }
++    if (debug_hint_only != 2) {
++      munmap(result, length);
++      result = MAP_FAILED;
++      errno = EEXIST;
++    }
++  }
++#endif
+   if (result != MAP_FAILED) {
+     return result;
+   }

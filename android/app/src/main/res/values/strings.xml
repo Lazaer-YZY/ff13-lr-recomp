@@ -1,40 +1,62 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">LR: FFXIII</string>
-    <string name="touch_hide_all">Hide all touch controls</string>
-    <string name="touch_hide_all_help">Reveal the system bars or use Android Back to show CTRL for 4 seconds.</string>
-    <string name="touch_settings_title">Controller settings</string>
+    <string name="touch_settings_title">Settings</string>
+    <!-- Section headers -->
+    <string name="touch_section_controls">Touch controls</string>
+    <string name="touch_frame_rate">Frame rate</string>
+    <string name="touch_section_image">Image</string>
+    <string name="touch_section_second_screen">Second screen</string>
+    <string name="touch_section_cheats">Cheats</string>
+    <string name="touch_section_troubleshooting">Troubleshooting</string>
+    <string name="touch_next_start_note">* Applies the next time the game starts.</string>
+    <!-- Touch controls -->
     <string name="touch_show_controls">Show touch controls</string>
-    <string name="touch_controller_hint">Physical controller connected. Touch controls hide automatically; turn them on here to use both together.</string>
-    <string name="touch_control_size">Control size: %1$d%%</string>
+    <string name="touch_controller_hint">A controller is connected, so touch controls hide on their own. Tick this to use both.</string>
+    <string name="touch_control_size">Size: %1$d%%</string>
     <string name="touch_opacity">Opacity: %1$d%%</string>
-    <string name="touch_ctrl_auto_hide">Auto-hide CTRL button</string>
+    <string name="touch_ctrl_auto_hide">Auto-hide the CTRL button</string>
+    <string name="touch_hide_all">Hide all touch controls</string>
+    <string name="touch_hide_all_help">To bring CTRL back for 4 s, swipe in the system bars or press Back.</string>
+    <!-- Frame rate -->
+    <string name="touch_fps_30">30 fps (coolest, as on the Xbox 360)</string>
+    <string name="touch_fps_40">40 fps *</string>
+    <string name="touch_fps_60">60 fps</string>
+    <string name="touch_fps_help">Cutscenes stay at 30 fps.</string>
+    <string name="touch_panel120">Smoother 60 fps (120 Hz screen) *</string>
+    <string name="touch_panel120_help">A late frame shows after 25 ms instead of 33 ms. Runs a little hotter.</string>
+    <string name="touch_perf_overlay">Performance overlay</string>
+    <string name="touch_perf_overlay_help">Frame rate and a frame time graph on screen.</string>
+    <string name="touch_fps_40_fallback">The last start at 40 fps did not get going; back to 30 fps.</string>
+    <!-- Image -->
+    <string name="touch_aa">Anti-aliasing</string>
+    <string name="touch_aa_off">Off</string>
+    <string name="touch_aa_fxaa">FXAA (smoother edges, a little softer)</string>
+    <string name="touch_upscale">Upscaling to the screen *</string>
+    <string name="touch_upscale_bilinear">Bilinear</string>
+    <string name="touch_upscale_fsr">AMD FSR 1 (sharper edges)</string>
+    <string name="touch_upscale_cas">AMD CAS (sharpening)</string>
+    <!-- Second screen -->
+    <string name="touch_companion">Companion</string>
+    <string name="touch_companion_help">Schemata in battle (tap to switch), the map in the field, artwork in cutscenes.</string>
+    <!-- Cheats -->
+    <string name="cheat_infinite_ep">Infinite EP</string>
+    <string name="cheat_freeze_clock">Freeze the clock</string>
+    <string name="touch_cheats_help">A save made with a cheat on keeps its effects.</string>
+    <!-- Troubleshooting -->
+    <string name="touch_debug_log">Debug logging *</string>
+    <string name="touch_debug_log_help">Records statistics for bug reports. Slight extra load.</string>
+    <string name="touch_exact_shader_math">Exact Xbox shader math *</string>
+    <string name="touch_exact_shader_math_help">Only if something looks wrong. Slower; shaders rebuild once.</string>
     <string name="touch_gpu_driver">GPU driver: %1$s …</string>
     <string name="touch_gpu_driver_system">System</string>
     <string name="touch_game_folder">Game folder …</string>
+    <string name="touch_save_logs">Save logs for a bug report …</string>
+    <string name="logs_saved">Logs saved as %1$s. Attach that file to your bug report.</string>
+    <string name="logs_save_failed">Could not save the logs: %1$s</string>
+    <string name="logs_no_picker">This device has no file picker to save the logs with.</string>
+    <!-- Buttons -->
     <string name="touch_apply">Apply</string>
     <string name="touch_edit_layout">Edit layout</string>
-    <string name="touch_render_title">Display</string>
-    <string name="touch_frame_rate">Frame rate</string>
-    <string name="touch_fps_30">30 fps (as on the Xbox 360)</string>
-    <string name="touch_fps_40">40 fps in gameplay (120 Hz panel mode; cutscenes stay at 30; from the next start)</string>
-    <string name="touch_fps_60">60 fps in gameplay (cutscenes stay at 30; needs GPU headroom, runs hotter)</string>
-    <string name="touch_panel120">Smoother 60 fps: 120 Hz panel mode (a frame that misses 16.7 ms shows after 25 ms instead of 33; runs hotter; from the next start)</string>
-    <string name="touch_fps_40_fallback">The last start at 40 fps did not get going; back to 30 fps.</string>
-    <string name="touch_aa">Anti-aliasing (FXAA, at the game\'s 720p)</string>
-    <string name="touch_aa_off">Off</string>
-    <string name="touch_aa_fxaa">FXAA</string>
-    <string name="touch_upscale">Upscaling 720p to the screen (applies at the next start)</string>
-    <string name="touch_upscale_bilinear">Bilinear</string>
-    <string name="touch_upscale_fsr">AMD FSR 1.0 (sharper edges)</string>
-    <string name="touch_upscale_cas">AMD CAS (sharpening)</string>
-    <string name="touch_perf_overlay">Performance overlay (frame rate, frame time graph; the game\'s own frames)</string>
-    <string name="touch_exact_shader_math">Exact Xbox shader math (slower; only if something renders wrong; from the next start, shaders rebuild once)</string>
-    <string name="touch_companion">Second screen: schemata in battle (tap to switch), map in the field, artwork in cutscenes</string>
-    <string name="touch_debug_log">Debug logging (frame and wait statistics for troubleshooting; slight extra load; from the next start)</string>
-    <string name="touch_cheats_title">Cheats</string>
-    <string name="touch_cheats_help">Apply at once. Saving while a cheat is on keeps its effects in that save (a frozen clock stays at its time).</string>
-    <string name="cheat_infinite_ep">Infinite EP (EP abilities cost nothing)</string>
-    <string name="cheat_freeze_clock">Freeze the clock (the days do not pass)</string>
     <string name="touch_cancel">Cancel</string>
 </resources>

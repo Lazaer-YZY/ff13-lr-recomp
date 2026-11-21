@@ -27,25 +27,33 @@ import java.util.zip.ZipOutputStream;
  * Runtime logs in {@code Android/data/<package>/files/logs/}, which a player
  * can copy to a PC over USB without root or adb.
  *
- * The native runtime writes there through {@code LR_LOG_DIR}. A PC sees new
- * files over USB (MTP) only after the media scanner has indexed them, and MTP
- * reports the size recorded at that scan, so the folder is scanned again on
- * every launch: the files of a run that crashed are complete after that.
+ * The game's log is {@code lr.log} (RuntimeActivity's --log_file; every start is
+ * appended to it). A PC sees new files over USB (MTP) only after the media
+ * scanner has indexed them, and MTP reports the size recorded at that scan, so
+ * the folder is scanned again on every launch and when the game is left: the
+ * files of a run that crashed are complete after that. Until 2026-11-20 the
+ * scan skipped lr.log (the names below were Lost Odyssey's), so a PC showed it
+ * stale or not at all (public issue #4).
  */
 final class PlayerLogs {
     static final String DIRECTORY = "logs";
     static final String README = "README.txt";
     static final int JAVA_CRASHES_KEPT = 5;
-    private static final String README_TEXT =
-        "Lightning Returns Recomp logs. For a bug report, attach the newest runtime-*.log,\n"
-        + "native-stderr.log and any java-crash-*.txt. Open the app once after a crash\n"
-        + "so a PC sees the complete files.\n";
+    static final String README_TEXT =
+        "LR: FFXIII logs. For a bug report, attach lr.log (every start is added to its end)\n"
+        + "and any java-crash-*.txt. Open the app once after a crash so a PC sees the\n"
+        + "complete files.\n";
     private static final Pattern LOG_FILE = Pattern.compile(
-        "runtime-\\d+\\.log|shader-\\d+\\.jsonl|native-stderr(\\.previous)?\\.log|java-crash-\\d+\\.txt|README\\.txt");
+        "lr\\.log|runtime-\\d+\\.log|shader-\\d+\\.jsonl|native-stderr(\\.previous)?\\.log|java-crash-\\d+\\.txt|README\\.txt");
     private static final Pattern JAVA_CRASH = Pattern.compile("java-crash-(\\d+)\\.txt");
     private static final Pattern RUNTIME_LOG = Pattern.compile("runtime-(\\d+)\\.log");
     private static final Pattern EXPORTED = Pattern.compile(
-        "native-stderr(\\.previous)?\\.log|java-crash-\\d+\\.txt");
+        "lr\\.log|native-stderr(\\.previous)?\\.log|java-crash-\\d+\\.txt");
+    /**
+     * lr.log grows with every start; an export keeps its last 32 MB (whole lines; a zip of
+     * that is a few MB, well under GitHub's 25 MB attachment limit).
+     */
+    static final long EXPORT_TAIL_BYTES = 32L << 20;
     /** Runtime logs in an export: this run and the two before it, for a crash in the last one. */
     static final int RUNTIME_LOGS_EXPORTED = 3;
 
@@ -95,8 +103,9 @@ final class PlayerLogs {
     }
 
     /**
-     * The files a log export holds: the newest runtime logs, native stderr and the
-     * Java crash reports. Shader logs stay out; they are large and rarely needed.
+     * The files a log export holds: the game's lr.log and the Java crash reports
+     * (plus the Lost Odyssey runtime/stderr names, should they ever appear). Shader
+     * logs stay out; they are large and rarely needed.
      */
     static List<File> exportable(File directory) {
         File[] files = directory.listFiles();
@@ -129,6 +138,11 @@ final class PlayerLogs {
      * up to the export.
      */
     static void exportZip(List<File> files, String device, OutputStream output) throws IOException {
+        exportZip(files, device, output, EXPORT_TAIL_BYTES);
+    }
+
+    /** As above; a file longer than {@code tailBytes} is cut to its end, from a line start. */
+    static void exportZip(List<File> files, String device, OutputStream output, long tailBytes) throws IOException {
         ZipOutputStream zip = new ZipOutputStream(output);
         zip.putNextEntry(new ZipEntry("logs/device.txt"));
         zip.write((device + "\n").getBytes(StandardCharsets.UTF_8));
@@ -137,12 +151,29 @@ final class PlayerLogs {
         for (File file : files) {
             zip.putNextEntry(new ZipEntry("logs/" + file.getName()));
             try (InputStream input = new FileInputStream(file)) {
+                long skip = file.length() - tailBytes;
+                if (skip > 0) {
+                    for (long left = skip; left > 0; ) {
+                        long n = input.skip(left);
+                        if (n <= 0) break;
+                        left -= n;
+                    }
+                    for (int c; (c = input.read()) >= 0 && c != '\n'; ) ++skip;  // to the next line
+                    zip.write(("[first " + (skip + 1) + " bytes of " + file.getName() + " left out]\n")
+                        .getBytes(StandardCharsets.UTF_8));
+                }
                 for (int n; (n = input.read(buffer)) > 0; ) zip.write(buffer, 0, n);
             }
             zip.closeEntry();
         }
         zip.finish();
         zip.flush();
+    }
+
+    /** The suggested file name of a log export, e.g. LR-FFXIII-logs-20261120-1530.zip. */
+    static String exportName(java.util.Date when) {
+        return "LR-FFXIII-logs-" + new java.text.SimpleDateFormat("yyyyMMdd-HHmm", java.util.Locale.US).format(when)
+            + ".zip";
     }
 
     /** Whether settings.ini turns on Settings -> System -> Debug log (info lines in the runtime log). */
@@ -165,7 +196,8 @@ final class PlayerLogs {
         //noinspection ResultOfMethodCallIgnored
         directory.mkdirs();
         File readme = new File(directory, README);
-        if (!readme.exists()) write(readme, README_TEXT);
+        // Rewritten when its text changed (older installs carry Lost Odyssey's file names).
+        if (readme.length() != README_TEXT.getBytes(StandardCharsets.UTF_8).length) write(readme, README_TEXT);
         List<File> files = scannable(directory);
         if (files.isEmpty()) return;
         String[] paths = new String[files.size()];

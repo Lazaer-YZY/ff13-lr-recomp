@@ -1,7 +1,7 @@
 From 40a369719a7780fdcfc6deb773103b098c00e9db Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 00:06:40 +0800
-Subject: [PATCH 073/108] gpu: vulkan: plumbing for extended dynamic state
+Subject: [PATCH 073/115] gpu: vulkan: plumbing for extended dynamic state
  1/2/3 and graphics pipeline libraries; pairing-independent interpolator
  interface (inactive)
 

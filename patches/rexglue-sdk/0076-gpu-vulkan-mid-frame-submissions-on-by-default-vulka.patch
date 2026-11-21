@@ -1,7 +1,7 @@
 From b482f3061cd1b30df273d42757611757e2481d83 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 08:35:30 +0800
-Subject: [PATCH 076/108] gpu: vulkan: mid-frame submissions on by default
+Subject: [PATCH 076/115] gpu: vulkan: mid-frame submissions on by default
  (vulkan_submit_on_primary_buffer_end)
 
 Turned off on 2026-11-08 for a title flicker on Qualcomm's v819.2

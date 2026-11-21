@@ -1,7 +1,7 @@
 From 31933118366d90c95cbfaa1466136adef8546ac4 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 09:36:49 +0800
-Subject: [PATCH 077/108] gpu: vulkan: lazy resolve dumps; depth resolves also
+Subject: [PATCH 077/115] gpu: vulkan: lazy resolve dumps; depth resolves also
  feed k_8_8_8_8 textures
 
 A 1x k_8_8_8_8 resolve that feeds a texture (vulkan_resolve_feed_textures) no

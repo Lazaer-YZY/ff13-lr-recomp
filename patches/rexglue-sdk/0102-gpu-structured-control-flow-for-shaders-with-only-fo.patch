@@ -1,7 +1,7 @@
 From d4d022c625f81b78ad017d01379b97cf867f9f02 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Wed, 11 Nov 2026 16:05:14 +0800
-Subject: [PATCH 102/108] gpu: structured control flow for shaders with only
+Subject: [PATCH 102/115] gpu: structured control flow for shaders with only
  forward jumps (spirv_structured_forward_jumps, on)
 
 

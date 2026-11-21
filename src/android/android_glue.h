@@ -34,6 +34,15 @@ void ClearTouchSnapshot();
 // Returns true when a custom driver is active.
 bool LoadCustomVulkanDriver();
 
+// Setup failed: when the Vulkan code noted why ("<GPU name>: <reason>", e.g. a missing feature), hands
+// it to the activity (RuntimeActivity.reportGraphicsFailure), which opens the GPU driver page with it
+// once the game closes (LrApp::OnSetupFailed).
+void ReportGraphicsFailure();
+// A renderer that fails on the GPU thread aborts the process before any activity callback: this
+// SIGABRT handler saves the noted reason to <app files>/graphics_failure.txt for the next start's
+// GPU driver page (GpuDriverStore.takeGraphicsFailure). Installed before the GPU plugin loads.
+void InstallGraphicsFailureSaver();
+
 // Pins the calling thread to the faster CPU clusters (every core whose top clock is above the
 // slowest cluster's; LR_AFFINITY=<hex mask> overrides, LR_AFFINITY=all turns it off). Called on
 // SDL's main thread before the runtime creates any thread, so every game, GPU and audio thread

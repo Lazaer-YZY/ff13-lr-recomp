@@ -1,7 +1,7 @@
 From 0745fbb0bc4c96e514e43671777998cd3c70a7c0 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:16:53 +0800
-Subject: [PATCH 004/108] ui(android): add AndroidNativeWindowSurface and SDL
+Subject: [PATCH 004/115] ui(android): add AndroidNativeWindowSurface and SDL
  native window lookup
 
 surface_android.h/.cpp wrap the ANativeWindow from SDL_PROP_WINDOW_ANDROID_

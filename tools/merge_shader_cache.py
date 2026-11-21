@@ -14,7 +14,7 @@ import sys
 TITLE = '5351081B'
 XSH_MAGIC = 0x48534558   # 'XESH'
 XPSO_MAGIC = 0x53504558  # 'XEPS'
-XPSO_RECORD = 66         # uint64 hash + PipelineDescription (58 bytes) at storage version below
+XPSO_RECORD = 68         # uint64 hash + packed PipelineDescription (60 bytes; 68-byte records since 2026-11)
 
 
 def read_xsh(path):

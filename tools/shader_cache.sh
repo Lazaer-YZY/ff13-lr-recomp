@@ -17,7 +17,7 @@
 # The .xsh file contains shader code from the game: only share it with people who own the game.
 #
 # The game is force-stopped first (it rewrites these files while running) and the device is put
-# to sleep at the end. With several adb devices set LR_ADB_SERIAL.
+# to sleep at the end unless another app was in use. With several adb devices set LR_ADB_SERIAL.
 set -u
 export MSYS_NO_PATHCONV=1
 [ -f /c/lr/tools/env.sh ] && source /c/lr/tools/env.sh >/dev/null 2>&1
@@ -29,11 +29,23 @@ A() { adb ${LR_ADB_SERIAL:+-s "$LR_ADB_SERIAL"} "$@"; }
 win() { command -v cygpath >/dev/null && cygpath -m "$1" || echo "$1"; }
 PYBIN=python; python -c "" >/dev/null 2>&1 || PYBIN=python3
 PY() { "$PYBIN" -I "$@"; }
-finish() { A shell am force-stop $PKG >/dev/null 2>&1; A shell input keyevent KEYCODE_SLEEP >/dev/null 2>&1; }
+# The screen goes back to sleep only if it was asleep or showing this game when the script started:
+# another project's run or the owner may be using the device (2026-11-21: a push put the Thor to
+# sleep in the middle of the DS2 project's run).
+FOUND=""
+finish() {
+  A shell am force-stop $PKG >/dev/null 2>&1
+  if ! echo "$FOUND" | grep -q 'mWakefulness=Awake' || echo "$FOUND" | grep -q "ResumedActivity.*$PKG"; then
+    A shell input keyevent KEYCODE_SLEEP >/dev/null 2>&1
+  else
+    echo "note: the screen was on with another app in front; left it on"
+  fi
+}
 die() { echo "error: $*" >&2; exit 1; }
 
 cmd=${1:-}; trap finish EXIT
 A get-state >/dev/null 2>&1 || die "no adb device (USB debugging on, cable in, authorised?)"
+FOUND=$(A shell "dumpsys power | grep -m1 mWakefulness=; dumpsys activity activities | grep ResumedActivity" 2>/dev/null | tr -d '\r')
 A shell am force-stop $PKG
 case "$cmd" in
   pull)

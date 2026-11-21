@@ -1,0 +1,50 @@
+From 4c5d28fbe5b90f7165a0f249772ee55df645a4a1 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 21 Nov 2026 08:10:34 +0800
+Subject: [PATCH 111/115] ui: ReXApp::OnSetupFailed when runtime, GPU plugin or
+ presentation setup fails
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
+index 9672d33..a2f0583 100644
+--- a/include/rex/rex_app.h
++++ b/include/rex/rex_app.h
+@@ -105,6 +105,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   /// Called after runtime is fully initialized, before window creation.
+   virtual void OnPostSetup() {}
+ 
++  /// Called when the GPU plugin, graphics presentation or runtime setup failed, before the app gives up.
++  virtual void OnSetupFailed() {}
++
+   /// Called after ImGui drawer is created. Add custom dialogs here.
+   virtual void OnCreateDialogs(ui::ImGuiDrawer* drawer) { (void)drawer; }
+ 
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 9ff54e8..05b3974 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -235,6 +235,7 @@ bool ReXApp::ConstructRuntime(const PathConfig& paths) {
+   auto status = runtime_->Setup(ppc_info_, std::move(config_));
+   if (XFAILED(status)) {
+     REXLOG_ERROR("Runtime setup failed: {:08X}", status);
++    OnSetupFailed();
+     return false;
+   }
+ 
+@@ -318,6 +319,7 @@ bool ReXApp::SetupPresentation() {
+       auto msg =
+           fmt::format("Failed to load GPU plugin '{}'. See log for details.", config_.gpu_plugin);
+       REXLOG_ERROR("{}", msg);
++      OnSetupFailed();
+       rex::ShowSimpleMessageBox(rex::SimpleMessageBoxType::Error, msg);
+       return false;
+     }
+@@ -327,6 +329,7 @@ bool ReXApp::SetupPresentation() {
+     X_STATUS status = config_.graphics->SetupPresentation(&app_context());
+     if (XFAILED(status)) {
+       REXLOG_ERROR("Graphics presentation setup failed: {:08X}", status);
++      OnSetupFailed();
+       return false;
+     }
+   }

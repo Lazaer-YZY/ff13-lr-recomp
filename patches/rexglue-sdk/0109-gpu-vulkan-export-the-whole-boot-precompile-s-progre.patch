@@ -1,13 +1,9 @@
 From 590cc8a6dc5d20a2661734df722f64a7d5263ac5 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 16 Nov 2026 19:56:40 +0800
-Subject: [PATCH] gpu/vulkan: export the whole boot precompile's progress
- (rex_precompile_all_permille) for the app's background indicator
+Subject: [PATCH 109/115] gpu/vulkan: export the whole boot precompile's
+ progress (rex_precompile_all_permille) for the app's background indicator
 
----
- src/graphics/vulkan/pipeline_cache.cpp     | 6 ++++++
- src/kernel/xboxkrnl/xboxkrnl_threading.cpp | 3 +++
- 2 files changed, 9 insertions(+)
 
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
 index 90999b2..1fb1695 100644
@@ -61,6 +57,3 @@ index 6a94600..34714a7 100644
  
  u32 KeSetEvent_entry(ppc_ptr_t<X_KEVENT> event_ptr, u32 increment, u32 wait) {
    if (auto observer = rex_set_event_observer) observer(0, event_ptr.guest_address());
--- 
-2.51.0.windows.1
-

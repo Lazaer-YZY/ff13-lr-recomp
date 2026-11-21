@@ -1,7 +1,7 @@
 From dea13a14e7394be6060bbf490d2089bfd91499cd Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Tue, 10 Nov 2026 06:37:58 +0800
-Subject: [PATCH 092/108] gpu: shared memory shader reads through one R32_UINT
+Subject: [PATCH 092/115] gpu: shared memory shader reads through one R32_UINT
  texel buffer; pipeline IR dump
 
 On Adreno/Turnip maxStorageBufferRange is 128 MB, so the 512 MB shared memory

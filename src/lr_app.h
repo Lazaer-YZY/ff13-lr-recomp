@@ -1227,10 +1227,19 @@ class LrApp : public rex::ReXApp {
 
   void OnPostLaunchModule(rex::system::XThread*) override { StartCaptureButtonWatcher(); }
 
+  // The GPU plugin, presentation or runtime could not be set up: on Android the reason the Vulkan
+  // code noted goes to the activity, which opens the GPU driver page with it.
+  void OnSetupFailed() override {
+#if defined(__ANDROID__)
+    lr::android::ReportGraphicsFailure();
+#endif
+  }
+
   // Runs in ReXApp::SetupPresentation() before LoadGpuPlugin() and
   // graphics->SetupPresentation(), i.e. before any Vulkan instance exists.
   void OnPreSetup(rex::RuntimeConfig& config) override {
 #if defined(__ANDROID__)
+    lr::android::InstallGraphicsFailureSaver();
     lr::android::LoadCustomVulkanDriver();  // ours: Turnip / custom Vulkan driver
     REXLOG_INFO("LR Android: game threads on {}", lr::android::PinnedCoresNote());
 #endif

@@ -109,7 +109,7 @@ Newer releases install over the old one and keep your saves and game files.
 ### What you need
 - **The game**: *Lightning Returns: Final Fantasy XIII*, USA Xbox 360 disc, dumped to an ISO from your own copy (title ID `5351081B`, media ID `4A99274C`, XEX version 0.0.0.8, no title update). Other regions need their own manifest and are untested.
 - **A Windows 10/11 PC** with [Git for Windows](https://git-scm.com/download/win) and [Python 3](https://www.python.org/downloads/) (tick "Add to PATH"). No admin rights needed: everything else is downloaded portably into `C:\dev`. About **30 GB** free disk space.
-- **An Android phone or handheld with a Snapdragon chip** (Adreno 6xx, 7xx or 8xx GPU; Snapdragon 8 Gen 2 or newer recommended; tested on the AYN Thor), about 8 GB free. **A controller is optional:** without one the game shows on-screen touch buttons; built-in, Bluetooth and USB controllers work too. Devices with Mali GPUs (Dimensity, Exynos, Tensor) are untested.
+- **An Android phone or handheld with a Snapdragon chip** (Adreno 6xx, 7xx or 8xx GPU; Snapdragon 8 Gen 2 or newer recommended; tested on the AYN Thor), about 8 GB free. **A controller is optional:** without one the game shows on-screen touch buttons; built-in, Bluetooth and USB controllers work too. Devices with Mali GPUs (Dimensity, Exynos, Tensor) are untested: since v1.2.1 the renderer has fallbacks for the Vulkan features Mali drivers lack instead of refusing to start, but that is checked only by making the Thor's Adreno report a Mali's features. If the game can't start, the GPU driver page says why; please open an issue with the logs (**CTRL → Save logs for a bug report …**).
 - **Time**: the first build compiles the recompiled game, which takes **one to several hours** on a laptop.
 
 ### Build it yourself
@@ -141,7 +141,7 @@ The game's own Settings menu is the Xbox 360 release's, unchanged. The port's op
 | Performance overlay | off · on | fps and a frame-time graph. |
 | Exact Xbox shader math | off · on | Slower. Only if something renders wrong (black or flashing pixels, broken lighting). |
 | Touch controls | shown when no controller is connected | Size, opacity and layout are editable. |
-| GPU driver | Stable Turnip v2 (bundled) | Installed and selected automatically on first start (Adreno 6xx/7xx/8xx; sysmem mode on Adreno 710/720/722). Other Turnip builds can be installed; Qualcomm's drivers are not supported. |
+| GPU driver | Stable Turnip v2 (bundled) | Installed and selected automatically on first start (Adreno 6xx/7xx/8xx; sysmem mode on Adreno 710/720/722). Other Turnip builds can be downloaded on the GPU driver page but are untested with this game; Qualcomm's drivers are not supported. |
 | Second screen | on | The bottom-screen companion on dual-screen devices (see above). |
 | Cheats | all off | *Infinite EP* (EP stays at its maximum, so EP abilities cost nothing) and *Freeze the clock* (the days do not pass). Apply at once. A save made while a cheat is on keeps its effects (a frozen clock stays at its time). |
 | Debug logging | off | Writes frame and GPU statistics to the log, for reporting a problem. Costs ~4% CPU. |
@@ -234,7 +234,7 @@ bash tools/shader_cache.sh push friend.zip
 ```
 
 ## Troubleshooting
-- **Logs** are in `Android/data/com.lrrecomp.android/files/logs/lr.log`: `adb pull /sdcard/Android/data/com.lrrecomp.android/files/logs`
+- **Logs** for a bug report: on the phone, tap **CTRL**, then *Save logs for a bug report …*, and attach the zip it saves (usually in Downloads). They are in `Android/data/com.lrrecomp.android/files/logs/lr.log`; from a PC: `adb pull /sdcard/Android/data/com.lrrecomp.android/files/logs`
 - **Hitches in new areas right after installing:** the shader screen was skipped (START + BACK). It continues at the title on the next start; let it finish once.
 - **Wrong colours, black or flashing pixels:** turn on CTRL > Exact Xbox shader math (shaders rebuild once).
 - **Build fails after a codegen:** run `python -I tools/patch_generated.py`; it is needed after every `rexglue codegen`.
@@ -253,7 +253,7 @@ bash tools/shader_cache.sh push friend.zip
 ## References and credits
 Ordered by how much this port relies on them.
 
-1. **[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)** (BSD-style), derived from **[Xenia](https://xenia.jp)**: the recompiler, runtime and Vulkan GPU emulation everything is built on. This project carries 109 patches on v0.10.1.
+1. **[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)** (BSD-style), derived from **[Xenia](https://xenia.jp)**: the recompiler, runtime and Vulkan GPU emulation everything is built on. This project carries 115 patches on v0.10.1.
 2. **[lr-ffxiii-port](https://github.com/leftisthominid/lr-ffxiii-port)** by leftisthominid (GPL-3.0): an earlier ReXGlue port of this exact title. Its function analysis set, codegen flags and runtime hooks (including the movie/graphics-interrupt deadlock fix) were the starting point.
 3. **[Lost Odyssey Recomp](https://github.com/freefrank/LostOdysseyRecomp)** (GPL-3.0): the Android app layer (activities, GPU driver store, game folder, touch overlay, Turnip loading) is adapted from it; also ideas for render-target handling and thread placement on phones.
 4. **[Turnip / Mesa](https://docs.mesa3d.org/drivers/freedreno.html)** (MIT), packaged by **[whitebelyash](https://github.com/whitebelyash/AdrenoToolsDrivers)** (Stable Turnip v2): the bundled GPU driver, loaded with **[libadrenotools](https://github.com/bylaws/libadrenotools)** (BSD-2).
@@ -262,6 +262,7 @@ Ordered by how much this port relies on them.
 7. **[Xendroid+](https://github.com/phforner0/Xendroid-Plus)** and **[XeniOS](https://github.com/xenios-jp/XeniOS)**: ideas for mobile GPUs (texture sign specialisation, direct host resolve), re-implemented here.
 8. **[UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp)**, **[XenonRecomp](https://github.com/hedge-dev/XenonRecomp)**, **[XenosRecomp](https://github.com/hedge-dev/XenosRecomp)**: reference implementations of static and shader recompilation (register flags, shader precompile approach).
 9. **[xenia-edge](https://github.com/has207/xenia-edge)**, **[Theft4](https://github.com/KoreanSeats1/Theft4)** and X360-Mobile: corroborating notes on resolve and transfer optimisations.
+10. **[The Simpsons Game recomp](https://github.com/YesterMester/TheSimpsonsGameRecomp)** (GPL-3.0): its vertex memory export as compute dispatches, adapted for GPUs without vertex-stage stores (Arm's Mali driver).
 
 ## Licence
 GNU GPL v3 (see [`LICENSE`](LICENSE)). *Lightning Returns: Final Fantasy XIII* is © Square Enix. This project is not affiliated with Square Enix. The repository contains no game code or data; the release APK contains code recompiled from the game's executable and the second screen's images made from the game files, and runs only with the player's own disc image.

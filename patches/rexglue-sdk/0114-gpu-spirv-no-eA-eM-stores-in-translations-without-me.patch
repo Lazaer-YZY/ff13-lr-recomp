@@ -1,0 +1,30 @@
+From 3b35679d16ad39e5e4eb7d6cd5d3a1d39e3cab54 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 21 Nov 2026 09:52:34 +0800
+Subject: [PATCH 114/115] gpu/spirv: no eA/eM# stores in translations without
+ memory export
+
+A vertex shader's raster translation on a device without vertexPipelineStoresAndAtomics (the
+export runs as a compute dispatch instead) never creates the memexport variables, but
+ProcessAllocInstruction still stored to them: a null instruction dereference in
+spv::Builder::createStore during the boot precompile (emulated Mali and PanVK, 2026-11-21).
+Latent upstream: desktop Xenia requires vertex stores.
+
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 3471797..6edea3e 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -1667,6 +1667,13 @@ void SpirvShaderTranslator::ProcessAllocInstruction(const ParsedAllocInstruction
+   if (export_eM || start_memexport) {
+     CloseExecConditionals();
+   }
++  // Without memory export in this translation (a vertex shader's raster translation on a device
++  // without vertexPipelineStoresAndAtomics, where the export runs as a separate compute dispatch),
++  // the eA / eM# variables were never created: storing to them dereferenced a null instruction
++  // (Mali and PanVK crashed in the boot precompile, 2026-11-21).
++  if (!IsMemoryExportUsed()) {
++    return;
++  }
+ 
+   if (export_eM) {
+     ExportToMemory(export_eM);

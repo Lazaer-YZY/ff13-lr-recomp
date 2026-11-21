@@ -31,8 +31,10 @@
 #include <sched.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <fcntl.h>
 #include <chrono>
+#include <csignal>
 #include <thread>
 
 #include <android/log.h>
@@ -40,8 +42,13 @@
 #include <jni.h>
 
 #include <SDL3/SDL_gamepad.h>
+#include <SDL3/SDL_system.h>
 
 #include <rex/logging/macros.h>
+
+// "<GPU name>: <reason>" when the Vulkan device or the renderer could not be set up
+// (sdk src/ui/vulkan/vulkan_device.cpp, command_processor.cpp SetupContext).
+extern "C" char rex_vulkan_failure_reason[256];
 
 #if defined(LR_HAS_ADRENOTOOLS)
 #include <adrenotools/driver.h>
@@ -191,6 +198,15 @@ std::string PinThreadsToFastCores() {
         CPU_SET(int(cpu), &set);
       }
     }
+    // Fewer than 4 fast cores (2 big + 6 little: Snapdragon 695, Dimensity 700-1080, Helio G99,
+    // Exynos 1280): the main, GPU command, job, audio and loader threads would all share two
+    // cores. Leave every core to the scheduler, which keeps the busiest threads on the big ones
+    // (as the sister project DS2 does since 2026-11-20).
+    if (CPU_COUNT(&set) > 0 && CPU_COUNT(&set) < 4) {
+      note = "all cores (only " + std::to_string(CPU_COUNT(&set)) + " fast ones)";
+      __android_log_print(ANDROID_LOG_INFO, "lrrecomp", "game threads on %s", note.c_str());
+      return note;
+    }
   }
   if (CPU_COUNT(&set) == 0) {
     note = "all cores (one cluster or empty mask)";
@@ -280,6 +296,14 @@ void StartCpuClockSampler() {
 }
 
 bool LoadCustomVulkanDriver() {
+  // The kernel in every log: kernels before 4.17 take MAP_FIXED_NOREPLACE as a hint, which the guest
+  // memory code now works around (sdk memory_posix.cpp AllocFixed; the sister project's issue #4).
+  {
+    struct utsname name {};
+    if (uname(&name) == 0) {
+      REXLOG_INFO("LR android: kernel {} {}, page size {}", name.release, name.machine, sysconf(_SC_PAGESIZE));
+    }
+  }
   const char* driver = std::getenv("LR_VK_CUSTOM_DRIVER");
   if (!driver || !*driver) {
     LR_ALOG(ANDROID_LOG_INFO, "vulkan: active driver = system (no custom driver selected)");
@@ -334,6 +358,67 @@ bool LoadCustomVulkanDriver() {
   // on the system driver, which the GPU plugin's device log line reveals.
   return InstallOverride(gipa, driver, "libadrenotools");
 #endif
+}
+
+void ReportGraphicsFailure() {
+  const char* reason = rex_vulkan_failure_reason;
+  if (!reason[0]) return;  // not a graphics failure (game files, memory): the log tells
+  REXLOG_ERROR("LR android: the renderer could not start: {}", reason);
+  auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
+  auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
+  if (!env || !activity) return;
+  jclass type = env->GetObjectClass(activity);
+  jmethodID method = type ? env->GetMethodID(type, "reportGraphicsFailure", "(Ljava/lang/String;)V") : nullptr;
+  if (method) {
+    if (jstring text = env->NewStringUTF(reason)) {
+      env->CallVoidMethod(activity, method, text);
+      env->DeleteLocalRef(text);
+    }
+  }
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  if (type) env->DeleteLocalRef(type);
+  env->DeleteLocalRef(activity);
+}
+
+namespace {
+char g_failure_file[512] = {};
+struct sigaction g_previous_abort {};
+
+// Async-signal-safe: open/write/close only.
+void OnAbort(int sig, siginfo_t* info, void* context) {
+  if (rex_vulkan_failure_reason[0] && g_failure_file[0]) {
+    const int fd = open(g_failure_file, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0660);
+    if (fd >= 0) {
+      size_t n = 0;
+      while (n < sizeof(rex_vulkan_failure_reason) && rex_vulkan_failure_reason[n]) ++n;
+      (void)!write(fd, rex_vulkan_failure_reason, n);
+      close(fd);
+    }
+  }
+  // Hand over to the previous handler (the runtime's or the system's crash reporting).
+  sigaction(SIGABRT, &g_previous_abort, nullptr);
+  if (g_previous_abort.sa_flags & SA_SIGINFO) {
+    if (g_previous_abort.sa_sigaction) g_previous_abort.sa_sigaction(sig, info, context);
+  } else if (g_previous_abort.sa_handler != SIG_DFL && g_previous_abort.sa_handler != SIG_IGN &&
+             g_previous_abort.sa_handler) {
+    g_previous_abort.sa_handler(sig);
+  }
+  raise(SIGABRT);
+}
+}  // namespace
+
+void InstallGraphicsFailureSaver() {
+  // The renderer's setup ends in rex::FatalError (abort) when it fails on the GPU thread, before any
+  // activity callback can run: save the noted reason where GpuDriverStore.takeGraphicsFailure reads it
+  // on the next start.
+  const char* dir = std::getenv("REX_ANDROID_APP_DIR");
+  if (!dir || !*dir) return;
+  std::snprintf(g_failure_file, sizeof(g_failure_file), "%sgraphics_failure.txt", dir);
+  struct sigaction action {};
+  action.sa_sigaction = OnAbort;
+  action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+  sigemptyset(&action.sa_mask);
+  sigaction(SIGABRT, &action, &g_previous_abort);
 }
 
 }  // namespace lr::android

@@ -7,11 +7,13 @@ import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Typeface;
 import android.hardware.input.InputManager;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.util.SparseArray;
+import android.util.TypedValue;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
@@ -400,14 +402,19 @@ final class TouchControlsView extends View {
     }
 
     /**
-     * A labelled radio group of two or three choices added to {@code content}; returns the
-     * first button (its group holds the others, see {@link #radioChoice}).
+     * A radio group of two or three choices added to {@code content}, under a section header
+     * ({@code header}) or a plain label; returns the first button (its group holds the others,
+     * see {@link #radioChoice}).
      */
-    private RadioButton radio(LinearLayout content, String label, String a, String b, String c,
+    private RadioButton radio(LinearLayout content, String label, boolean header, String a, String b, String c,
                               int checked) {
-        TextView title = new TextView(content.getContext());
-        title.setText(label);
-        content.addView(title);
+        if (header) {
+            header(content, label);
+        } else {
+            TextView title = new TextView(content.getContext());
+            title.setText(label);
+            content.addView(title);
+        }
         RadioGroup group = new RadioGroup(content.getContext());
         String[] texts = c != null ? new String[] { a, b, c } : new String[] { a, b };
         RadioButton first = null;
@@ -421,6 +428,48 @@ final class TouchControlsView extends View {
         }
         content.addView(group);
         return first;
+    }
+
+    /** A bold section header of the settings dialog. */
+    private void header(LinearLayout content, String text) {
+        TextView view = new TextView(content.getContext());
+        view.setText(text);
+        view.setTypeface(Typeface.DEFAULT_BOLD);
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        float density = getResources().getDisplayMetrics().density;
+        view.setPadding(0, Math.round(16f * density), 0, Math.round(2f * density));
+        content.addView(view);
+    }
+
+    /** A short grey line under an option, indented to the option's text. */
+    private TextView hint(LinearLayout content, String text) {
+        TextView view = new TextView(content.getContext());
+        view.setText(text);
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        view.setAlpha(0.7f);
+        float density = getResources().getDisplayMetrics().density;
+        view.setPadding(Math.round(32f * density), 0, 0, Math.round(4f * density));
+        content.addView(view);
+        return view;
+    }
+
+    /** A checkbox with an optional grey explanation under it. */
+    private CheckBox option(LinearLayout content, String label, String help, boolean checked) {
+        CheckBox box = new CheckBox(content.getContext());
+        box.setText(label);
+        box.setChecked(checked);
+        content.addView(box);
+        if (help != null) hint(content, help);
+        return box;
+    }
+
+    /** A button opening another page, in the dialog's own text (not all caps). */
+    private Button pageButton(LinearLayout content, String label) {
+        Button button = new Button(content.getContext());
+        button.setText(label);
+        button.setAllCaps(false);
+        content.addView(button);
+        return button;
     }
 
     /** Index of the checked button in the group of {@code first}, 0 if none. */
@@ -440,6 +489,9 @@ final class TouchControlsView extends View {
         int padding = Math.round(20f * getResources().getDisplayMetrics().density);
         content.setPadding(padding, 0, padding, 0);
 
+        // Sections with short labels, a grey line under the options that need one, and one footnote
+        // for the options read at start (the owner, 2026-11-21: "a bit verbose ... like in the ds2 project").
+        header(content, strings.getString(R.string.touch_section_controls));
         CheckBox toggle = new CheckBox(activity);
         toggle.setText(strings.getString(R.string.touch_show_controls));
         toggle.setChecked(visibility.visible());
@@ -448,10 +500,8 @@ final class TouchControlsView extends View {
             if (!syncingSettingsToggle) settingsChoiceEdited = true;
         });
         content.addView(toggle);
-        TextView hint = new TextView(activity);
-        hint.setText(strings.getString(R.string.touch_controller_hint));
+        TextView hint = hint(content, strings.getString(R.string.touch_controller_hint));
         hint.setVisibility(visibility.controllerPresent() ? VISIBLE : GONE);
-        content.addView(hint);
         settingsToggle = toggle;
         controllerHint = hint;
 
@@ -480,91 +530,71 @@ final class TouchControlsView extends View {
         ctrlAutoHide.setChecked(ctrl.enabled());
         content.addView(ctrlAutoHide);
 
-        CheckBox hideAll = new CheckBox(activity);
-        hideAll.setText(strings.getString(R.string.touch_hide_all));
-        hideAll.setChecked(ctrl.hideAll());
-        content.addView(hideAll);
-        TextView hideAllHelp = new TextView(activity);
-        hideAllHelp.setText(strings.getString(R.string.touch_hide_all_help));
-        content.addView(hideAllHelp);
-        // Display settings: frame rate and anti-aliasing apply at once, the upscaler at the next start.
+        CheckBox hideAll = option(content, strings.getString(R.string.touch_hide_all),
+            strings.getString(R.string.touch_hide_all_help), ctrl.hideAll());
+
+        // Frame rate: 30 and 60 apply at once; 40 (120 Hz panel mode) and the smoother 60 at the next start.
         SharedPreferences render = RuntimeActivity.renderPrefs(activity);
-        TextView renderTitle = new TextView(activity);
-        renderTitle.setText(strings.getString(R.string.touch_render_title));
-        renderTitle.setPadding(0, padding, 0, 0);
-        content.addView(renderTitle);
         String fps = render.getString("fps", RuntimeActivity.DEFAULT_FPS);
-        RadioButton fps30 = radio(content, strings.getString(R.string.touch_frame_rate),
+        RadioButton fps30 = radio(content, strings.getString(R.string.touch_frame_rate), true,
             strings.getString(R.string.touch_fps_30), strings.getString(R.string.touch_fps_40),
             strings.getString(R.string.touch_fps_60), "40".equals(fps) ? 1 : "60g".equals(fps) ? 2 : 0);
-        CheckBox panel120 = new CheckBox(activity);
-        panel120.setText(strings.getString(R.string.touch_panel120));
-        panel120.setChecked(render.getBoolean("panel120", false));
-        content.addView(panel120);
-        RadioButton aaOff = radio(content, strings.getString(R.string.touch_aa),
+        hint(content, strings.getString(R.string.touch_fps_help));
+        CheckBox panel120 = option(content, strings.getString(R.string.touch_panel120),
+            strings.getString(R.string.touch_panel120_help), render.getBoolean("panel120", false));
+        CheckBox perfOverlay = option(content, strings.getString(R.string.touch_perf_overlay),
+            strings.getString(R.string.touch_perf_overlay_help), render.getBoolean("overlay", false));
+
+        // Image: anti-aliasing applies at once, the upscaler at the next start.
+        header(content, strings.getString(R.string.touch_section_image));
+        RadioButton aaOff = radio(content, strings.getString(R.string.touch_aa), false,
             strings.getString(R.string.touch_aa_off), strings.getString(R.string.touch_aa_fxaa), null,
             "fxaa".equals(render.getString("aa", "off")) ? 1 : 0);
         String upscale = render.getString("upscale", "bilinear");
-        RadioButton upBilinear = radio(content, strings.getString(R.string.touch_upscale),
+        RadioButton upBilinear = radio(content, strings.getString(R.string.touch_upscale), false,
             strings.getString(R.string.touch_upscale_bilinear), strings.getString(R.string.touch_upscale_fsr),
             strings.getString(R.string.touch_upscale_cas), "fsr".equals(upscale) ? 1 : "cas".equals(upscale) ? 2 : 0);
-        CheckBox perfOverlay = new CheckBox(activity);
-        perfOverlay.setText(strings.getString(R.string.touch_perf_overlay));
-        perfOverlay.setChecked(render.getBoolean("overlay", false));
-        content.addView(perfOverlay);
+
         // Second screen (dual-screen devices only): schemata in battle, map in the field, fan art otherwise.
         CheckBox companion = null;
         if (CompanionScreen.available(activity)) {
-            companion = new CheckBox(activity);
-            companion.setText(strings.getString(R.string.touch_companion));
-            companion.setChecked(CompanionScreen.enabled(render));
-            content.addView(companion);
+            header(content, strings.getString(R.string.touch_section_second_screen));
+            companion = option(content, strings.getString(R.string.touch_companion),
+                strings.getString(R.string.touch_companion_help), CompanionScreen.enabled(render));
         }
         final CheckBox companionBox = companion;
-        // Xenos multiply emulation (0 x anything = 0) in the translated shaders: off by default since
-        // 2026-11-11 (-12% GPU in Luxerion, no visible difference seen); the fallback if a scene glitches.
-        CheckBox exactMath = new CheckBox(activity);
-        exactMath.setText(strings.getString(R.string.touch_exact_shader_math));
-        exactMath.setChecked(render.getBoolean("exact_shader_math", false));
-        content.addView(exactMath);
-        // Diagnostics (the owner, 2026-11-11: off for regular play): read at start, so from the next start.
-        CheckBox debugLog = new CheckBox(activity);
-        debugLog.setText(strings.getString(R.string.touch_debug_log));
-        debugLog.setChecked(render.getBoolean("debug_log", RuntimeActivity.DEFAULT_DEBUG_LOG));
-        content.addView(debugLog);
 
         // Cheats (public issue #1): one switch per cheat, applied at once (Cheats.java).
-        TextView cheatsTitle = new TextView(activity);
-        cheatsTitle.setText(strings.getString(R.string.touch_cheats_title));
-        cheatsTitle.setPadding(0, padding, 0, 0);
-        content.addView(cheatsTitle);
-        TextView cheatsHelp = new TextView(activity);
-        cheatsHelp.setText(strings.getString(R.string.touch_cheats_help));
-        content.addView(cheatsHelp);
+        header(content, strings.getString(R.string.touch_section_cheats));
         int cheatBits = Cheats.saved(render);
         CheckBox[] cheatBoxes = new CheckBox[Cheats.ALL.length];
-        for (int i = 0; i < Cheats.ALL.length; ++i) {
-            cheatBoxes[i] = new CheckBox(activity);
-            cheatBoxes[i].setText(strings.getString(Cheats.ALL[i].label));
-            cheatBoxes[i].setChecked((cheatBits & Cheats.ALL[i].bit) != 0);
-            content.addView(cheatBoxes[i]);
-        }
+        for (int i = 0; i < Cheats.ALL.length; ++i)
+            cheatBoxes[i] = option(content, strings.getString(Cheats.ALL[i].label), null,
+                (cheatBits & Cheats.ALL[i].bit) != 0);
+        hint(content, strings.getString(R.string.touch_cheats_help));
 
+        // Troubleshooting. Diagnostics (the owner, 2026-11-11: off for regular play): read at start.
+        header(content, strings.getString(R.string.touch_section_troubleshooting));
+        CheckBox debugLog = option(content, strings.getString(R.string.touch_debug_log),
+            strings.getString(R.string.touch_debug_log_help),
+            render.getBoolean("debug_log", RuntimeActivity.DEFAULT_DEBUG_LOG));
+        // Xenos multiply emulation (0 x anything = 0) in the translated shaders: off by default since
+        // 2026-11-11 (-12% GPU in Luxerion, no visible difference seen); the fallback if a scene glitches.
+        CheckBox exactMath = option(content, strings.getString(R.string.touch_exact_shader_math),
+            strings.getString(R.string.touch_exact_shader_math_help), render.getBoolean("exact_shader_math", false));
         // Qualcomm and Mali devices: open the GPU driver page (download / switch Turnip or PanVK).
         Button driverButton = null;
         if (GpuDriverStore.supported()) {
-            driverButton = new Button(activity);
             GpuDriverStore.Installed driver = GpuDriverStore.selectedDriver(activity);
-            driverButton.setText(strings.getString(R.string.touch_gpu_driver,
+            driverButton = pageButton(content, strings.getString(R.string.touch_gpu_driver,
                 driver != null ? driver.metadata.name : strings.getString(R.string.touch_gpu_driver_system)));
-            driverButton.setAllCaps(false);
-            content.addView(driverButton);
         }
-        // TODO: saves/logs export page (Lost Odyssey SaveTransferActivity) not ported yet.
-        Button folderButton = new Button(activity);
-        folderButton.setText(strings.getString(R.string.touch_game_folder));
-        folderButton.setAllCaps(false);
-        content.addView(folderButton);
+        Button folderButton = pageButton(content, strings.getString(R.string.touch_game_folder));
+        // A zip of lr.log through the system file picker, so a player can attach it to a bug report
+        // from the phone (Android 11+ hides Android/data from file managers; public issue #4).
+        Button logsButton = pageButton(content, strings.getString(R.string.touch_save_logs));
+        TextView nextStart = hint(content, strings.getString(R.string.touch_next_start_note));
+        nextStart.setPadding(0, padding / 2, 0, padding / 2);
 
         ScrollView scroll = new ScrollView(activity);
         scroll.addView(content);
@@ -610,6 +640,10 @@ final class TouchControlsView extends View {
         folderButton.setOnClickListener(v -> {
             settingsDialog.dismiss();
             activity.openGameFolderPage();
+        });
+        logsButton.setOnClickListener(v -> {
+            settingsDialog.dismiss();
+            activity.startLogExport();
         });
         settingsDialogOpen = true;
         syncCtrlPin();

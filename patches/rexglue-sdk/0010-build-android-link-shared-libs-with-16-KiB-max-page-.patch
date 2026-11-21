@@ -1,7 +1,7 @@
 From 5943d056263201dce68c044843ee871fddcc8bdc Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:22:44 +0800
-Subject: [PATCH 010/108] build(android): link shared libs with 16 KiB
+Subject: [PATCH 010/115] build(android): link shared libs with 16 KiB
  max-page-size
 
 rexruntime, rexgpu-xenos and SDL3-shared get -Wl,-z,max-page-size=16384 on

@@ -24,9 +24,9 @@ import org.json.JSONObject;
 /**
  * Driver packages offered for download: the GitHub release feeds of the Turnip
  * builders that the Eden emulator's driver fetcher lists, read with the same
- * per-source display rules, plus Eden's recommendation table by Adreno model;
- * and, for Mali, the Mesa PanVK builds of panvk-kbase-android with a
- * recommendation by Mali architecture.
+ * per-source display rules (on Adreno the bundled Turnip stays the recommended
+ * driver, see {@link #adrenoIntroduction}); and, for Mali, the Mesa PanVK builds
+ * of panvk-kbase-android with a recommendation by Mali architecture.
  */
 final class GpuDriverCatalog {
     static final String USER_AGENT = "LightningReturnsRecomp-Android";
@@ -233,17 +233,20 @@ final class GpuDriverCatalog {
         }
     }
 
-    /** Eden's recommendation for an Adreno model number (its table, unchanged). */
-    static String edenRecommendation(int model) {
-        if (model < 10) return "Unsupported";
-        if (model < 100) return "KIMCHI Latest";
-        if (model < 600) return "Unsupported";
-        if (model < 640) return "Mr. Purple EOL-24.3.4";
-        if (model < 700) return "Mr. Purple T19";
-        if (model <= 710) return "KIMCHI 25.2.0_r5";
-        if (model < 800) return "Mr. Purple T23";
-        if (model < 900) return "GameHub Adreno 8xx";
-        return "Unsupported";
+    /**
+     * The driver page's introduction on Adreno: the bundled Turnip is the driver this game is
+     * tested with, whatever the model. Until 2026-11-20 the page showed Eden's per-model pick
+     * instead (Mr. Purple T19 on Adreno 640-699), which sent an Adreno 650 player to an untested
+     * build that stopped at the shader precompile (public issue #4); the downloads stay, as
+     * untested alternatives.
+     */
+    static String adrenoIntroduction(String gpuModel) {
+        String bundled = GpuDriverStore.BUNDLED_TURNIP_NAME;
+        return "GPU: " + (gpuModel != null ? gpuModel : "unknown")
+            + "\nRecommended: " + bundled + " (bundled), the driver this game is tested with."
+            + "\nThe other Turnip builds below come from the same GitHub sources as the Eden emulator "
+            + "and are untested with this game: if one freezes or crashes, select " + bundled
+            + " again. The game restarts when the driver changes.";
     }
 
     // Mali -------------------------------------------------------------------
@@ -255,8 +258,8 @@ final class GpuDriverCatalog {
         /** Mali G1 (v14): built by PanVK-kbase but not run on hardware yet. */
         UNTESTED,
         /**
-         * Midgard and Bifrost: no PanVK-kbase build, and Bifrost's PanVK has
-         * four descriptor sets where the renderer binds five.
+         * Midgard and Bifrost: no PanVK-kbase build (the renderer binds at most
+         * four descriptor sets, Mali's limit, so that is not the obstacle).
          */
         UNSUPPORTED,
         /** The GPU name is unknown or not a Mali one. */

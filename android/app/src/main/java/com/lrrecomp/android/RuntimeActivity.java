@@ -247,6 +247,64 @@ public final class RuntimeActivity extends SDLActivity {
         startActivity(intent);
     }
 
+    private static final int REQUEST_EXPORT_LOGS = 0x4c52;  // 'LR'
+
+    /** CTRL dialog's "Save logs": the system file picker, then a zip of lr.log there. */
+    void startLogExport() {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+            .addCategory(Intent.CATEGORY_OPENABLE)
+            .setType("application/zip")
+            .putExtra(Intent.EXTRA_TITLE, PlayerLogs.exportName(new java.util.Date()));
+        try {
+            startActivityForResult(intent, REQUEST_EXPORT_LOGS);
+        } catch (android.content.ActivityNotFoundException e) {
+            Toast.makeText(this, getString(R.string.logs_no_picker), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQUEST_EXPORT_LOGS) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) exportLogs(data.getData());
+            return;
+        }
+        super.onActivityResult(requestCode, resultCode, data);
+    }
+
+    private void exportLogs(android.net.Uri uri) {
+        java.util.List<File> files = PlayerLogs.exportable(PlayerLogs.directory(this));
+        String version;
+        try {
+            version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            version = "?";
+        }
+        GpuDriverStore.Installed driver = GpuDriverStore.selectedDriver(this);
+        String device = PlayerLogs.deviceDescription() + "\napp=" + version
+            + "\ngpu=" + GpuDriverStore.gpuModel()
+            + "\ndriver=" + (driver != null ? driver.metadata.name : GpuDriverStore.SYSTEM_DRIVER_NAME)
+            + "\ndebug_logging=" + (renderPrefs(this).getBoolean("debug_log", false) ? "on" : "off");
+        new Thread(() -> {
+            String message;
+            try (java.io.OutputStream output = getContentResolver().openOutputStream(uri, "w")) {
+                if (output == null) throw new java.io.IOException("the file could not be opened");
+                PlayerLogs.exportZip(files, device, output);
+                String name = null;
+                try (android.database.Cursor row = getContentResolver().query(uri,
+                        new String[] {android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+                    if (row != null && row.moveToFirst()) name = row.getString(0);
+                } catch (RuntimeException ignored) {
+                    // The name is only for the message.
+                }
+                message = getString(R.string.logs_saved, name != null ? name : "a zip");
+            } catch (java.io.IOException | RuntimeException e) {
+                message = getString(R.string.logs_save_failed, String.valueOf(e.getMessage()));
+            }
+            final String shown = message;
+            runOnUiThread(() -> Toast.makeText(this, shown, Toast.LENGTH_LONG).show());
+        }, "LR log export").start();
+    }
+
     @Override
     protected void onPause() {
         if (touchControls != null) touchControls.onHostPause();

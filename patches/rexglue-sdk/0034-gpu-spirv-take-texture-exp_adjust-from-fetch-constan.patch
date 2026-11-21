@@ -1,7 +1,7 @@
 From a0c43904f5f64e1bc4be3345ebe63ed34a6a4f24 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 20:41:17 +0800
-Subject: [PATCH 034/108] gpu(spirv): take texture exp_adjust from fetch
+Subject: [PATCH 034/115] gpu(spirv): take texture exp_adjust from fetch
  constant word 3, not word 4
 
 Bits 13:18 of word 4 are inside the LOD bias; the -1 bias common for world

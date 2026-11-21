@@ -76,6 +76,11 @@ public final class GpuDriverActivity extends Activity {
         GameStorage.prepare(this);
         fromGame = getIntent().getBooleanExtra(EXTRA_FROM_GAME, false);
         graphicsFailure = getIntent().getStringExtra(EXTRA_GRAPHICS_FAILURE);
+        // A renderer that failed during native setup aborts the process; its reason waits in a file.
+        if (!fromGame) {
+            String savedFailure = GpuDriverStore.takeGraphicsFailure(this);
+            if (graphicsFailure == null) graphicsFailure = savedFailure;
+        }
         vendor = GpuDriverStore.vendor();
         gpuName = GpuDriverStore.gpuModel();
         if (vendor == GpuDriverStore.Vendor.MALI) {
@@ -172,15 +177,7 @@ public final class GpuDriverActivity extends Activity {
         if (isMali()) {
             addMaliIntroduction(page);
         } else {
-            String model = gpuName;
-            int number = GpuDriverCatalog.adrenoModel(model);
-            StringBuilder about = new StringBuilder("GPU: ").append(model != null ? model : "unknown");
-            if (number > 0) about.append(" · Eden recommends: ").append(GpuDriverCatalog.edenRecommendation(number));
-            about.append("\nVerified with this game on Adreno 750: ").append(GpuDriverStore.VERIFIED_DRIVER);
-            page.addView(dim(about.toString()));
-            page.addView(dim("The Qualcomm driver drops the text on the highlighted menu row. "
-                + "A Mesa Turnip package fixes it. Downloads come from the same GitHub "
-                + "sources as the Eden emulator; the game restarts when the driver changes."));
+            page.addView(dim(GpuDriverCatalog.adrenoIntroduction(gpuName)));
         }
         String notice = null;
         if (graphicsFailure != null) {

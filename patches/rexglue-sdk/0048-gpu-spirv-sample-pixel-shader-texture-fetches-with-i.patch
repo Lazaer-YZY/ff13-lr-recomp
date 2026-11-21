@@ -1,7 +1,7 @@
 From b8712210c4e7a65603e04eb828e601233d624988 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 09:10:34 +0800
-Subject: [PATCH 048/108] gpu: spirv: sample pixel shader texture fetches with
+Subject: [PATCH 048/115] gpu: spirv: sample pixel shader texture fetches with
  implicit LOD and a bias
 
 Texture fetches with a computed LOD were sampled with explicit gradients

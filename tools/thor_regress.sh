@@ -9,6 +9,8 @@
 #   --baseline  keep this run's numbers and pictures as the reference (out/regress/thor/baseline/)
 #   FORCE=1     run even when the Thor looks in use (awake, or a game running): only when it is ours
 #   FPS=30|60g  frame-rate mode for the run (default 30, the dev default; the public build ships 60g)
+#   MORE_EXTRAS="--es REX_VULKAN_EMULATE_GPU mali ..."  extra am-start extras for every start (debug
+#               builds: REX_<CVAR> sets a cvar), e.g. an emulated Mali profile or REX_DEBUG_MMAP_HINT_ONLY 1
 #
 # Tests (each a cold start with only its bench save present, tools/thor_saves.sh):
 #   boot    cold start to the title menu (A until the opening movie): no crash, Vulkan + shader storage up, title picture vs reference
@@ -47,7 +49,7 @@ RUN=/c/lr/out/regress/thor/${LABEL}_$(date +%Y%m%d_%H%M%S)
 mkdir -p "$RUN" "$REF"
 A() { adb -s "$S" "$@"; }
 # The frame-time overlay off whatever the player chose: it changes every frame and would lower the SSIM.
-EXTRAS="--es LR_DIAG 1 --es LR_FPS ${FPS:-30} --es LR_AA off --es REX_PRESENT_EFFECT bilinear --es LR_FRAME_OVERLAY 0"
+EXTRAS="--es LR_DIAG 1 --es LR_FPS ${FPS:-30} --es LR_AA off --es REX_PRESENT_EFFECT bilinear --es LR_FRAME_OVERLAY 0 ${MORE_EXTRAS:-}"
 
 say() { echo "[$LABEL] $*" | tee -a "$RUN/run.log"; }
 results=()
@@ -155,12 +157,20 @@ open_save() {
   press A; sleep 4; press A; sleep 3; press A; sleep 6; press A; sleep 8
   press A; sleep 12
 }
-# open_save, then A until the companion state says field (quest / tip screens).
+# open_save, then A until the companion state says field (quest / tip screens). With "clock" also
+# until the game clock runs: the state can say field while a quest card is still up (2026-11-21:
+# 'Hunting the Savior' over the plaza, the clock stood and the picture was the card). Not for the
+# cheats test, whose clock is frozen on purpose. The clock moves ~1 game minute per 3 s.
 load_save() {
-  local mark=$1
+  local mark=$1 need_clock=${2:-} c0 c1
   open_save "$mark" || return 1
   for _ in $(seq 12); do
-    field_now "$mark" && return 0
+    if field_now "$mark"; then
+      [ -z "$need_clock" ] && return 0
+      c0=$(state "$mark" | grep -o 'clock=[0-9:]*'); sleep 8
+      c1=$(state "$mark" | grep -o 'clock=[0-9:]*')
+      [ -n "$c1" ] && [ "$c1" != "$c0" ] && return 0
+    fi
     alive || return 2
     press A 300; sleep 5
   done
@@ -242,7 +252,7 @@ fi
 if wanted field; then
   fails=()
   mark=$(start_game lux_plaza "--es LR_CHEATS 0") || fails+=("start failed")
-  if load_save "$mark"; then
+  if load_save "$mark" clock; then
     sleep 5; m2=$(devtime); c0=$(state "$mark" | grep -o 'clock=[0-9:]*')
     sleep 32
     set -- $(fps_since "$m2"); fps=$1; low=$2; over=$3; win=$4

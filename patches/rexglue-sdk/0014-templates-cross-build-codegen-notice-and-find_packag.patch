@@ -1,7 +1,7 @@
 From 7d34e334e4f22c026c51c1a291843da0c6af4822 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:35:30 +0800
-Subject: [PATCH 014/108] templates: cross-build codegen notice and
+Subject: [PATCH 014/115] templates: cross-build codegen notice and
  find_package root-path hint
 
 - Without rex::rexglue, print a STATUS note that codegen is skipped and

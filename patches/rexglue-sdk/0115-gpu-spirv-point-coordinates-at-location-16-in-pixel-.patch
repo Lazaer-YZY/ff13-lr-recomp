@@ -1,0 +1,48 @@
+From 13c03f2838de535c34a51be894ec069a751bdbb2 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Sat, 21 Nov 2026 11:16:51 +0800
+Subject: [PATCH 115/115] gpu/spirv: point coordinates at location 16 in pixel
+ shaders with fixed interpolator locations
+
+The point-sprite VS expansion and the point geometry shader write the point coordinates after all
+16 interpolator locations when locations are fixed (pipeline libraries), but the pixel shader read
+them right after the used interpolators: another interpolator became the sprite's texture
+coordinates (the HUD and fonts sampled the wrong atlas areas without geometry shaders, PanVK).
+Fragment library keys of point-sprite pixel shaders get a new translation-switch bit so a stored
+library list never claims a library of the old SPIR-V.
+
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 6edea3e..6cffa45 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -3027,6 +3027,13 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
+         main_interface_.push_back(interpolator);
+         ++input_location;
+       }
++      // With fixed locations the producers (the point-sprite VS expansion and the point geometry
++      // shader) put the point coordinates after all the interpolator locations, not after the
++      // used ones: reading them at the packed location took another interpolator as the sprite's
++      // texture coordinates (the HUD and fonts without geometry shaders, PanVK, 2026-11-21).
++      if (fixed_interpolator_locations_) {
++        input_location = xenos::kMaxInterpolators;
++      }
+     }
+ 
+     // Point coordinate input.
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 5791dd3..ab6fd24 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -4095,6 +4095,12 @@ uint64_t FragmentLibraryKeyHash(uint64_t pixel_shader_hash, uint64_t pixel_shade
+       (uint32_t(REXCVAR_GET(vulkan_texture_fetch_implicit_lod)) << 2) |
+       (uint32_t(SpirvShaderTranslator::IsTextureSignSpecializationEnabled()) << 3) |
+       (uint32_t(REXCVAR_GET(spirv_structured_forward_jumps)) << 4);
++  // Point-sprite pixel shaders read the point coordinates at location 16 since 2026-11-21: a new
++  // key for those only, so a library list entry never claims a library of the old SPIR-V.
++  if (pixel_shader_hash &&
++      SpirvShaderTranslator::Modification(pixel_shader_variant).pixel.param_gen_point) {
++    key.translation_switches |= UINT32_C(1) << 5;
++  }
+   key.texture_sign_classes = texture_sign_classes;
+   return XXH3_64bits(&key, sizeof(key));
+ }

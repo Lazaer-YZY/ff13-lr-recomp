@@ -55,8 +55,8 @@ final class GpuDriverStore {
     static final String META_FILE = "meta.json";
     static final long MAX_META_BYTES = 500_000L;
     static final long MAX_LIBRARY_BYTES = 256L << 20;
-    /** The driver the menu text fix was verified with on an Adreno 750 (2026-10-03). */
-    static final String VERIFIED_DRIVER = "KIMCHI Turnip v26.0.0 R8";
+    /** The bundled package's meta.json name (GpuDriverCatalogTest checks it against the asset). */
+    static final String BUNDLED_TURNIP_NAME = "Stable Turnip v2";
     /** meta.json "backend" of the Mesa PanVK packages for Mali (panvk-kbase-android). */
     static final String BACKEND_PANVK = "panvk-kbase";
     /**
@@ -311,6 +311,34 @@ final class GpuDriverStore {
 
     static void clearBootPending(Context context) {
         preferences(context).edit().remove(KEY_BOOT_PENDING).commit();
+    }
+
+    /** The file the native abort handler saves a renderer setup failure to (android_glue.cpp). */
+    static final String GRAPHICS_FAILURE_FILE = "graphics_failure.txt";
+
+    /**
+     * Why the renderer could not start in the last run when the process ended before the activity
+     * could pass it on (a native setup failure, saved by the abort handler to
+     * files/graphics_failure.txt), or null. Read once.
+     */
+    static String takeGraphicsFailure(Context context) {
+        java.io.File dir = context.getExternalFilesDir(null);
+        return dir != null ? takeGraphicsFailure(new java.io.File(dir, GRAPHICS_FAILURE_FILE)) : null;
+    }
+
+    static String takeGraphicsFailure(java.io.File file) {
+        if (!file.isFile()) return null;
+        String reason = null;
+        try (java.io.FileInputStream in = new java.io.FileInputStream(file)) {
+            byte[] bytes = new byte[512];
+            int n = in.read(bytes);
+            if (n > 0) reason = new String(bytes, 0, n, java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (java.io.IOException ignored) {
+            // An unreadable note only loses the reason; the page still opens after a failed start.
+        }
+        //noinspection ResultOfMethodCallIgnored
+        file.delete();
+        return reason == null || reason.isEmpty() ? null : reason;
     }
 
     /**

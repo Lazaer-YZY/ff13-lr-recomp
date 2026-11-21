@@ -1,7 +1,7 @@
 From d53c402cddeeb39b32439b1cef19f03531c50825 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Wed, 11 Nov 2026 08:31:11 +0800
-Subject: [PATCH 096/108] gpu: boot library precompile yields to gameplay
+Subject: [PATCH 096/115] gpu: boot library precompile yields to gameplay
  (vulkan_precompile_in_game), progress for the app
 
 Playing before the boot pixel shader library precompile finished (first launch after an update

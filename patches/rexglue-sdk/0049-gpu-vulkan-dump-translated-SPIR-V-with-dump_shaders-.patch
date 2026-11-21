@@ -1,7 +1,7 @@
 From 6ba73d54111d4d07f258947d266c54c19d3929d7 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 09:10:34 +0800
-Subject: [PATCH 049/108] gpu: vulkan: dump translated SPIR-V with
+Subject: [PATCH 049/115] gpu: vulkan: dump translated SPIR-V with
  dump_shaders, like the D3D12 backend
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
