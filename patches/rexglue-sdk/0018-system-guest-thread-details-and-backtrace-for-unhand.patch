@@ -1,7 +1,7 @@
 From 2f79cbabf07a6a0dae10ed642e9f63d838db5ae3 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 16:37:40 +0800
-Subject: [PATCH 018/116] system: guest thread details and backtrace for
+Subject: [PATCH 018/117] system: guest thread details and backtrace for
  unhandled guest AVs
 
 - XThread::DescribeCurrentForFault (registered by Runtime::Setup as the fault

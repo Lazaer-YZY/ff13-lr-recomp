@@ -1,7 +1,7 @@
 From b69bb394f6ae0834f5ab734173993046464361eb Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 07:53:10 +0800
-Subject: [PATCH 046/116] gpu: vulkan: GPU time per resolve and texture load
+Subject: [PATCH 046/117] gpu: vulkan: GPU time per resolve and texture load
  size and format
 
 With vulkan_gpu_timing, resolve and texture load segments are split by

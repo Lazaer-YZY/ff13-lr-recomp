@@ -130,10 +130,66 @@ public final class RuntimeActivity extends SDLActivity {
     /** Saves the display settings; frame rate and anti-aliasing change at once, the upscaler at the next start. */
     void applyRenderSettings(String fps, String aa, String upscale, boolean overlay) {
         renderPrefs(this).edit().putString("fps", fps).putString("aa", aa).putString("upscale", upscale)
-            .putBoolean("overlay", overlay).apply();
+            .putBoolean("overlay", overlay).commit();  // on disk before a restart (offerRestart)
         nativeSetOption("fps", fps);
         nativeSetOption("aa", aa);
         nativeSetOption("overlay", overlay ? "1" : "0");
+    }
+
+    /**
+     * The CTRL settings read only when the game starts (marked * in the dialog): 40 fps and the smoother 60 (the
+     * 120 Hz panel mode), the upscaler, stretching, debug logging, the exact shader math and the GPU compatibility
+     * switches. The dialog offers a restart when they change, as DS2's does.
+     */
+    static String nextStartState(SharedPreferences render) {
+        return "40".equals(render.getString("fps", DEFAULT_FPS)) + "|" + panel120Active(render)
+            + "|" + render.getString("upscale", "bilinear")
+            + "|" + render.getBoolean("debug_log", DEFAULT_DEBUG_LOG)
+            + "|" + render.getBoolean("exact_shader_math", false)
+            + "|" + GpuCompat.Choices.from(render).summary();
+    }
+
+    /** After CTRL changed a next-start setting: restart now (progress since the last save is lost) or later. */
+    void offerRestart() {
+        new android.app.AlertDialog.Builder(this)
+            .setTitle(getString(R.string.restart_title))
+            .setMessage(getString(R.string.restart_message))
+            .setPositiveButton(getString(R.string.restart_now), (dialog, which) -> restartGame())
+            .setNegativeButton(getString(R.string.restart_later), null)
+            .show();
+    }
+
+    /** Restarts the game in a new process (CTRL's next-start settings). */
+    void restartGame() {
+        android.util.Log.i("lrrecomp", "restart from CTRL");
+        if (touchControls != null) touchControls.clearTouches();
+        GpuDriverStore.clearBootPending(this);  // a chosen restart is not a failed start
+        // The pending activity outlives the process; Android starts a new one for it.
+        Intent intent = new Intent(this, RuntimeActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        startActivity(intent);
+        Runtime.getRuntime().exit(0);
+    }
+
+    /**
+     * CTRL's Exit button (as in DS2, the owner, 2026-11-23: "choosing to quit game"): asks first, then ends the game
+     * like a restart does, without starting it again. The game has no exit of its own.
+     */
+    void confirmExit() {
+        new android.app.AlertDialog.Builder(this)
+            .setTitle(getString(R.string.exit_title))
+            .setMessage(getString(R.string.exit_message))
+            .setPositiveButton(getString(R.string.exit_confirm), (dialog, which) -> exitGame())
+            .setNegativeButton(getString(R.string.touch_cancel), null)
+            .show();
+    }
+
+    private void exitGame() {
+        android.util.Log.i("lrrecomp", "exit from CTRL");
+        if (touchControls != null) touchControls.clearTouches();
+        GpuDriverStore.clearBootPending(this);  // a chosen exit is not a failed start, however soon it came
+        finishAndRemoveTask();
+        Runtime.getRuntime().exit(0);
     }
 
     /** CTRL dialog: saves the cheat switches and applies them at once (Cheats.java). */
@@ -219,6 +275,11 @@ public final class RuntimeActivity extends SDLActivity {
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
+        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && touchControls != null && touchControls.ctrlGone()) {
+            // CTRL removed after the start (CTRL option): Back opens Settings, and the key goes nowhere else.
+            if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) touchControls.openSettingsFromBack();
+            return true;
+        }
         if (event.getKeyCode() == KeyEvent.KEYCODE_BACK && event.getAction() == KeyEvent.ACTION_UP
                 && !event.isCanceled() && touchControls != null) touchControls.revealCtrl();
         // Keep SDL's existing Back mapping/consumption, including gesture-generated keys.
@@ -227,6 +288,10 @@ public final class RuntimeActivity extends SDLActivity {
 
     @Override
     public void onBackPressed() {
+        if (touchControls != null && touchControls.ctrlGone()) {
+            touchControls.openSettingsFromBack();  // the back gesture, which comes without a key event
+            return;
+        }
         if (touchControls != null) touchControls.revealCtrl();
         // Preserve SDL's fallback behavior on Android versions that call this directly.
         super.onBackPressed();
@@ -469,6 +534,11 @@ public final class RuntimeActivity extends SDLActivity {
         nativeSetenv("REX_VULKAN_ALLOW_PRESENT_MODE_MAILBOX", "false");
         nativeSetenv("REX_VULKAN_ALLOW_PRESENT_MODE_IMMEDIATE", "false");
         nativeSetenv("REX_VULKAN_ALLOW_PRESENT_MODE_FIFO_RELAXED", "false");
+        // Memory that serves no purpose (from the DS2 port, its #8: a 6 GB phone): upload pages beyond 8 MB free per
+        // pool once the GPU is done with them (a pool otherwise keeps its loading peak), and render targets that own
+        // no EDRAM data and no draw bound for 30 s freed (leftovers of the title, menus and loading screens).
+        nativeSetenv("REX_UPLOAD_BUFFER_MAX_FREE_MB", "8");
+        nativeSetenv("REX_VULKAN_EVICT_IDLE_RENDER_TARGETS_S", "30");
         // Display settings from the CTRL dialog (renderPrefs): the hooks read LR_FPS / LR_AA at
         // start, the presenter's upscaler is the present_effect cvar (restart only).
         SharedPreferences render = renderPrefs(this);

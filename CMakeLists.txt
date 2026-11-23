@@ -20,6 +20,7 @@ if(ANDROID)
     # SDL3's SDLActivity loads libmain.so and calls its exported SDL_main (see android/README.md).
     list(APPEND LR_SOURCES
         src/android/android_glue.cpp
+        src/android/lr_affinity.cpp   # affinity keeper: threads pinned again after a cpuset change
     )
     add_library(lr SHARED ${LR_SOURCES})
     set_target_properties(lr PROPERTIES OUTPUT_NAME main PREFIX "lib")

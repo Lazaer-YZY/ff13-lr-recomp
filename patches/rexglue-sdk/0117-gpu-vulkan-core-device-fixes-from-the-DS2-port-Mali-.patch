@@ -1,0 +1,923 @@
+From 0817ee83f33298f8c77a7e03d1a19ac624832bef Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Tue, 24 Nov 2026 00:42:56 +0800
+Subject: [PATCH 117/117] gpu/vulkan, core: device fixes from the DS2 port
+ (Mali defaults, closing crash, stall log, memory cuts)
+
+- vulkan_arm_driver_defaults: on Arm's proprietary Mali driver, render passes instead of dynamic
+  rendering and restricted render areas, where nothing else set them.
+- Occlusion queries end outside the render pass and only once (Arm driver fault).
+- POSIX threads cache their kernel tid at start: pthread_gettid_np aborted on a joined thread when
+  TerminateTitle woke every guest thread.
+- vulkan_gpu_stall_log_ms: blocking fence waits and frames over 250 ms are logged (release too).
+- upload_buffer_max_free_mb and vulkan_evict_idle_render_targets_s (off by default here; the app
+  turns them on), GPU memory by kind every vulkan_log_device_memory_s, SyncLoggingToStorage.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 7e6027f..07b2e10 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -170,6 +170,8 @@ class RenderTargetCache {
+   virtual void ClearCache();
+ 
+   virtual void BeginFrame();
++  uint64_t frame_index() const { return frame_index_; }
++  void CountFrame() { ++frame_index_; }
+ 
+   // vulkan_depth_4x_as_1x: the current draw renders a 4x surface's samples as the pixels of the 1x
+   // surface twice as wide and tall (the surface info is already rewritten), so its estimated
+@@ -299,6 +301,8 @@ class RenderTargetCache {
+     RenderTarget(RenderTarget&& render_target) = delete;
+     RenderTarget& operator=(RenderTarget&& render_target) = delete;
+     RenderTargetKey key() const { return key_; }
++    // The last frame (RenderTargetCache::frame_index()) a draw bound it; for finding idle render targets.
++    uint64_t last_used_frame = 0;
+ 
+    protected:
+     RenderTarget(RenderTargetKey key) : key_(key) {}
+@@ -502,6 +506,18 @@ class RenderTargetCache {
+     assert_true(GetPath() == Path::kHostRenderTargets);
+     return last_update_transfers_;
+   }
++  const std::unordered_map<RenderTargetKey, RenderTarget*, RenderTargetKey::Hasher>& render_targets() const {
++    return render_targets_;
++  }
++  // Render targets that own no EDRAM data (no ownership range, no host depth) and no draw bound for at least
++  // min_idle_frames: nothing would be lost by destroying them (diagnostics, render target memory).
++  void CollectIdleRenderTargets(uint64_t min_idle_frames, std::vector<RenderTarget*>& idle) const;
++  // Whether a draw's bindings (the last update's used / accumulated render targets, a redirected clear) refer to it.
++  bool IsRenderTargetInLastUpdate(const RenderTarget* render_target) const;
++  // Removes a render target CollectIdleRenderTargets returned from the cache (the host cache has released what refers
++  // to it and deletes it once the GPU is done with it). Found by pointer (an entry's key need not equal the render
++  // target's own key()); false if it is not in the cache, and then it must not be deleted.
++  bool RemoveIdleRenderTarget(RenderTarget* render_target);
+   // Pixels of the depth render target that the current draw overwrites
+   // completely (gpu_skip_overwritten_transfers), not transferred - or nullptr.
+   const Transfer::Rectangle* last_update_transfer_cutout() const {
+@@ -691,6 +707,7 @@ class RenderTargetCache {
+   // since standard containers use dynamic allocation for elements, though
+   // changes to this throughout a frame are pretty rare.
+   std::map<uint32_t, OwnershipRange> ownership_ranges_;
++  uint64_t frame_index_ = 0;  // BeginFrame count
+ 
+   // Render targets actually used by the draw call with the last successful
+   // update. 0 is depth, color starting from 1, nullptr if not bound.
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index a2ce211..2859918 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -12,6 +12,7 @@
+ 
+ #include <unordered_set>
+ #include <array>
++#include <chrono>
+ #include <climits>
+ #include <cstdint>
+ #include <deque>
+@@ -1094,6 +1095,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool gpu_timing_enabled_ = false;
+   // vulkan_lr_skip_battle_grey: a crossfade draw happened in this frame.
+   bool lr_crossfade_this_frame_ = false;
++  // The last "GPU memory by kind" line (vulkan_log_device_memory_s).
++  std::chrono::steady_clock::time_point device_memory_logged_at_{};
+   // 0 - not checked yet, 1 - supported, -1 - unsupported.
+   int gpu_timing_support_ = 0;
+   double gpu_timing_period_ns_ = 1.0;
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 23a2ffc..2e5f57b 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <array>
++#include <deque>
+ #include <cstdint>
+ #include <cstring>
+ #include <functional>
+@@ -80,6 +81,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache,
+   struct Framebuffer {
+     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+     VkExtent2D host_extent{};
++    // The last frame (RenderTargetCache::frame_index()) a draw or transfer looked it up (idle eviction).
++    uint64_t last_used_frame = 0;
+     Framebuffer() = default;
+     Framebuffer(VkFramebuffer framebuffer, const VkExtent2D& host_extent)
+         : framebuffer(framebuffer), host_extent(host_extent) {}
+@@ -95,6 +98,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache,
+   bool Initialize(uint32_t shared_memory_binding_count);
+   void Shutdown(bool from_destructor = false);
+   void ClearCache() override;
++  // Render target memory for the log: "N MB in K, owning EDRAM data N MB in K, idle (no EDRAM data, unbound for
++  // idle_frames) N MB in K".
++  std::string RenderTargetMemoryReport(uint64_t idle_frames) const;
++  // vulkan_evict_idle_render_targets_s: destroys the render targets owning no EDRAM data and unbound for
++  // min_idle_frames, with their framebuffers (only when those are idle too). Returns how many, adds their bytes.
++  size_t EvictIdleRenderTargets(uint64_t min_idle_frames, uint64_t& freed_bytes);
++  // Evicted render targets, deleted once the submission current at their eviction has completed (a submission still
++  // in flight may read one, as a transfer source when it lost its EDRAM data).
++  std::deque<std::pair<uint64_t, RenderTarget*>> retired_render_targets_;
++  void DeleteRetiredRenderTargets(bool all);
+ 
+   void CompletedSubmissionUpdated();
+   void EndSubmission();
+diff --git a/include/rex/logging/api.h b/include/rex/logging/api.h
+index 3b8f1ae..edd3ea9 100644
+--- a/include/rex/logging/api.h
++++ b/include/rex/logging/api.h
+@@ -78,6 +78,12 @@ void ShutdownLogging();
+  */
+ void FlushLogging();
+ 
++/**
++ * FlushLogging, then commit the current log file to storage (fdatasync), so a sudden power-off or kernel reboot
++ * loses at most what was logged since. No-op without a log file, and on Windows.
++ */
++void SyncLoggingToStorage();
++
+ /**
+  * Register a new log category at runtime.
+  *
+diff --git a/include/rex/ui/vulkan/util.h b/include/rex/ui/vulkan/util.h
+index 27a5136..5d7a00c 100644
+--- a/include/rex/ui/vulkan/util.h
++++ b/include/rex/ui/vulkan/util.h
+@@ -12,6 +12,7 @@
+ 
+ #include <algorithm>
+ #include <cstdint>
++#include <string>
+ 
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/device.h>
+@@ -119,6 +120,13 @@ inline VkImageSubresourceRange InitializeSubresourceRange(
+   return range;
+ }
+ 
++// GPU memory by kind, for the log (what a 1.7 GB footprint at 720p is made of): device memory allocations added
++// (positive bytes) or freed (negative). The dedicated-allocation helpers below note theirs themselves, by kind:
++// "render targets" / "render targets msaa" (images with attachment usage), "other images", "buffers".
++void NoteDeviceMemory(const char* kind, int64_t bytes);
++// "kind MB (count), ..." of what is live, largest first.
++std::string DeviceMemoryReport();
++
+ // Creates a buffer backed by a dedicated allocation. The allocation size will
+ // NOT be aligned to nonCoherentAtomSize - if mapping or flushing not the whole
+ // size, memory_size_out must be used for clamping the range.
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index e8de147..ae074e1 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -33,6 +33,8 @@
+ #if REX_PLATFORM_WIN32
+ #include <spdlog/sinks/msvc_sink.h>
+ #else
++#include <fcntl.h>
++#include <unistd.h>
+ #include <spdlog/sinks/stdout_sinks.h>
+ #endif
+ 
+@@ -58,6 +60,8 @@ namespace {
+ std::vector<LogCategoryEntry> g_registry;
+ spdlog::sink_ptr g_console_sink;
+ spdlog::sink_ptr g_file_sink;
++// The same sink as g_file_sink, typed, for SyncLoggingToStorage (its current file name).
++std::shared_ptr<spdlog::sinks::basic_file_sink_mt> g_rotating_sink;
+ spdlog::sink_ptr g_early_sink;
+ std::vector<spdlog::sink_ptr> g_extra_sinks;
+ bool g_early_initialized = false;
+@@ -272,6 +276,7 @@ void InitLogging(const LogConfig& config) {
+     sink->set_level(spdlog::level::trace);
+     sink->set_pattern(config.file_pattern);
+     g_file_sink = sink;
++    g_rotating_sink = sink;
+   }
+ 
+   g_extra_sinks = config.extra_sinks;
+@@ -320,6 +325,7 @@ void ShutdownLogging() {
+   g_registry.clear();
+   g_console_sink.reset();
+   g_file_sink.reset();
++  g_rotating_sink.reset();
+   g_early_sink.reset();
+   g_extra_sinks.clear();
+   g_initialized = false;
+@@ -333,6 +339,23 @@ void FlushLogging() {
+       entry.logger->flush();
+ }
+ 
++void SyncLoggingToStorage() {
++  FlushLogging();
++#if !REX_PLATFORM_WIN32
++  std::shared_ptr<spdlog::sinks::basic_file_sink_mt> sink;
++  {
++    std::lock_guard lock(g_mutex);
++    sink = g_rotating_sink;
++  }
++  if (!sink) return;
++  // fdatasync commits the file's data whichever descriptor it is called on.
++  const int fd = ::open(sink->filename().c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
++  if (fd < 0) return;
++  ::fdatasync(fd);
++  ::close(fd);
++#endif
++}
++
+ LogCategoryId RegisterLogCategory(const char* name) {
+   std::lock_guard lock(g_mutex);
+ 
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 2e72e59..45c269e 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -790,6 +790,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ #endif
+ #if REX_PLATFORM_ANDROID
+     android_pre_api_26_name_[0] = '\0';
++    if (pthread_equal(thread, pthread_self())) tid_.store(gettid(), std::memory_order_release);
+ #endif
+   }
+ 
+@@ -875,7 +876,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ #else
+     cpu_set_t cpu_set;
+ #if REX_PLATFORM_ANDROID
+-    if (sched_getaffinity(pthread_gettid_np(thread_), sizeof(cpu_set_t), &cpu_set) != 0) {
++    if (sched_getaffinity(android_tid(), sizeof(cpu_set_t), &cpu_set) != 0) {
+       assert_always();
+     }
+ #else
+@@ -908,7 +909,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       }
+     }
+ #if REX_PLATFORM_ANDROID
+-    if (sched_setaffinity(pthread_gettid_np(thread_), sizeof(cpu_set_t), &cpu_set) != 0) {
++    if (sched_setaffinity(android_tid(), sizeof(cpu_set_t), &cpu_set) != 0) {
+       assert_always();
+     }
+ #else
+@@ -953,6 +954,12 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   void QueueUserCallback(std::function<void()> callback) {
+     WaitStarted();
++    {
++      // A thread that has run to its end has nothing to wake (TerminateTitle wakes every guest thread it saw
++      // running, and some exit in between).
++      std::unique_lock<std::mutex> lock(state_mutex_);
++      if (state_ == State::kFinished) return;
++    }
+     {
+       std::unique_lock<std::mutex> lock(callback_mutex_);
+       user_callbacks_.push_back(std::move(callback));
+@@ -976,7 +983,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     sigval value{};
+     value.sival_ptr = this;
+ #if REX_PLATFORM_ANDROID
+-    int result = sigqueue(pthread_gettid_np(thread_),
++    int result = sigqueue(android_tid(),
+                           GetSystemSignal(SignalType::kThreadUserCallback), value);
+ #else
+     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
+@@ -1096,6 +1103,17 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     }
+   }
+ 
++#if REX_PLATFORM_ANDROID
++  // The kernel thread id, cached when the thread starts. bionic's pthread_gettid_np aborts the process ("invalid
++  // pthread_t ... passed to pthread_gettid_np") once the thread has exited and been joined: TerminateTitle's
++  // wake-up of every guest thread raced into that when the game closed (S25, 2026-11-22). On a thread that has
++  // gone, the syscalls fail with ESRCH instead.
++  pid_t android_tid() const {
++    pid_t tid = tid_.load(std::memory_order_acquire);
++    return tid ? tid : pthread_gettid_np(thread_);
++  }
++#endif
++
+   void WaitStarted() const {
+     std::unique_lock<std::mutex> lock(state_mutex_);
+     state_signal_.wait(lock, [this] { return state_ != State::kUninitialized; });
+@@ -1128,6 +1146,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ #endif
+   }
+   pthread_t thread_;
++#if REX_PLATFORM_ANDROID
++  std::atomic<pid_t> tid_{0};
++#endif
+   bool signaled_;
+   int exit_code_;
+   State state_;             // Protected by state_mutex_
+@@ -1547,6 +1568,10 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+ 
+   current_thread_ = thread;
+   current_thread_condition_ = &thread->handle_;
++#if REX_PLATFORM_ANDROID
++  // Before the started state is published: WaitStarted() callers read it.
++  thread->handle_.tid_.store(gettid(), std::memory_order_release);
++#endif
+   {
+     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index b9fde10..9c9a622 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -421,6 +421,51 @@ void RenderTargetCache::BeginFrame() {
+   ResetAccumulatedRenderTargets();
+ }
+ 
++bool RenderTargetCache::IsRenderTargetInLastUpdate(const RenderTarget* render_target) const {
++  for (const RenderTarget* used : last_update_used_render_targets_) {
++    if (used == render_target) return true;
++  }
++  for (const RenderTarget* accumulated : last_update_accumulated_render_targets_) {
++    if (accumulated == render_target) return true;
++  }
++  // (DS2's fork also checks its redirected resolve clear here; LR has no such path.)
++  return false;
++}
++
++bool RenderTargetCache::RemoveIdleRenderTarget(RenderTarget* render_target) {
++  bool removed = false;
++  for (auto it = render_targets_.begin(); it != render_targets_.end();) {
++    if (it->second == render_target) {
++      it = render_targets_.erase(it);
++      removed = true;
++    } else {
++      ++it;
++    }
++  }
++  return removed;
++}
++
++void RenderTargetCache::CollectIdleRenderTargets(uint64_t min_idle_frames,
++                                                 std::vector<RenderTarget*>& idle) const {
++  std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> owning;
++  for (const auto& ownership_range_pair : ownership_ranges_) {
++    const OwnershipRange& ownership_range = ownership_range_pair.second;
++    if (!ownership_range.render_target.IsEmpty()) owning.emplace(ownership_range.render_target);
++    if (!ownership_range.host_depth_render_target_unorm24.IsEmpty()) {
++      owning.emplace(ownership_range.host_depth_render_target_unorm24);
++    }
++    if (!ownership_range.host_depth_render_target_float24.IsEmpty()) {
++      owning.emplace(ownership_range.host_depth_render_target_float24);
++    }
++  }
++  for (const auto& render_target_pair : render_targets_) {
++    RenderTarget* render_target = render_target_pair.second;
++    if (!render_target || owning.count(render_target->key())) continue;
++    if (frame_index_ - render_target->last_used_frame < min_idle_frames) continue;
++    idle.push_back(render_target);
++  }
++}
++
+ bool RenderTargetCache::Update(bool is_rasterization_done,
+                                reg::RB_DEPTHCONTROL normalized_depth_control,
+                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
+@@ -987,10 +1032,18 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+     return true;
+   }
+ 
++  // Transfer sources are read by the GPU now although no draw binds them (idle render targets).
++  for (const std::vector<Transfer>& transfers : last_update_transfers_) {
++    for (const Transfer& transfer : transfers) {
++      if (transfer.source) transfer.source->last_used_frame = frame_index_;
++      if (transfer.host_depth_source) transfer.host_depth_source->last_used_frame = frame_index_;
++    }
++  }
+   // If everything succeeded, update the used render targets.
+   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+     last_update_used_render_targets_[i] =
+         (depth_and_color_rts_used_bits & (uint32_t(1) << i)) ? rts[i] : nullptr;
++    if (last_update_used_render_targets_[i]) last_update_used_render_targets_[i]->last_used_frame = frame_index_;
+   }
+   if (are_accumulated_render_targets_valid_) {
+     // Check if the only re-enabling a previously bound render target.
+@@ -1476,6 +1529,9 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
+     // Insert even if failed to create, not to try to create again.
+     render_targets_.emplace(key, render_target);
+   }
++  // Any lookup is a use (idle render targets): resolve clears take theirs here without a draw binding them, and
++  // looked idle while used every frame (freed and recreated every 10 s, 2026-11-23).
++  if (render_target) render_target->last_used_frame = frame_index_;
+   return render_target;
+ }
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 9c22f84..59e82a5 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -108,6 +108,11 @@ REXCVAR_DEFINE_UINT32(vulkan_submit_before_wait_min_draws, 1, "GPU/Vulkan",
+                       "sleeps. Lightning Returns waits once per frame for a guest memory counter; "
+                       "without this the GPU idled until the wait ended. 0 = never.")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_INT32(vulkan_gpu_stall_log_ms, 250, "GPU/Vulkan",
++                     "Log blocking waits for submitted GPU work and frames (time between swaps) that last "
++                     "at least this many ms: a GPU hang the kernel driver reset and recovered from shows as "
++                     "one (the DS2 port's Adreno 830 GMEM hangs, 2026-11-22), long before a lost device; loads "
++                     "and the app in the background do too. 0 = off.");
+ REXCVAR_DEFINE_BOOL(vulkan_fence_poll, false, "GPU/Vulkan",
+                     "Poll in-flight submission fences with zero-timeout waits whenever a submission "
+                     "begins, to reclaim resources early (Xenia's behaviour). Off: completion is "
+@@ -213,6 +218,23 @@ REXCVAR_DEFINE_BOOL(vulkan_render_area_restrict, false, "GPU",
+                     "whole EDRAM-tall framebuffer, so tile-based GPUs load and store less")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_INT32(vulkan_evict_idle_render_targets_s, 0, "GPU/Vulkan",
++                     "Free render targets that own no EDRAM data and no draw has bound for this many seconds "
++                     "(counted at 60 frames per second), with their idle framebuffers (0 = keep them all)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(vulkan_log_device_memory_s, 30, "GPU/Vulkan",
++                     "Log the GPU memory by kind (render targets, shared memory, buffers, upload pages, other images) "
++                     "and the texture memory every this many seconds (0 = off)")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
++REXCVAR_DEFINE_INT32(vulkan_arm_driver_defaults, 1, "GPU/Vulkan",
++                     "Defaults for Arm's own Mali driver, applied at GPU setup to settings nothing else set: "
++                     "render passes instead of dynamic rendering (vulkan_dynamic_rendering false) and render "
++                     "areas restricted to what the passes write (vulkan_render_area_restrict true). 0 = off, "
++                     "1 = on Arm's proprietary driver, 2 = on any driver (to test the path on other GPUs)")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ // Set by the Vulkan device code (src/ui/vulkan/vulkan_device.cpp, librexruntime) for the Android app's GPU driver
+ // page: "<GPU name>: <reason>" when the renderer cannot start.
+ extern "C" char rex_vulkan_failure_reason[256];
+@@ -1256,6 +1278,33 @@ bool VulkanCommandProcessor::SetupContext() {
+   REXGPU_INFO("VulkanCommandProcessor: mid-frame submissions {}",
+               REXCVAR_GET(vulkan_submit_on_primary_buffer_end) ? "on" : "off");
+ 
++  // Arm's proprietary Mali driver (from the DS2 port, its public #16 / #20 / #21, Mali-G615, 2026-11-22):
++  // - with dynamic rendering, gameplay had flickering vertices and broken surfaces, and players saw
++  //   them go away with render passes (CTRL's "Dynamic rendering off");
++  // - ~100 passes per frame each loaded and stored the whole EDRAM-tall framebuffer while their writes
++  //   cover a fraction of it: on a tiler that is mostly wasted tile memory traffic.
++  // Both run before the render target and pipeline caches read them; a value from a REX_* variable or
++  // the command line (CTRL's own options) wins.
++  {
++    int32_t arm_defaults = REXCVAR_GET(vulkan_arm_driver_defaults);
++    bool arm_driver = device_properties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY;
++    if (arm_defaults >= 2 || (arm_defaults == 1 && arm_driver)) {
++      static const std::pair<const char*, const char*> kArmDefaults[] = {
++          {"vulkan_dynamic_rendering", "false"},
++          {"vulkan_render_area_restrict", "true"},
++      };
++      std::string applied;
++      for (const auto& [name, value] : kArmDefaults) {
++        if (rex::cvar::GetFlagSource(name) != rex::cvar::Source::kDefault) continue;
++        rex::cvar::SetFlagByName(name, value);
++        applied += std::string(applied.empty() ? "" : ", ") + name + "=" + value;
++      }
++      REXGPU_INFO("VulkanCommandProcessor: Arm driver defaults ({}): {}",
++                  arm_driver ? "Arm's proprietary driver" : "forced on another driver",
++                  applied.empty() ? std::string("none, all set elsewhere") : applied);
++    }
++  }
++
+   // The unconditional inclusion of the vertex shader stage also covers the case
+   // of manual index / factor buffer fetch (the system constants and the shared
+   // memory are needed for that) in the tessellation vertex shader when
+@@ -2869,6 +2918,18 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   SCOPE_profile_cpu_f("gpu");
+   lr_crossfade_this_frame_ = false;
+   CpFrameOnSwap();
++  // GPU memory by kind every vulkan_log_device_memory_s (from the DS2 port: a 720p game's 1.7 GB on Turnip, its
++  // issue #8's 6 GB phone).
++  if (const int32_t every_s = REXCVAR_GET(vulkan_log_device_memory_s); every_s > 0) {
++    const auto now = std::chrono::steady_clock::now();
++    if (now - device_memory_logged_at_ >= std::chrono::seconds(every_s)) {
++      device_memory_logged_at_ = now;
++      REXGPU_INFO("GPU memory by kind: {}", ui::vulkan::util::DeviceMemoryReport());
++      // 1800 frames: 30 s at 60 fps, 60 s at 30.
++      REXGPU_INFO("Render target memory: {}", render_target_cache_->RenderTargetMemoryReport(1800));
++      // (DS2's fork also logs its texture cache's own statistics here; LR's texture cache has no such report.)
++    }
++  }
+   if (vertex_memexport_fallback_log.reported_once) {
+     vertex_memexport_fallback_log.ReportIfDue();
+   }
+@@ -5036,6 +5097,18 @@ void VulkanCommandProcessor::CpFrameOnSwap() {
+   const uint64_t now = CpNowNs();
+   auto& f = cp_frame_;
+   const uint32_t threshold_ms = REXCVAR_GET(vulkan_slow_frame_ms);
++  // Release builds too (one comparison per frame): the DS2 port's S25 GPU hangs froze the picture for 360-480 ms
++  // each before the device was lost, with nothing in the log.
++  if (int32_t long_ms = REXCVAR_GET(vulkan_gpu_stall_log_ms);
++      long_ms > 0 && f.start_ns && now - f.start_ns >= uint64_t(long_ms) * 1000000) {
++    static std::atomic<uint32_t> long_frames{0};
++    const uint32_t n = long_frames.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (n <= 30 || n % 50 == 0) {
++      REXGPU_WARN("Long frame: {:.0f} ms between swaps ({} so far; a load, the app in the background, or a GPU "
++                  "hang the driver reset)",
++                  (now - f.start_ns) / 1e6, n);
++    }
++  }
+   if (f.start_ns && threshold_ms && now - f.start_ns > uint64_t(threshold_ms) * 1000000) {
+     const double total = (now - f.start_ns) / 1e6;
+     const double regmem = (wait_reg_mem_us_total_ - f.regmem_us_start) / 1e3;
+@@ -6736,9 +6809,15 @@ bool VulkanCommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out
+ 
+ void VulkanCommandProcessor::DisableHostOcclusionQueries() {
+   if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
++    // The query began outside a render pass (BeginGuestOcclusionQuery), so it must end outside one, and only once:
++    // it is cleared before EndSubmission, which would otherwise end it a second time. The old order (end inside the
++    // open render pass, then a second vkCmdEndQuery in EndSubmission) crashed Arm's Mali driver in vkCmdEndQuery
++    // (the DS2 port's #16 / #17). LR keeps occlusion queries off on Android; this is hardening.
++    const uint32_t host_index = active_occlusion_query_.host_index;
++    active_occlusion_query_ = {};
+     if (BeginSubmission(true)) {
+-      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
+-                                             active_occlusion_query_.host_index);
++      EndRenderPass();
++      deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_, host_index);
+       EndSubmission(false);
+     }
+   }
+@@ -6906,6 +6985,7 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     // synchronization scope all commands that occur earlier in submission
+     // order."
+     VkResult wait_result;
++    const auto stall_wait_start = std::chrono::steady_clock::now();
+     uint32_t fence_wait_sleep_us = REXCVAR_GET(vulkan_fence_wait_sleep_us);
+     if (fence_wait_sleep_us) {
+       // Poll and sleep instead of a blocking driver wait (the driver may spin
+@@ -6924,6 +7004,22 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+           dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                               submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+     }
++    if (int32_t stall_log_ms = REXCVAR_GET(vulkan_gpu_stall_log_ms); stall_log_ms > 0) {
++      const int64_t waited_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                    std::chrono::steady_clock::now() - stall_wait_start)
++                                    .count();
++      if (waited_ms >= stall_log_ms) {
++        static std::atomic<uint32_t> stalls{0};
++        const uint32_t n = stalls.fetch_add(1, std::memory_order_relaxed) + 1;
++        if (n <= 20 || n % 50 == 0) {
++          REXGPU_WARN(
++              "GPU stall: waited {} ms for submission {} ({} in flight, result {}); {} wait(s) of {}+ ms "
++              "so far (a GPU hang the driver reset, or very long GPU work)",
++              waited_ms, await_submission, await_submission - submission_completed_, int(wait_result), n,
++              stall_log_ms);
++        }
++      }
++    }
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+@@ -7206,6 +7302,21 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     primitive_processor_->BeginFrame();
+ 
+     texture_cache_->BeginFrame();
++
++    // Only the frame count (idle render targets): the cache's own BeginFrame is not called on this path.
++    render_target_cache_->CountFrame();
++    // vulkan_evict_idle_render_targets_s: every 600 frames, render targets owning no EDRAM data and unbound that
++    // long (counted at 60 frames per second, so longer at lower frame rates) are freed with their idle framebuffers.
++    // At Majula ~100 MB of 455 MB were such leftovers of the title, menus and loading (DECISIONS.md, 2026-11-23).
++    if (const int32_t idle_s = REXCVAR_GET(vulkan_evict_idle_render_targets_s);
++        idle_s > 0 && render_target_cache_->frame_index() % 600 == 0) {
++      uint64_t freed_bytes = 0;
++      const size_t evicted =
++          render_target_cache_->EvictIdleRenderTargets(uint64_t(idle_s) * 60, freed_bytes);
++      if (evicted) {
++        REXGPU_INFO("Freed {} idle render targets ({:.0f} MB)", evicted, freed_bytes / 1048576.0);
++      }
++    }
+   }
+ 
+   return true;
+@@ -7284,14 +7395,14 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+   if (submission_open_) {
+     assert_false(scratch_buffer_used_);
+ 
++    // A query still active here began outside a render pass: end the render pass first (DS2 #16 / #17).
++    EndRenderPass();
+     if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
+       deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
+                                              active_occlusion_query_.host_index);
+       active_occlusion_query_ = {};
+     }
+ 
+-    EndRenderPass();
+-
+     pipeline_cache_->EndSubmission();
+ 
+     render_target_cache_->EndSubmission();
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index a3f5bb1..3f435e8 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1213,6 +1213,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
+   // so ShutdownCommon is called by the RenderTargetCache destructor, when it's
+   // already too late.
+   DestroyAllRenderTargets(true);
++  DeleteRetiredRenderTargets(true);  // the GPU is idle at shutdown
+ 
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device,
+                                          resolve_fsi_clear_64bpp_pipeline_);
+@@ -1371,10 +1372,109 @@ void VulkanRenderTargetCache::ClearCache() {
+   RenderTargetCache::ClearCache();
+ }
+ 
++std::string VulkanRenderTargetCache::RenderTargetMemoryReport(uint64_t idle_frames) const {
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  auto bytes_of = [&](const RenderTarget* render_target) {
++    VkMemoryRequirements memory_requirements;
++    dfn.vkGetImageMemoryRequirements(
++        device, static_cast<const VulkanRenderTarget*>(render_target)->image(), &memory_requirements);
++    return uint64_t(memory_requirements.size);
++  };
++  uint64_t all_bytes = 0, idle_bytes = 0, unowned_bytes = 0;
++  size_t all_count = 0;
++  for (const auto& render_target_pair : render_targets()) {
++    if (!render_target_pair.second) continue;
++    ++all_count;
++    all_bytes += bytes_of(render_target_pair.second);
++  }
++  std::vector<RenderTarget*> unowned, idle;
++  CollectIdleRenderTargets(0, unowned);
++  CollectIdleRenderTargets(idle_frames, idle);
++  for (const RenderTarget* render_target : unowned) unowned_bytes += bytes_of(render_target);
++  for (const RenderTarget* render_target : idle) idle_bytes += bytes_of(render_target);
++  return fmt::format("{:.0f} MB in {}, owning no EDRAM data {:.0f} MB in {}, of them unbound for {} frames {:.0f} MB in {}",
++                     all_bytes / 1048576.0, all_count, unowned_bytes / 1048576.0, unowned.size(), idle_frames,
++                     idle_bytes / 1048576.0, idle.size());
++}
++
++size_t VulkanRenderTargetCache::EvictIdleRenderTargets(uint64_t min_idle_frames, uint64_t& freed_bytes) {
++  std::vector<RenderTarget*> idle;
++  CollectIdleRenderTargets(min_idle_frames, idle);
++  if (idle.empty()) return 0;
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  // A framebuffer may hold views of the render target if its pitch, sample count and the base of an attachment of
++  // the same kind match (formats are not compared: a match of another format is only freed if idle as well).
++  auto may_use = [](const FramebufferKey& framebuffer_key, RenderTargetKey key) {
++    const RenderPassKey& pass = framebuffer_key.render_pass_key;
++    if (framebuffer_key.pitch_tiles_at_32bpp != key.pitch_tiles_at_32bpp ||
++        pass.msaa_samples != key.msaa_samples) {
++      return false;
++    }
++    if (key.is_depth) {
++      return (pass.depth_and_color_used & 1) && framebuffer_key.depth_base_tiles == key.base_tiles;
++    }
++    const uint32_t color_bases[] = {framebuffer_key.color_0_base_tiles, framebuffer_key.color_1_base_tiles,
++                                    framebuffer_key.color_2_base_tiles, framebuffer_key.color_3_base_tiles};
++    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
++      if ((pass.depth_and_color_used & (1u << (1 + i))) && color_bases[i] == key.base_tiles) return true;
++    }
++    return false;
++  };
++  size_t evicted = 0;
++  std::vector<FramebufferKey> doomed;
++  for (RenderTarget* render_target : idle) {
++    if (IsRenderTargetInLastUpdate(render_target)) continue;
++    const RenderTargetKey key = render_target->key();
++    doomed.clear();
++    bool framebuffer_in_use = false;
++    for (const auto& framebuffer_pair : framebuffers_) {
++      if (!may_use(framebuffer_pair.first, key)) continue;
++      if (frame_index() - framebuffer_pair.second.last_used_frame < min_idle_frames ||
++          &framebuffer_pair.second == last_update_framebuffer_) {
++        framebuffer_in_use = true;
++        break;
++      }
++      doomed.push_back(framebuffer_pair.first);
++    }
++    if (framebuffer_in_use) continue;
++    // Out of the cache first: only a render target that was really there is retired and later deleted (a lookup by
++    // key missed some on 2026-11-23, and the same three were "freed" every 10 s while the cache still used them).
++    if (!RemoveIdleRenderTarget(render_target)) continue;
++    for (const FramebufferKey& framebuffer_key : doomed) {
++      auto it = framebuffers_.find(framebuffer_key);
++      if (it == framebuffers_.end()) continue;
++      if (it->second.framebuffer != VK_NULL_HANDLE) {
++        dfn.vkDestroyFramebuffer(device, it->second.framebuffer, nullptr);
++      }
++      framebuffers_.erase(it);
++    }
++    VkMemoryRequirements memory_requirements;
++    dfn.vkGetImageMemoryRequirements(device, static_cast<VulkanRenderTarget*>(render_target)->image(),
++                                     &memory_requirements);
++    freed_bytes += memory_requirements.size;
++    retired_render_targets_.emplace_back(command_processor_.GetCurrentSubmission(), render_target);
++    ++evicted;
++  }
++  return evicted;
++}
++
++void VulkanRenderTargetCache::DeleteRetiredRenderTargets(bool all) {
++  const uint64_t completed = command_processor_.GetCompletedSubmission();
++  while (!retired_render_targets_.empty() && (all || retired_render_targets_.front().first <= completed)) {
++    delete retired_render_targets_.front().second;
++    retired_render_targets_.pop_front();
++  }
++}
++
+ void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
+   if (transfer_vertex_buffer_pool_) {
+     transfer_vertex_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
+   }
++  DeleteRetiredRenderTargets(false);
+ }
+ 
+ void VulkanRenderTargetCache::EndSubmission() {
+@@ -2434,6 +2534,12 @@ VulkanRenderTargetCache::VulkanRenderTarget::~VulkanRenderTarget() {
+     dfn.vkDestroyImageView(device, view_depth_stencil_, nullptr);
+   }
+   dfn.vkDestroyImageView(device, view_depth_color_, nullptr);
++  // The memory tracker counted it as the dedicated-allocation helper did (ui::vulkan::util::NoteDeviceMemory).
++  VkMemoryRequirements memory_requirements;
++  dfn.vkGetImageMemoryRequirements(device, image_, &memory_requirements);
++  ui::vulkan::util::NoteDeviceMemory(
++      key().msaa_samples != xenos::MsaaSamples::k1X ? "render targets msaa" : "render targets",
++      -int64_t(memory_requirements.size));
+   dfn.vkDestroyImage(device, image_, nullptr);
+   dfn.vkFreeMemory(device, memory_, nullptr);
+ }
+@@ -2833,6 +2939,7 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
+   }
+   auto it = framebuffers_.find(key);
+   if (it != framebuffers_.end()) {
++    it->second.last_used_frame = frame_index();
+     return &it->second;
+   }
+ 
+@@ -2898,10 +3005,12 @@ VulkanRenderTargetCache::GetHostRenderTargetsFramebuffer(
+     return nullptr;
+   }
+   // Creates at a persistent location - safe to use pointers.
+-  return &framebuffers_
+-              .emplace(std::piecewise_construct, std::forward_as_tuple(key),
+-                       std::forward_as_tuple(framebuffer, host_extent))
+-              .first->second;
++  Framebuffer& created = framebuffers_
++                             .emplace(std::piecewise_construct, std::forward_as_tuple(key),
++                                      std::forward_as_tuple(framebuffer, host_extent))
++                             .first->second;
++  created.last_used_frame = frame_index();
++  return &created;
+ }
+ 
+ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key) {
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 8e9e603..b1aec36 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -150,6 +150,7 @@ bool VulkanSharedMemory::Initialize() {
+       Shutdown();
+       return false;
+     }
++    ui::vulkan::util::NoteDeviceMemory("shared memory", int64_t(buffer_memory_allocate_info.allocationSize));
+     buffer_memory_.push_back(buffer_memory);
+     if (dfn.vkBindBufferMemory(device, buffer_, buffer_memory, 0) != VK_SUCCESS) {
+       REXGPU_ERROR("Shared memory: Failed to bind memory to the Vulkan buffer");
+diff --git a/src/ui/graphics_upload_buffer_pool.cpp b/src/ui/graphics_upload_buffer_pool.cpp
+index 407498e..162c1d0 100644
+--- a/src/ui/graphics_upload_buffer_pool.cpp
++++ b/src/ui/graphics_upload_buffer_pool.cpp
+@@ -12,9 +12,16 @@
+ #include <algorithm>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/math.h>
+ #include <rex/ui/graphics_upload_buffer_pool.h>
+ 
++REXCVAR_DEFINE_UINT32(upload_buffer_max_free_mb, 0, "GPU",
++                      "Upload pages kept free per pool once the GPU is done with them (0 = all: the pool keeps its peak "
++                      "for the rest of the session, ~100 MB at 720p). Lower saves memory on phones with little RAM; "
++                      "a page freed and needed again later is allocated again.")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
++
+ namespace rex {
+ namespace ui {
+ 
+@@ -39,6 +46,26 @@ void GraphicsUploadBufferPool::Reclaim(uint64_t completed_submission_index) {
+   if (!submitted_first_) {
+     submitted_last_ = nullptr;
+   }
++  // upload_buffer_max_free_mb: free pages beyond the cap (the first stays: it is the one being written). Only pages
++  // the GPU is done with are on this list.
++  const uint32_t max_free_mb = REXCVAR_GET(upload_buffer_max_free_mb);
++  if (max_free_mb && writable_first_ && page_size_) {
++    const size_t keep = std::max<size_t>(2, (size_t(max_free_mb) << 20) / page_size_);
++    Page* page = writable_first_;
++    for (size_t i = 1; i < keep && page->next_; ++i) {
++      page = page->next_;
++    }
++    Page* extra = page->next_;
++    if (extra) {
++      page->next_ = nullptr;
++      writable_last_ = page;
++      while (extra) {
++        Page* next = extra->next_;
++        delete extra;
++        extra = next;
++      }
++    }
++  }
+ }
+ 
+ void GraphicsUploadBufferPool::ChangeSubmissionTimeline() {
+diff --git a/src/ui/vulkan/vulkan_upload_buffer_pool.cpp b/src/ui/vulkan/vulkan_upload_buffer_pool.cpp
+index 771019a..979c6b1 100644
+--- a/src/ui/vulkan/vulkan_upload_buffer_pool.cpp
++++ b/src/ui/vulkan/vulkan_upload_buffer_pool.cpp
+@@ -147,6 +147,7 @@ GraphicsUploadBufferPool::Page* VulkanUploadBufferPool::CreatePageImplementation
+     dfn.vkDestroyBuffer(device, buffer, nullptr);
+     return nullptr;
+   }
++  util::NoteDeviceMemory("upload pages", int64_t(memory_allocate_info.allocationSize));
+ 
+   if (dfn.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS) {
+     REXLOG_ERROR("Failed to bind memory to a Vulkan upload buffer with {} bytes", page_size_);
+@@ -175,6 +176,9 @@ void VulkanUploadBufferPool::FlushPageWrites(Page* page, size_t offset, size_t s
+ VulkanUploadBufferPool::VulkanPage::~VulkanPage() {
+   const VulkanDevice::Functions& dfn = vulkan_device_->functions();
+   const VkDevice device = vulkan_device_->device();
++  VkMemoryRequirements memory_requirements;
++  dfn.vkGetBufferMemoryRequirements(device, buffer_, &memory_requirements);
++  util::NoteDeviceMemory("upload pages", -int64_t(memory_requirements.size));
+   dfn.vkDestroyBuffer(device, buffer_, nullptr);
+   // Unmapping is done implicitly when the memory is freed.
+   dfn.vkFreeMemory(device, memory_, nullptr);
+diff --git a/src/ui/vulkan/vulkan_util.cpp b/src/ui/vulkan/vulkan_util.cpp
+index 958e169..def1410 100644
+--- a/src/ui/vulkan/vulkan_util.cpp
++++ b/src/ui/vulkan/vulkan_util.cpp
+@@ -10,6 +10,11 @@
+  */
+ 
+ #include <cstdint>
++#include <map>
++#include <mutex>
++#include <vector>
++
++#include <fmt/format.h>
+ 
+ #include <rex/assert.h>
+ #include <rex/math.h>
+@@ -21,6 +26,38 @@ namespace ui {
+ namespace vulkan {
+ namespace util {
+ 
++namespace {
++std::mutex g_device_memory_mutex;
++std::map<std::string, std::pair<int64_t, int64_t>> g_device_memory;  // kind -> (count, bytes)
++}  // namespace
++
++void NoteDeviceMemory(const char* kind, int64_t bytes) {
++  std::lock_guard lock(g_device_memory_mutex);
++  auto& entry = g_device_memory[kind ? kind : "other"];
++  entry.first += bytes >= 0 ? 1 : -1;
++  entry.second += bytes;
++}
++
++std::string DeviceMemoryReport() {
++  std::vector<std::pair<std::string, std::pair<int64_t, int64_t>>> kinds;
++  int64_t total = 0;
++  {
++    std::lock_guard lock(g_device_memory_mutex);
++    for (const auto& entry : g_device_memory) {
++      if (entry.second.second <= 0) continue;
++      kinds.emplace_back(entry.first, entry.second);
++      total += entry.second.second;
++    }
++  }
++  std::sort(kinds.begin(), kinds.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
++  std::string report = fmt::format("{:.0f} MB:", total / 1048576.0);
++  for (const auto& [kind, value] : kinds) {
++    report += fmt::format(" {} {:.0f} MB ({}),", kind, value.second / 1048576.0, value.first);
++  }
++  if (!kinds.empty()) report.pop_back();
++  return report;
++}
++
+ void FlushMappedMemoryRange(const VulkanDevice* const vulkan_device, const VkDeviceMemory memory,
+                             const uint32_t memory_type, const VkDeviceSize offset,
+                             const VkDeviceSize memory_size, const VkDeviceSize size) {
+@@ -102,6 +139,7 @@ bool CreateDedicatedAllocationBuffer(const VulkanDevice* const vulkan_device,
+     return false;
+   }
+ 
++  NoteDeviceMemory("buffers", int64_t(memory_allocate_info.allocationSize));
+   buffer_out = buffer;
+   memory_out = memory;
+   if (memory_type_out) {
+@@ -161,6 +199,11 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+     return false;
+   }
+ 
++  NoteDeviceMemory((create_info.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))
++                       ? (create_info.samples != VK_SAMPLE_COUNT_1_BIT ? "render targets msaa" : "render targets")
++                       : "other images",
++                   int64_t(memory_allocate_info.allocationSize));
+   image_out = image;
+   memory_out = memory;
+   if (memory_type_out) {

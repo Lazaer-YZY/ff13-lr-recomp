@@ -1,7 +1,7 @@
 From 780619b39a49fe2d8f313a13e32344d166a2fb48 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:47:23 +0800
-Subject: [PATCH 026/116] core(android): executable path is librexruntime.so;
+Subject: [PATCH 026/117] core(android): executable path is librexruntime.so;
  REX_ANDROID_APP_DIR (behaviour informed by lr-ffxiii-port's Android patch,
  re-implemented)
 

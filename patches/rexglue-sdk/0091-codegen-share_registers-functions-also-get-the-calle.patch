@@ -1,7 +1,7 @@
 From 6d798ae12aae9bd582b1e43a2c7ec6187a6eab4f Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 23:10:08 +0800
-Subject: [PATCH 091/116] codegen: share_registers functions also get the
+Subject: [PATCH 091/117] codegen: share_registers functions also get the
  caller's localized non-volatile FPRs and VMX registers
 
 With non_volatile_as_local a function marked share_registers (an SEH funclet,

@@ -16,8 +16,11 @@ final class TouchCtrlHandle {
     static final float TAB_OPACITY = .5f;
     static final float TAB_LABEL_SCALE = .7f;
 
-    private boolean enabled = true, pinned, retracted, hideAll, revealed;
-    private long lastActivity, slideStart;
+    /** "Hide CTRL after the start" (the owner, 2026-11-23): gone this long after the start; Back opens Settings. */
+    static final long HIDE_AFTER_START_MS = 30_000;
+
+    private boolean enabled = true, pinned, retracted, hideAll, revealed, hideAfterStart;
+    private long lastActivity, slideStart, goneAt = Long.MAX_VALUE;
     private float slideFrom, slideTo;
 
     // Geometry from the last layout() call; fields so onDraw allocates nothing.
@@ -67,9 +70,26 @@ final class TouchCtrlHandle {
 
     boolean hideAll() { return hideAll; }
 
+    /**
+     * Removes CTRL for good HIDE_AFTER_START_MS after {@code since} (the start, or turning the option on); a pinned
+     * UI (the CTRL dialog, the layout editor) still shows it. Turning it on again restarts the countdown.
+     */
+    void setHideAfterStart(boolean value, long since) {
+        if (hideAfterStart == value) return;
+        hideAfterStart = value;
+        goneAt = value ? since + HIDE_AFTER_START_MS : Long.MAX_VALUE;
+    }
+
+    boolean hideAfterStart() { return hideAfterStart; }
+
+    /** CTRL is removed for the rest of the session: Android Back opens Settings instead. */
+    boolean gone(long now) { return hideAfterStart && now >= goneAt; }
+
     /** Hidden mode has no tab; only a system-bar/Back reveal or a pinned UI shows CTRL. */
     boolean visible(long now) {
-        return !hideAll || pinned || (revealed && now - lastActivity < HIDE_DELAY_MS);
+        if (pinned) return true;
+        if (gone(now)) return false;
+        return !hideAll || (revealed && now - lastActivity < HIDE_DELAY_MS);
     }
 
     /** True once the button retracts (including while it is still sliding out). */
@@ -85,6 +105,17 @@ final class TouchCtrlHandle {
 
     /** 0 = redraw next frame (sliding), positive = wait this long, -1 = nothing pending. */
     long nextWakeMs(long now) {
+        if (gone(now)) return -1;
+        long wait = timerWakeMs(now);
+        // The redraw that removes CTRL when the after-start countdown ends.
+        if (hideAfterStart && !pinned) {
+            long untilGone = Math.max(1, goneAt - now);
+            wait = wait < 0 ? untilGone : Math.min(wait, untilGone);
+        }
+        return wait;
+    }
+
+    private long timerWakeMs(long now) {
         if (hideAll) {
             return !pinned && visible(now) ? Math.max(1, lastActivity + HIDE_DELAY_MS - now) : -1;
         }

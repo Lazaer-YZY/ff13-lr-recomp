@@ -1,7 +1,7 @@
 From 712fd2436ccc70bcc5e253c3ce733ce940c73a4d Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:36:50 +0800
-Subject: [PATCH 015/116] ui(android): single-app mode so SDL_main finds
+Subject: [PATCH 015/117] ui(android): single-app mode so SDL_main finds
  GetWindowedAppCreator
 
 The inherited Xenia Android multi-app registry (XE_UI_WINDOWED_APPS_IN_LIBRARY)

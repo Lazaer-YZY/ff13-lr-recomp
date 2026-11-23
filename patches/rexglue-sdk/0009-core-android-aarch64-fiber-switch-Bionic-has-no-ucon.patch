@@ -1,7 +1,7 @@
 From 67d6b945431984bcf157f68410dd82a9b12a9368 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:22:44 +0800
-Subject: [PATCH 009/116] core(android): aarch64 fiber switch (Bionic has no
+Subject: [PATCH 009/117] core(android): aarch64 fiber switch (Bionic has no
  ucontext functions)
 
 Bionic does not implement getcontext/makecontext/swapcontext. On Android the

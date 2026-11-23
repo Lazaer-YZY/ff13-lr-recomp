@@ -52,5 +52,18 @@ std::string PinThreadsToFastCores();
 void StartCpuClockSampler();
 // The description from the last PinThreadsToFastCores call ("" if never called).
 const std::string& PinnedCoresNote();
+// The mask PinThreadsToFastCores set (bit n = cpu n); 0 when the game runs on all cores.
+uint64_t PinnedCoresMask();
+
+// The affinity keeper (lr_affinity.cpp): once a second, threads whose CPU mask a cpuset change reset
+// (Android moved the app from /top-app to /foreground) are pinned again, to their NoteThreadMask mask
+// or the startup mask; cpuset changes are logged, and with "Debug logging" (LR_DIAG) a placement line
+// every 10 s. LR_AFFINITY_KEEPER=0 turns the pinning off. Call right after PinThreadsToFastCores.
+void StartAffinityKeeper();
+// A mask LR gave one thread on purpose (bit n = cpu n): the keeper restores it after a reset instead of
+// the startup mask. Call again whenever that placement changes.
+void NoteThreadMask(int tid, uint64_t mask);
+// The game's main thread (the one reporting frames), for the placement line.
+void NoteGameMainThread(int tid);
 
 }  // namespace lr::android

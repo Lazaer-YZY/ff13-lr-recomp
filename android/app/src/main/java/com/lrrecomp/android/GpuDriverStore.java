@@ -217,11 +217,13 @@ final class GpuDriverStore {
     /**
      * Adreno 710/720/722: the bundled Stable Turnip v2 supports them in sysmem mode only
      * (whitebelyash's release notes: "unstable, sysmem only"), so Turnip runs with TU_DEBUG=sysmem.
+     * Adreno 8xx (8 Elite's 830, 825): tiled (gmem) rendering glitched, page-faulted and hung the GPU in the DS2
+     * port on a Galaxy S25 (DS2 DECISIONS 2026-11-22); sysmem fixed it. CTRL's "Tiled (gmem)" still overrides.
      */
     static boolean needsTurnipSysmem(String model, Metadata metadata) {
         if (model == null || metadata == null || metadata.isPanVk()) return false;
         int number = GpuDriverCatalog.adrenoModel(model);
-        return number == 710 || number == 720 || number == 722;
+        return number == 710 || number == 720 || number == 722 || (number >= 800 && number < 900);
     }
 
     /** LR_VK_CUSTOM_DRIVER_MODE for a package: the player's choice, else its default. */

@@ -1,7 +1,7 @@
 From aecae974f5ffbce971ca7ab927b4cbf73df718f5 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Wed, 11 Nov 2026 17:38:31 +0800
-Subject: [PATCH 103/116] gpu: boot precompile builds vertex
+Subject: [PATCH 103/117] gpu: boot precompile builds vertex
  (pre-rasterization) libraries too; vertex sign classes out of the stored
  description (its layout grew a byte)
 

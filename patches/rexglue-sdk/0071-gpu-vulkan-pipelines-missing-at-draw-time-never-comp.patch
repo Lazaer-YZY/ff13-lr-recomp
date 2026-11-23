@@ -1,7 +1,7 @@
 From 2aa810af308a5fe6d6a0302a6ee02db893179f43 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 23:47:42 +0800
-Subject: [PATCH 071/116] gpu: vulkan: pipelines missing at draw time never
+Subject: [PATCH 071/117] gpu: vulkan: pipelines missing at draw time never
  compile on the GPU thread
 
 With async_shader_compilation, a pipeline missing at draw time was given a

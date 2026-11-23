@@ -1,7 +1,7 @@
 From c6e26e2c3da7183accc82262972dd6d8418a3e28 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Tue, 10 Nov 2026 21:59:57 +0800
-Subject: [PATCH 094/116] gpu/kernel: frame-stall diagnostics (per-frame GPU
+Subject: [PATCH 094/117] gpu/kernel: frame-stall diagnostics (per-frame GPU
  time, upload/primitive timers, timeline observers)
 
 - "GPU slow frame on the GPU": per-frame GPU time from the timing queries when

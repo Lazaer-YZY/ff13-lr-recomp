@@ -1,7 +1,7 @@
 From 4ec6d031e98784afc740e72c9b59d3f4029f6e95 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 11:03:57 +0800
-Subject: [PATCH 059/116] gpu: vulkan: diagnostic switches to skip ownership
+Subject: [PATCH 059/117] gpu: vulkan: diagnostic switches to skip ownership
  transfers and texture reloads
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

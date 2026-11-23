@@ -1,7 +1,7 @@
 From 2223b0407c0252825df4eaa318f52db4231a380d Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 23 Nov 2026 08:10:15 +0800
-Subject: [PATCH 116/116] gpu/vulkan: record compute state outside render
+Subject: [PATCH 116/117] gpu/vulkan: record compute state outside render
  passes (Adreno 6xx)
 
 Turnip on Adreno 6xx loses compute pipeline / descriptor / push-constant

@@ -653,6 +653,8 @@ class LrApp : public rex::ReXApp {
 #if defined(__ANDROID__)
     // Before any runtime thread exists: every thread created from here on inherits the mask.
     lr::android::PinThreadsToFastCores();
+    // Pins threads again when Android moves the app to another cpuset (lr_affinity.cpp).
+    lr::android::StartAffinityKeeper();
     // "LR CPU clocks" statistics: only with "Debug logging" (LR_DIAG, see lr_hooks.cpp).
     if (const char* diag = std::getenv("LR_DIAG"); !(diag && diag[0] == '0')) {
       lr::android::StartCpuClockSampler();

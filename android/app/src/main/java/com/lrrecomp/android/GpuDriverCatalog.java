@@ -89,7 +89,8 @@ final class GpuDriverCatalog {
     /** Eden's sources and flags for Adreno, then the PanVK builds for Mali. */
     static final List<Source> SOURCES = Collections.unmodifiableList(Arrays.asList(
         new Source("Mr. Purple Turnip", "MrPurple666/purple-turnip", false, false),
-        new Source("GameHub Adreno 8xx", "crueter/GameHub-8Elite-Drivers", false, false),
+        // Eden's "GameHub Adreno 8xx" (crueter/GameHub-8Elite-Drivers) is left out, as in DS2: Qualcomm builds, which
+        // this game does not use on Adreno (GpuDriverStore: Turnip only), so a download installed and was never listed.
         new Source("KIMCHI Turnip", "K11MCH1/AdrenoToolsDrivers", true, true),
         new Source("Weab-Chan Freedreno", "Weab-chan/freedreno_turnip-CI", false, false),
         new Source("Whitebelyash Turnip", "whitebelyash/freedreno_turnip-CI", false, true),

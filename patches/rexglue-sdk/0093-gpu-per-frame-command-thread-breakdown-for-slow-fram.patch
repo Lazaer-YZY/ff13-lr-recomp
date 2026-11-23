@@ -1,7 +1,7 @@
 From bce197e896d8c496764b9dab2bc96f631632934a Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Tue, 10 Nov 2026 19:38:33 +0800
-Subject: [PATCH 093/116] gpu: per-frame command thread breakdown for slow
+Subject: [PATCH 093/117] gpu: per-frame command thread breakdown for slow
  frames (vulkan_slow_frame_ms)
 
 Every frame whose time between swaps exceeds vulkan_slow_frame_ms (default 30)

@@ -17,6 +17,7 @@ import android.util.TypedValue;
 import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
+import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.LinearLayout;
@@ -24,6 +25,7 @@ import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
 import android.widget.SeekBar;
+import android.widget.Spinner;
 import android.widget.TextView;
 
 /** Local touch controls layered over SDL's surface; physical pads stay in SDL. */
@@ -94,6 +96,7 @@ final class TouchControlsView extends View {
         ctrl.reset(now);
         ctrl.setEnabled(preferences.getBoolean("ctrl_auto_hide", true), now);
         ctrl.setHideAll(preferences.getBoolean("hide_all", false), now);
+        ctrl.setHideAfterStart(preferences.getBoolean("ctrl_hide_after_start", false), now);
         setClickable(true);
         setContentDescription("Touch controller settings");
     }
@@ -168,6 +171,15 @@ final class TouchControlsView extends View {
     void revealCtrl() {
         ctrl.activity(SystemClock.uptimeMillis());
         invalidate();
+    }
+
+    /** CTRL removed by "Removed 30 s after the game starts": Android Back opens Settings instead. */
+    boolean ctrlGone() { return ctrl.gone(SystemClock.uptimeMillis()); }
+
+    /** Android Back while CTRL is gone: the Settings dialog, unless it or the layout editor is already open. */
+    void openSettingsFromBack() {
+        if (settingsDialogOpen || editing) return;
+        showSettings();
     }
 
     private boolean controlsVisible() {
@@ -383,10 +395,12 @@ final class TouchControlsView extends View {
     }
 
     private void applySettings(boolean show, int sizePercent, int opacityPercent,
-                               boolean ctrlAutoHide, boolean hideAll) {
+                               boolean ctrlAutoHide, boolean hideAll, boolean ctrlHideAfterStart) {
         clearTouches();
         ctrl.setEnabled(ctrlAutoHide, SystemClock.uptimeMillis());
         ctrl.setHideAll(hideAll, SystemClock.uptimeMillis());
+        // Turned on now: the 30 s count from here (the game started long ago).
+        ctrl.setHideAfterStart(ctrlHideAfterStart, SystemClock.uptimeMillis());
         activity.updateSystemBarsBehavior();
         float size = sizePercent / 100f;
         if (!customLayout) layout = TouchControlLayout.defaults(
@@ -397,26 +411,18 @@ final class TouchControlsView extends View {
         preferences.edit().putFloat("size", layout.size)
             .putFloat("opacity", layout.opacity)
             .putBoolean("ctrl_auto_hide", ctrlAutoHide)
-            .putBoolean("hide_all", hideAll).apply();
+            .putBoolean("hide_all", hideAll)
+            .putBoolean("ctrl_hide_after_start", ctrlHideAfterStart).apply();
         setControlsEnabled(show);
     }
 
     /**
-     * A radio group of two or three choices added to {@code content}, under a section header
-     * ({@code header}) or a plain label; returns the first button (its group holds the others,
-     * see {@link #radioChoice}).
+     * A radio group of choices added to {@code content} under a bold label (none if {@code label} is null); returns
+     * the first button (its group holds the others, see {@link #radioChoice}).
      */
-    private RadioButton radio(LinearLayout content, String label, boolean header, String a, String b, String c,
-                              int checked) {
-        if (header) {
-            header(content, label);
-        } else {
-            TextView title = new TextView(content.getContext());
-            title.setText(label);
-            content.addView(title);
-        }
+    private RadioButton radio(LinearLayout content, String label, int checked, String... texts) {
+        if (label != null) header(content, label);
         RadioGroup group = new RadioGroup(content.getContext());
-        String[] texts = c != null ? new String[] { a, b, c } : new String[] { a, b };
         RadioButton first = null;
         for (int i = 0; i < texts.length; ++i) {
             RadioButton button = new RadioButton(content.getContext());
@@ -430,15 +436,94 @@ final class TouchControlsView extends View {
         return first;
     }
 
-    /** A bold section header of the settings dialog. */
+    /** A bold label over a group of choices inside a section of the settings dialog. */
     private void header(LinearLayout content, String text) {
         TextView view = new TextView(content.getContext());
         view.setText(text);
         view.setTypeface(Typeface.DEFAULT_BOLD);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         float density = getResources().getDisplayMetrics().density;
-        view.setPadding(0, Math.round(16f * density), 0, Math.round(2f * density));
+        view.setPadding(0, Math.round(10f * density), 0, Math.round(2f * density));
         content.addView(view);
+    }
+
+    /**
+     * A collapsible section of the settings dialog (as in the DS2 port's CTRL): a header row (closed: a right
+     * triangle, open: a down one) and the body its options go into, closed at first. Opening one closes the others
+     * and scrolls its header to the top.
+     */
+    private LinearLayout section(LinearLayout content, ScrollView scroll, java.util.List<TextView> headers,
+                                 java.util.List<LinearLayout> bodies, String title) {
+        Context context = content.getContext();
+        float density = getResources().getDisplayMetrics().density;
+        View divider = new View(context);
+        divider.setBackgroundColor(Color.argb(60, 128, 128, 128));
+        content.addView(divider, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT,
+                                                               Math.max(1, Math.round(density))));
+        TextView header = new TextView(context);
+        header.setTypeface(Typeface.DEFAULT_BOLD);
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 17);
+        header.setPadding(0, Math.round(14f * density), 0, Math.round(14f * density));
+        TypedValue ripple = new TypedValue();
+        if (context.getTheme().resolveAttribute(android.R.attr.selectableItemBackground, ripple, true)) {
+            header.setBackgroundResource(ripple.resourceId);
+        }
+        header.setTag(title);
+        header.setText("▸  " + title);
+        LinearLayout body = new LinearLayout(context);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(Math.round(8f * density), 0, 0, Math.round(10f * density));
+        body.setVisibility(GONE);
+        content.addView(header);
+        content.addView(body);
+        headers.add(header);
+        bodies.add(body);
+        header.setOnClickListener(v -> {
+            boolean open = body.getVisibility() != VISIBLE;
+            for (int i = 0; i < bodies.size(); ++i) {
+                bodies.get(i).setVisibility(GONE);
+                headers.get(i).setText("▸  " + headers.get(i).getTag());
+            }
+            if (!open) return;
+            body.setVisibility(VISIBLE);
+            header.setText("▾  " + title);
+            // Once the closed sections above have shrunk: the opened header at the top of the dialog.
+            header.getViewTreeObserver().addOnGlobalLayoutListener(
+                new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                    @Override public void onGlobalLayout() {
+                        header.getViewTreeObserver().removeOnGlobalLayoutListener(this);
+                        scroll.smoothScrollTo(0, header.getTop());
+                    }
+                });
+        });
+        return body;
+    }
+
+    /** A part of a section that opens and closes on its own (closed at first); returns its body. */
+    private LinearLayout subsection(LinearLayout content, String title) {
+        Context context = content.getContext();
+        float density = getResources().getDisplayMetrics().density;
+        TextView header = new TextView(context);
+        header.setTypeface(Typeface.DEFAULT_BOLD);
+        header.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        header.setPadding(0, Math.round(12f * density), 0, Math.round(12f * density));
+        TypedValue ripple = new TypedValue();
+        if (context.getTheme().resolveAttribute(android.R.attr.selectableItemBackground, ripple, true)) {
+            header.setBackgroundResource(ripple.resourceId);
+        }
+        header.setText("▸  " + title);
+        LinearLayout body = new LinearLayout(context);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setPadding(Math.round(8f * density), 0, 0, 0);
+        body.setVisibility(GONE);
+        content.addView(header);
+        content.addView(body);
+        header.setOnClickListener(v -> {
+            boolean open = body.getVisibility() != VISIBLE;
+            body.setVisibility(open ? VISIBLE : GONE);
+            header.setText((open ? "▾  " : "▸  ") + title);
+        });
+        return body;
     }
 
     /** A short grey line under an option, indented to the option's text. */
@@ -481,30 +566,71 @@ final class TouchControlsView extends View {
         return 0;
     }
 
+    /** A dropdown of {@code texts} added to {@code content}, {@code selected} chosen. */
+    private Spinner spinner(LinearLayout content, int selected, String... texts) {
+        Spinner spinner = new Spinner(content.getContext());
+        ArrayAdapter<String> adapter =
+            new ArrayAdapter<>(content.getContext(), android.R.layout.simple_spinner_item, texts);
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        spinner.setAdapter(adapter);
+        spinner.setSelection(Math.max(0, Math.min(selected, texts.length - 1)));
+        content.addView(spinner);
+        return spinner;
+    }
+
+    /** True on a screen wider than 16:9 (where "Stretch to fill wide screens" does something). */
+    private boolean wideScreen() {
+        int w = Math.max(getWidth(), getHeight()), h = Math.min(getWidth(), getHeight());
+        return h > 0 && (float) w / h > 16f / 9f + 0.01f;
+    }
+
     private void showSettings() {
         clearTouches();
         Context strings = activity;
+        float density = getResources().getDisplayMetrics().density;
         LinearLayout content = new LinearLayout(activity);
         content.setOrientation(LinearLayout.VERTICAL);
-        int padding = Math.round(20f * getResources().getDisplayMetrics().density);
+        int padding = Math.round(20f * density);
         content.setPadding(padding, 0, padding, 0);
+        // The same dialog as the DS2 port's CTRL (the owner, 2026-11-23: "The two menus should look and feel very
+        // similar"): collapsible sections, all closed when the dialog opens, one open at a time, the footnote on top,
+        // Exit at the top right; the options differ where the games do.
+        ScrollView scroll = new ScrollView(activity);
+        java.util.List<TextView> sectionHeaders = new java.util.ArrayList<>();
+        java.util.List<LinearLayout> sectionBodies = new java.util.ArrayList<>();
+        TextView nextStart = hint(content, strings.getString(R.string.touch_next_start_note));
+        nextStart.setPadding(0, Math.round(4f * density), 0, Math.round(8f * density));
+        LinearLayout touchSec = section(content, scroll, sectionHeaders, sectionBodies,
+            strings.getString(R.string.touch_section_controls));
+        LinearLayout rateSec = section(content, scroll, sectionHeaders, sectionBodies,
+            strings.getString(R.string.touch_section_performance));
+        LinearLayout imageSec = section(content, scroll, sectionHeaders, sectionBodies,
+            strings.getString(R.string.touch_section_image));
+        LinearLayout screenSec = !CompanionScreen.available(activity) ? null : section(content, scroll,
+            sectionHeaders, sectionBodies, strings.getString(R.string.touch_section_second_screen));
+        LinearLayout gameSec = section(content, scroll, sectionHeaders, sectionBodies,
+            strings.getString(R.string.touch_section_game));
+        LinearLayout toolsSec = section(content, scroll, sectionHeaders, sectionBodies,
+            strings.getString(R.string.touch_section_troubleshooting));
+        SharedPreferences render = RuntimeActivity.renderPrefs(activity);
 
-        // Sections with short labels, a grey line under the options that need one, and one footnote
-        // for the options read at start (the owner, 2026-11-21: "a bit verbose ... like in the ds2 project").
-        header(content, strings.getString(R.string.touch_section_controls));
+        // --- Controls: the on-screen controls, their layout editor, size and opacity, the CTRL button.
+        header(touchSec, strings.getString(R.string.touch_group_on_screen));
         CheckBox toggle = new CheckBox(activity);
         toggle.setText(strings.getString(R.string.touch_show_controls));
-        toggle.setChecked(visibility.visible());
+        // The old "Hide all touch controls" also hid the gamepad: shown unticked so Apply keeps it hidden.
+        toggle.setChecked(visibility.visible() && !ctrl.hideAll());
         settingsChoiceEdited = false;
         toggle.setOnCheckedChangeListener((button, checked) -> {
             if (!syncingSettingsToggle) settingsChoiceEdited = true;
         });
-        content.addView(toggle);
-        TextView hint = hint(content, strings.getString(R.string.touch_controller_hint));
+        touchSec.addView(toggle);
+        TextView hint = hint(touchSec, strings.getString(R.string.touch_controller_hint));
         hint.setVisibility(visibility.controllerPresent() ? VISIBLE : GONE);
         settingsToggle = toggle;
         controllerHint = hint;
-
+        // The layout editor here rather than as a dialog button, so it is clear it moves the touch controls.
+        Button editLayoutButton = pageButton(touchSec, strings.getString(R.string.touch_edit_layout));
         TextView sizeLabel = new TextView(activity);
         SeekBar size = new SeekBar(activity);
         size.setMax(80);
@@ -512,9 +638,8 @@ final class TouchControlsView extends View {
         sizeLabel.setText(strings.getString(R.string.touch_control_size, size.getProgress() + 60));
         size.setOnSeekBarChangeListener(seekListener(value ->
             sizeLabel.setText(strings.getString(R.string.touch_control_size, value + 60))));
-        content.addView(sizeLabel);
-        content.addView(size);
-
+        touchSec.addView(sizeLabel);
+        touchSec.addView(size);
         TextView opacityLabel = new TextView(activity);
         SeekBar opacity = new SeekBar(activity);
         opacity.setMax(75);
@@ -522,117 +647,144 @@ final class TouchControlsView extends View {
         opacityLabel.setText(strings.getString(R.string.touch_opacity, opacity.getProgress() + 25));
         opacity.setOnSeekBarChangeListener(seekListener(value ->
             opacityLabel.setText(strings.getString(R.string.touch_opacity, value + 25))));
-        content.addView(opacityLabel);
-        content.addView(opacity);
+        touchSec.addView(opacityLabel);
+        touchSec.addView(opacity);
+        // The CTRL button, one choice (TouchCtrlHandle): always shown, auto-hidden to a tab (the default), or removed
+        // 30 s after the start with Android Back opening Settings (RuntimeActivity). The old "Hide all touch
+        // controls" shows as removed.
+        RadioButton ctrlChoice = radio(touchSec, strings.getString(R.string.touch_ctrl_button),
+            ctrl.hideAfterStart() || ctrl.hideAll() ? 2 : ctrl.enabled() ? 1 : 0,
+            strings.getString(R.string.touch_ctrl_always), strings.getString(R.string.touch_ctrl_tab),
+            strings.getString(R.string.touch_ctrl_removed));
 
-        CheckBox ctrlAutoHide = new CheckBox(activity);
-        ctrlAutoHide.setText(strings.getString(R.string.touch_ctrl_auto_hide));
-        ctrlAutoHide.setChecked(ctrl.enabled());
-        content.addView(ctrlAutoHide);
-
-        CheckBox hideAll = option(content, strings.getString(R.string.touch_hide_all),
-            strings.getString(R.string.touch_hide_all_help), ctrl.hideAll());
-
-        // Frame rate: 30 and 60 apply at once; 40 (120 Hz panel mode) and the smoother 60 at the next start.
-        SharedPreferences render = RuntimeActivity.renderPrefs(activity);
+        // --- Frame rate and performance: 30 / 40 / 60 / 60 on the 120 Hz panel in one list, then the overlay.
+        // 30 and 60 apply at once; 40 and the smoother 60 need the panel mode, set at the next start.
         String fps = render.getString("fps", RuntimeActivity.DEFAULT_FPS);
-        RadioButton fps30 = radio(content, strings.getString(R.string.touch_frame_rate), true,
+        boolean sixty = "60g".equals(fps) || "60".equals(fps);
+        RadioButton fpsChoice = radio(rateSec, strings.getString(R.string.touch_frame_rate),
+            "40".equals(fps) ? 1 : sixty ? (render.getBoolean("panel120", false) ? 3 : 2) : 0,
             strings.getString(R.string.touch_fps_30), strings.getString(R.string.touch_fps_40),
-            strings.getString(R.string.touch_fps_60), "40".equals(fps) ? 1 : "60g".equals(fps) ? 2 : 0);
-        hint(content, strings.getString(R.string.touch_fps_help));
-        CheckBox panel120 = option(content, strings.getString(R.string.touch_panel120),
-            strings.getString(R.string.touch_panel120_help), render.getBoolean("panel120", false));
-        CheckBox perfOverlay = option(content, strings.getString(R.string.touch_perf_overlay),
+            strings.getString(R.string.touch_fps_60), strings.getString(R.string.touch_fps_60_smooth));
+        hint(rateSec, strings.getString(R.string.touch_fps_help));
+        CheckBox perfOverlay = option(rateSec, strings.getString(R.string.touch_perf_overlay),
             strings.getString(R.string.touch_perf_overlay_help), render.getBoolean("overlay", false));
 
-        // Image: anti-aliasing applies at once, the upscaler at the next start.
-        header(content, strings.getString(R.string.touch_section_image));
-        RadioButton aaOff = radio(content, strings.getString(R.string.touch_aa), false,
-            strings.getString(R.string.touch_aa_off), strings.getString(R.string.touch_aa_fxaa), null,
-            "fxaa".equals(render.getString("aa", "off")) ? 1 : 0);
-        String upscale = render.getString("upscale", "bilinear");
-        RadioButton upBilinear = radio(content, strings.getString(R.string.touch_upscale), false,
+        // --- Image: anti-aliasing at once; the upscaler and stretching from the next start.
+        header(imageSec, strings.getString(R.string.touch_aa));
+        Spinner aaChoice = spinner(imageSec, "fxaa".equals(render.getString("aa", "off")) ? 1 : 0,
+            strings.getString(R.string.touch_aa_off), strings.getString(R.string.touch_aa_fxaa));
+        final String[] upscales = { "bilinear", "fsr", "cas" };
+        header(imageSec, strings.getString(R.string.touch_upscale));
+        Spinner upscaleChoice = spinner(imageSec,
+            java.util.Arrays.asList(upscales).indexOf(render.getString("upscale", "bilinear")),
             strings.getString(R.string.touch_upscale_bilinear), strings.getString(R.string.touch_upscale_fsr),
-            strings.getString(R.string.touch_upscale_cas), "fsr".equals(upscale) ? 1 : "cas".equals(upscale) ? 2 : 0);
-        // Public issue #6: the presenter's letterbox off, so the 16:9 picture fills a wider phone screen.
-        CheckBox stretch = option(content, strings.getString(R.string.touch_stretch),
+            strings.getString(R.string.touch_upscale_cas));
+        // Public issue #6: the presenter's letterbox off, so the 16:9 picture fills a wider phone screen. Greyed out
+        // and unticked on 16:9 screens, as DS2's Fill screen.
+        CheckBox stretch = option(imageSec, strings.getString(R.string.touch_stretch),
             strings.getString(R.string.touch_stretch_help), render.getBoolean(GpuCompat.KEY_STRETCH, false));
-
-        // Second screen (dual-screen devices only): schemata in battle, map in the field, fan art otherwise.
-        CheckBox companion = null;
-        if (CompanionScreen.available(activity)) {
-            header(content, strings.getString(R.string.touch_section_second_screen));
-            companion = option(content, strings.getString(R.string.touch_companion),
-                strings.getString(R.string.touch_companion_help), CompanionScreen.enabled(render));
+        if (!wideScreen()) {
+            stretch.setText(strings.getString(R.string.touch_stretch) + " " + strings.getString(R.string.touch_stretch_na));
+            stretch.setChecked(false);
+            stretch.setEnabled(false);
         }
+
+        // --- Second screen (dual-screen devices only): schemata in battle, map in the field, fan art otherwise.
+        CheckBox companion = screenSec == null ? null : option(screenSec, strings.getString(R.string.touch_companion),
+            strings.getString(R.string.touch_companion_help), CompanionScreen.enabled(render));
         final CheckBox companionBox = companion;
 
-        // Cheats (public issue #1): one switch per cheat, applied at once (Cheats.java).
-        header(content, strings.getString(R.string.touch_section_cheats));
+        // --- Game: the game folder, then the cheats (public issue #1): one switch each, applied at once (Cheats.java).
+        Button folderButton = pageButton(gameSec, strings.getString(R.string.touch_game_folder));
+        header(gameSec, strings.getString(R.string.touch_section_cheats));
         int cheatBits = Cheats.saved(render);
         CheckBox[] cheatBoxes = new CheckBox[Cheats.ALL.length];
         for (int i = 0; i < Cheats.ALL.length; ++i)
-            cheatBoxes[i] = option(content, strings.getString(Cheats.ALL[i].label), null,
+            cheatBoxes[i] = option(gameSec, strings.getString(Cheats.ALL[i].label), null,
                 (cheatBits & Cheats.ALL[i].bit) != 0);
-        hint(content, strings.getString(R.string.touch_cheats_help));
+        hint(gameSec, strings.getString(R.string.touch_cheats_help));
 
-        // Troubleshooting. Diagnostics (the owner, 2026-11-11: off for regular play): read at start.
-        header(content, strings.getString(R.string.touch_section_troubleshooting));
-        CheckBox debugLog = option(content, strings.getString(R.string.touch_debug_log),
-            strings.getString(R.string.touch_debug_log_help),
-            render.getBoolean("debug_log", RuntimeActivity.DEFAULT_DEBUG_LOG));
-        // Xenos multiply emulation (0 x anything = 0) in the translated shaders: off by default since
-        // 2026-11-11 (-12% GPU in Luxerion, no visible difference seen); the fallback if a scene glitches.
-        CheckBox exactMath = option(content, strings.getString(R.string.touch_exact_shader_math),
-            strings.getString(R.string.touch_exact_shader_math_help), render.getBoolean("exact_shader_math", false));
+        // --- Troubleshooting: the GPU driver page, debug logging, the log zip, then Advanced.
         // Qualcomm and Mali devices: open the GPU driver page (download / switch Turnip or PanVK).
         Button driverButton = null;
         if (GpuDriverStore.supported()) {
             GpuDriverStore.Installed driver = GpuDriverStore.selectedDriver(activity);
-            driverButton = pageButton(content, strings.getString(R.string.touch_gpu_driver,
+            driverButton = pageButton(toolsSec, strings.getString(R.string.touch_gpu_driver,
                 driver != null ? driver.metadata.name : strings.getString(R.string.touch_gpu_driver_system)));
         }
-        Button folderButton = pageButton(content, strings.getString(R.string.touch_game_folder));
+        // Diagnostics (the owner, 2026-11-11: off for regular play): read at start.
+        CheckBox debugLog = option(toolsSec, strings.getString(R.string.touch_debug_log),
+            strings.getString(R.string.touch_debug_log_help),
+            render.getBoolean("debug_log", RuntimeActivity.DEFAULT_DEBUG_LOG));
         // A zip of lr.log through the system file picker, so a player can attach it to a bug report
         // from the phone (Android 11+ hides Android/data from file managers; public issue #4).
-        Button logsButton = pageButton(content, strings.getString(R.string.touch_save_logs));
-
+        Button logsButton = pageButton(toolsSec, strings.getString(R.string.touch_save_logs));
+        // Advanced, closed until tapped: the exact shader math and the GPU compatibility (testing) switches, in every
+        // build since the Adreno 6xx fix (v1.2.3), as in DS2.
+        LinearLayout advanced = subsection(toolsSec, strings.getString(R.string.touch_advanced));
+        // Xenos multiply emulation (0 x anything = 0) in the translated shaders: off by default since
+        // 2026-11-11 (-12% GPU in Luxerion, no visible difference seen); the fallback if a scene glitches.
+        CheckBox exactMath = option(advanced, strings.getString(R.string.touch_exact_shader_math),
+            strings.getString(R.string.touch_exact_shader_math_help), render.getBoolean("exact_shader_math", false));
         // GPU compatibility (testing; public issue #4, Adreno 600 series): renderer paths to switch off
-        // one at a time, read at the next start (GpuCompat). Dev builds only for now: #4 waits for the
-        // DS2 port's Adreno 600 result (the owner, 2026-11-21); public builds keep the defaults.
-        LinearLayout compat = new LinearLayout(activity);
-        compat.setOrientation(LinearLayout.VERTICAL);
-        if (!BuildConfig.PUBLIC_DEFAULTS) content.addView(compat);
-        header(compat, strings.getString(R.string.touch_section_compat));
-        hint(compat, strings.getString(R.string.touch_compat_help)).setPadding(0, 0, 0, padding / 4);
-        CheckBox compatShortcuts = option(compat, strings.getString(R.string.touch_compat_shortcuts),
+        // one at a time, read at the next start (GpuCompat).
+        header(advanced, strings.getString(R.string.touch_section_compat));
+        hint(advanced, strings.getString(R.string.touch_compat_help)).setPadding(0, 0, 0, Math.round(4f * density));
+        CheckBox compatShortcuts = option(advanced, strings.getString(R.string.touch_compat_shortcuts),
             strings.getString(R.string.touch_compat_shortcuts_help), render.getBoolean(GpuCompat.KEY_SHORTCUTS, false));
-        CheckBox compatShaders = option(compat, strings.getString(R.string.touch_compat_shaders),
+        CheckBox compatShaders = option(advanced, strings.getString(R.string.touch_compat_shaders),
             strings.getString(R.string.touch_compat_shaders_help), render.getBoolean(GpuCompat.KEY_SHADERS, false));
-        CheckBox compatGpl = option(compat, strings.getString(R.string.touch_compat_gpl),
+        CheckBox compatGpl = option(advanced, strings.getString(R.string.touch_compat_gpl),
             strings.getString(R.string.touch_compat_gpl_help), render.getBoolean(GpuCompat.KEY_GPL, false));
-        CheckBox compatDynamic = option(compat, strings.getString(R.string.touch_compat_dynrender),
+        CheckBox compatDynamic = option(advanced, strings.getString(R.string.touch_compat_dynrender),
             strings.getString(R.string.touch_compat_dynrender_help),
             render.getBoolean(GpuCompat.KEY_DYNAMIC_RENDERING, false));
-        String turnipMode = render.getString(GpuCompat.KEY_TURNIP_MODE, GpuCompat.MODE_AUTO);
-        RadioButton turnipAuto = radio(compat, strings.getString(R.string.touch_compat_tu_mode), false,
-            strings.getString(R.string.touch_compat_tu_auto), strings.getString(R.string.touch_compat_tu_sysmem),
-            strings.getString(R.string.touch_compat_tu_gmem),
-            GpuCompat.MODE_SYSMEM.equals(turnipMode) ? 1 : GpuCompat.MODE_GMEM.equals(turnipMode) ? 2 : 0);
-        CheckBox compatNoUbwc = option(compat, strings.getString(R.string.touch_compat_tu_noubwc), null,
-            render.getBoolean(GpuCompat.KEY_TURNIP_NO_UBWC, false));
-        TextView nextStart = hint(content, strings.getString(R.string.touch_next_start_note));
-        nextStart.setPadding(0, padding / 2, 0, padding / 2);
+        // Turnip's own switches only where Turnip runs (Adreno); elsewhere the stored values stay as they are.
+        boolean turnip = GpuDriverStore.vendor() == GpuDriverStore.Vendor.ADRENO;
+        RadioButton turnipChoice = null;
+        CheckBox noUbwc = null;
+        if (turnip) {
+            String turnipMode = render.getString(GpuCompat.KEY_TURNIP_MODE, GpuCompat.MODE_AUTO);
+            turnipChoice = radio(advanced, strings.getString(R.string.touch_compat_tu_mode),
+                GpuCompat.MODE_SYSMEM.equals(turnipMode) ? 1 : GpuCompat.MODE_GMEM.equals(turnipMode) ? 2 : 0,
+                strings.getString(R.string.touch_compat_tu_auto), strings.getString(R.string.touch_compat_tu_sysmem),
+                strings.getString(R.string.touch_compat_tu_gmem));
+            noUbwc = option(advanced, strings.getString(R.string.touch_compat_tu_noubwc), null,
+                render.getBoolean(GpuCompat.KEY_TURNIP_NO_UBWC, false));
+        }
+        final RadioButton turnipMode = turnipChoice;
+        final CheckBox compatNoUbwc = noUbwc;
 
-        ScrollView scroll = new ScrollView(activity);
         scroll.addView(content);
+        // The title row with Exit at its right, as in DS2.
+        LinearLayout titleRow = new LinearLayout(activity);
+        titleRow.setOrientation(LinearLayout.HORIZONTAL);
+        titleRow.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        titleRow.setPadding(Math.round(24f * density), Math.round(18f * density), Math.round(12f * density), 0);
+        TextView titleText = new TextView(activity);
+        titleText.setTextAppearance(android.R.style.TextAppearance_DeviceDefault_DialogWindowTitle);
+        titleText.setText(strings.getString(R.string.touch_settings_title));
+        titleRow.addView(titleText, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        Button exitButton = new Button(activity, null, android.R.attr.borderlessButtonStyle);
+        exitButton.setText(strings.getString(R.string.exit_game));
+        exitButton.setAllCaps(false);
+        exitButton.setTextColor(Color.rgb(255, 140, 120));
+        titleRow.addView(exitButton, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT,
+                                                                   LinearLayout.LayoutParams.WRAP_CONTENT));
+        Runnable applyTouch = () -> {
+            int ctrlMode = radioChoice(ctrlChoice);
+            applySettings(toggle.isChecked(), size.getProgress() + 60, opacity.getProgress() + 25,
+                          ctrlMode != 0, false, ctrlMode == 2);
+        };
         AlertDialog settingsDialog = new AlertDialog.Builder(activity)
-            .setTitle(strings.getString(R.string.touch_settings_title))
+            .setCustomTitle(titleRow)
             .setView(scroll)
             .setPositiveButton(strings.getString(R.string.touch_apply), (dialog, which) -> {
-                applySettings(toggle.isChecked(), size.getProgress() + 60,
-                              opacity.getProgress() + 25, ctrlAutoHide.isChecked(), hideAll.isChecked());
-                RuntimeActivity.renderPrefs(activity).edit().putBoolean("panel120", panel120.isChecked())
+                applyTouch.run();
+                SharedPreferences prefs = RuntimeActivity.renderPrefs(activity);
+                final String nextStartBefore = RuntimeActivity.nextStartState(prefs);
+                int rate = radioChoice(fpsChoice);
+                prefs.edit().putBoolean("panel120", rate == 3)
                     .putBoolean("debug_log", debugLog.isChecked())
                     .putBoolean("exact_shader_math", exactMath.isChecked())
                     .putBoolean(GpuCompat.KEY_STRETCH, stretch.isChecked())
@@ -640,23 +792,23 @@ final class TouchControlsView extends View {
                     .putBoolean(GpuCompat.KEY_SHADERS, compatShaders.isChecked())
                     .putBoolean(GpuCompat.KEY_GPL, compatGpl.isChecked())
                     .putBoolean(GpuCompat.KEY_DYNAMIC_RENDERING, compatDynamic.isChecked())
-                    .putString(GpuCompat.KEY_TURNIP_MODE, radioChoice(turnipAuto) == 1 ? GpuCompat.MODE_SYSMEM
-                        : radioChoice(turnipAuto) == 2 ? GpuCompat.MODE_GMEM : GpuCompat.MODE_AUTO)
-                    .putBoolean(GpuCompat.KEY_TURNIP_NO_UBWC, compatNoUbwc.isChecked()).apply();
-                activity.applyRenderSettings(radioChoice(fps30) == 1 ? "40" : radioChoice(fps30) == 2 ? "60g" : "30",
-                    radioChoice(aaOff) == 1 ? "fxaa" : "off",
-                    radioChoice(upBilinear) == 1 ? "fsr" : radioChoice(upBilinear) == 2 ? "cas" : "bilinear",
-                    perfOverlay.isChecked());
+                    .putString(GpuCompat.KEY_TURNIP_MODE, turnipMode == null
+                        ? render.getString(GpuCompat.KEY_TURNIP_MODE, GpuCompat.MODE_AUTO)
+                        : radioChoice(turnipMode) == 1 ? GpuCompat.MODE_SYSMEM
+                        : radioChoice(turnipMode) == 2 ? GpuCompat.MODE_GMEM : GpuCompat.MODE_AUTO)
+                    .putBoolean(GpuCompat.KEY_TURNIP_NO_UBWC, compatNoUbwc == null
+                        ? render.getBoolean(GpuCompat.KEY_TURNIP_NO_UBWC, false) : compatNoUbwc.isChecked())
+                    .commit();  // on disk before a restart below
+                activity.applyRenderSettings(rate == 1 ? "40" : rate >= 2 ? "60g" : "30",
+                    aaChoice.getSelectedItemPosition() == 1 ? "fxaa" : "off",
+                    upscales[upscaleChoice.getSelectedItemPosition()], perfOverlay.isChecked());
                 if (companionBox != null) activity.applyCompanionSetting(companionBox.isChecked());
                 int cheats = 0;
                 for (int i = 0; i < cheatBoxes.length; ++i)
                     cheats = Cheats.with(cheats, Cheats.ALL[i].bit, cheatBoxes[i].isChecked());
                 activity.applyCheats(cheats);
-            })
-            .setNeutralButton(strings.getString(R.string.touch_edit_layout), (dialog, which) -> {
-                applySettings(toggle.isChecked(), size.getProgress() + 60,
-                              opacity.getProgress() + 25, ctrlAutoHide.isChecked(), hideAll.isChecked());
-                enterEditor();
+                if (!nextStartBefore.equals(RuntimeActivity.nextStartState(RuntimeActivity.renderPrefs(activity))))
+                    activity.offerRestart();
             })
             .setNegativeButton(strings.getString(R.string.touch_cancel), null)
             .create();
@@ -680,6 +832,16 @@ final class TouchControlsView extends View {
         logsButton.setOnClickListener(v -> {
             settingsDialog.dismiss();
             activity.startLogExport();
+        });
+        // As the old dialog button did: the touch settings applied (so the editor shows them), then the editor.
+        editLayoutButton.setOnClickListener(v -> {
+            applyTouch.run();
+            enterEditor();
+            settingsDialog.dismiss();
+        });
+        exitButton.setOnClickListener(v -> {
+            settingsDialog.dismiss();
+            activity.confirmExit();
         });
         settingsDialogOpen = true;
         syncCtrlPin();

@@ -1,7 +1,7 @@
 From c0c2f28e97bbdee1d5a8a81d1a81e6c2091303ab Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Wed, 11 Nov 2026 15:17:07 +0800
-Subject: [PATCH 101/116] gpu: vertex texture sign specialization
+Subject: [PATCH 101/117] gpu: vertex texture sign specialization
  (spirv_vertex_texture_sign_specialization, off: no measured gain)
 
 

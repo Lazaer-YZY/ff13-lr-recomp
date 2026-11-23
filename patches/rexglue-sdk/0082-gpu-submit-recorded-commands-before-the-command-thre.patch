@@ -1,7 +1,7 @@
 From 88ea82f884f1a3d05beae1564c2f4972455787cf Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 12:55:18 +0800
-Subject: [PATCH 082/116] gpu: submit recorded commands before the command
+Subject: [PATCH 082/117] gpu: submit recorded commands before the command
  thread waits; WAIT_REG_MEM and fence-wait stats
 
 VulkanCommandProcessor::PrepareForWait was a no-op, so when the command stream

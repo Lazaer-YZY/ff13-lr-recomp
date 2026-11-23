@@ -1,7 +1,7 @@
 From 55ad2724680b9dc206049d4c948c7d52d3266140 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 18:28:27 +0800
-Subject: [PATCH 088/116] gpu: spirv_debug_texture_signs_unsigned (diagnostic
+Subject: [PATCH 088/117] gpu: spirv_debug_texture_signs_unsigned (diagnostic
  ceiling for texture sign specialization)
 
 Every texture fetch translated as unsigned (no sign or gamma handling; wrong colours).

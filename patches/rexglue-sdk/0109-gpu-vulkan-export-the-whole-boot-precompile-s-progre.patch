@@ -1,7 +1,7 @@
 From 590cc8a6dc5d20a2661734df722f64a7d5263ac5 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 16 Nov 2026 19:56:40 +0800
-Subject: [PATCH 109/116] gpu/vulkan: export the whole boot precompile's
+Subject: [PATCH 109/117] gpu/vulkan: export the whole boot precompile's
  progress (rex_precompile_all_permille) for the app's background indicator
 
 

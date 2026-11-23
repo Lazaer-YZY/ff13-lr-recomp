@@ -1,7 +1,7 @@
 From 8b1d6b6b1375d67a0077974b5c7c79d75944a605 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 23:31:34 +0800
-Subject: [PATCH 070/116] gpu: shader cache self-repair, live FXAA switch for
+Subject: [PATCH 070/117] gpu: shader cache self-repair, live FXAA switch for
  the game's settings, compile threads off the game's cores, safer transfer
  skips
 

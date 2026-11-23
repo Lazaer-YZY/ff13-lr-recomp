@@ -1,7 +1,7 @@
 From 20b530d80a6a5c7f9aea1b931fc0a3814f815489 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 19:25:55 +0800
-Subject: [PATCH 068/116] gpu: resolve feed for depth (k_24_8) and k_32_FLOAT
+Subject: [PATCH 068/117] gpu: resolve feed for depth (k_24_8) and k_32_FLOAT
  textures, lower texture parts, per-format registry
 
 - Feed pipelines for R32_SFLOAT targets: k_32_FLOAT render targets read

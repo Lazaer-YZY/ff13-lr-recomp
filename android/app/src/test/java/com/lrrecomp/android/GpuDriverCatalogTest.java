@@ -31,6 +31,32 @@ public class GpuDriverCatalogTest {
         assertEquals(0, GpuDriverCatalog.adrenoModel(null));
     }
 
+    /** Turnip runs in sysmem on the 710/720/722 (driver notes) and on Adreno 8xx (the DS2 port's S25 GPU hangs). */
+    @Test
+    public void turnipSysmemModels() {
+        GpuDriverStore.Metadata turnip = new GpuDriverStore.Metadata("Stable Turnip v2", "", "", "Mesa", "", 28,
+            "vulkan.ad07XX.so");
+        GpuDriverStore.Metadata panvk = new GpuDriverStore.Metadata("PanVK-kbase", "", "", "Mesa", "", 28,
+            "libvulkan_panfrost.so", "", "", GpuDriverStore.BACKEND_PANVK);
+        for (String model : new String[] {"Adreno (TM) 710", "Adreno (TM) 722", "Adreno (TM) 825",
+                                          "Adreno830v2", "Adreno (TM) 899"}) {
+            assertTrue(model, GpuDriverStore.needsTurnipSysmem(model, turnip));
+        }
+        for (String model : new String[] {"Adreno (TM) 650", "Adreno (TM) 740", "Adreno750v2", "Adreno (TM) 900",
+                                          "Mali-G715", null}) {
+            assertFalse(String.valueOf(model), GpuDriverStore.needsTurnipSysmem(model, turnip));
+        }
+        assertFalse(GpuDriverStore.needsTurnipSysmem("Adreno (TM) 830", panvk));
+    }
+
+    /** Qualcomm (GameHub) packages are not offered for download: Adreno runs on Turnip only. */
+    @Test
+    public void noQualcommSource() {
+        for (GpuDriverCatalog.Source source : GpuDriverCatalog.SOURCES) {
+            assertFalse(source.path, source.path.contains("GameHub"));
+        }
+    }
+
     @Test
     public void introductionRecommendsTheBundledDriverOnEveryModel() {
         String[] models = {"Adreno (TM) 618", "Adreno (TM) 650", "Adreno (TM) 660", "Adreno (TM) 710",

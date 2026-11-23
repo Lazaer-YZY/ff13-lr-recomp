@@ -138,9 +138,11 @@ void ClearTouchSnapshot() {
 
 namespace {
 std::string g_pinned_cores_note;
+uint64_t g_pinned_cores_mask = 0;
 }
 
 const std::string& PinnedCoresNote() { return g_pinned_cores_note; }
+uint64_t PinnedCoresMask() { return g_pinned_cores_mask; }
 
 // On the Thor (Snapdragon 8 Gen 2: cpus 0-2 Cortex-A510, 3-6 A715/A710, 7 X3) the game's
 // worker threads were often scheduled on the little cores, which stretched the jobs the main
@@ -220,6 +222,11 @@ std::string PinThreadsToFastCores() {
     note = "all cores (sched_setaffinity failed: " + std::string(std::strerror(errno)) + ")";
   } else {
     note = "cpus " + cpus + (want.empty() ? " (middle cluster, not the prime core)" : " (LR_AFFINITY)");
+    // For the affinity keeper (lr_affinity.cpp): a cpuset change resets every thread's mask.
+    g_pinned_cores_mask = 0;
+    for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; ++cpu) {
+      if (CPU_ISSET(cpu, &set)) g_pinned_cores_mask |= uint64_t(1) << cpu;
+    }
   }
   __android_log_print(ANDROID_LOG_INFO, "lrrecomp", "game threads on %s", note.c_str());
   return note;
@@ -567,9 +574,11 @@ Java_com_lrrecomp_android_RuntimeActivity_nativeCompanionPinLittleCores(JNIEnv* 
   CPU_ZERO(&set);
   std::string cpus;
   int picked = 0;
+  uint64_t bits = 0;
   for (int i = 0; i < n; ++i) {
     if (freq[i] != lowest) continue;
     CPU_SET(i, &set);
+    bits |= uint64_t(1) << i;
     cpus += (cpus.empty() ? "" : ",") + std::to_string(i);
     ++picked;
   }
@@ -580,6 +589,7 @@ Java_com_lrrecomp_android_RuntimeActivity_nativeCompanionPinLittleCores(JNIEnv* 
     result = "not pinned (sched_setaffinity: " + std::string(std::strerror(errno)) + ")";
   } else {
     result = "pinned to cpu " + cpus + " (" + std::to_string(lowest / 1000) + " MHz cores)";
+    lr::android::NoteThreadMask(int(gettid()), bits);  // back here after a cpuset change (lr_affinity.cpp)
   }
   return env->NewStringUTF(result.c_str());
 }
@@ -731,6 +741,7 @@ void LrPlaceAuxThreads() {
   }();
   if (!enabled) return;
   static cpu_set_t little;
+  static uint64_t little_bits = 0;
   static bool little_ready = false;
   if (!little_ready) {
     CPU_ZERO(&little);
@@ -749,7 +760,9 @@ void LrPlaceAuxThreads() {
     if (max_khz.empty()) return;
     slowest = *std::min_element(max_khz.begin(), max_khz.end());
     for (size_t cpu = 0; cpu < max_khz.size(); ++cpu) {
-      if (max_khz[cpu] == slowest) CPU_SET(int(cpu), &little);
+      if (max_khz[cpu] != slowest) continue;
+      CPU_SET(int(cpu), &little);
+      if (cpu < 64) little_bits |= uint64_t(1) << cpu;
     }
     little_ready = true;
   }
@@ -776,6 +789,7 @@ void LrPlaceAuxThreads() {
     for (const char* prefix : kAux) aux |= strncmp(comm, prefix, strlen(prefix)) == 0;
     if (!aux) continue;
     if (sched_setaffinity(tid, sizeof(little), &little) == 0) {
+      lr::android::NoteThreadMask(tid, little_bits);
       moved.push_back(tid);
       ++count;
       names += std::string(names.empty() ? "" : ", ") + comm;
@@ -824,9 +838,11 @@ void LrPlaceMainOnPrime() {
   cpu_set_t prime;
   CPU_ZERO(&prime);
   std::string cpus;
+  uint64_t prime_bits = 0;
   for (size_t cpu = 0; cpu < max_khz.size(); ++cpu) {
     if (mode == 1 ? max_khz[cpu] == fastest : (max_khz[cpu] > slowest || slowest == fastest)) {
       CPU_SET(int(cpu), &prime);
+      if (cpu < 64) prime_bits |= uint64_t(1) << cpu;
       cpus += (cpus.empty() ? "" : ",") + std::to_string(cpu);
     }
   }
@@ -861,6 +877,8 @@ void LrPlaceMainOnPrime() {
   }
   closedir(dir);
   if (best_tid && sched_setaffinity(best_tid, sizeof(prime), &prime) == 0) {
+    // The affinity keeper (lr_affinity.cpp) restores this mask, not the startup one, after a cpuset change.
+    lr::android::NoteThreadMask(best_tid, prime_bits);
     done = true;
     REXLOG_INFO("LR threads: guest main thread {} moved to cpus {} (LR_MAIN_PRIME={})", best_tid,
                 cpus, mode);
@@ -897,7 +915,10 @@ void LrPlaceEffectWorkers() {
       comm[n] = 0;
     }
     if (strncmp(comm, "vfx-qix-effect", 14) != 0) continue;
-    if (sched_setaffinity(atoi(e->d_name), sizeof(set), &set) == 0) ++count;
+    if (sched_setaffinity(atoi(e->d_name), sizeof(set), &set) == 0) {
+      lr::android::NoteThreadMask(atoi(e->d_name), mask);
+      ++count;
+    }
   }
   closedir(dir);
   if (count) {
@@ -1035,6 +1056,7 @@ void StartGpuCounterSampler() {
 
 void LrAndroidFrameDone(uint64_t work_us, double frame_rate) {
   uint64_t frames = g_lr_game_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (frames == 1) lr::android::NoteGameMainThread(int(gettid()));  // the placement line's "main"
   if (frames == 120) StartGpuCounterSampler();
   if (frames % 300 == 0) {
     LrPlaceAuxThreads();

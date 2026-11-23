@@ -1,7 +1,7 @@
 From 2a21e70228ffb89633142b3e466888d3a2776f56 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:46:11 +0800
-Subject: [PATCH 024/116] core: fix heap corruption from concurrent thread
+Subject: [PATCH 024/117] core: fix heap corruption from concurrent thread
  naming
 
 A new XThread names itself on start (thread_->set_name(thread_name_)) while

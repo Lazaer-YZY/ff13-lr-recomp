@@ -1,7 +1,7 @@
 From 84b32cb16c44f3567b670a8ed6daae068133470e Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:40:03 +0800
-Subject: [PATCH 020/116] core(android): arm64 FPSCR rounding map and
+Subject: [PATCH 020/117] core(android): arm64 FPSCR rounding map and
  per-thread denormal flush (behaviour informed by lr-ffxiii-port's Android
  patch, re-implemented)
 

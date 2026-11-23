@@ -1,7 +1,7 @@
 From 8ea145a63378926a2c3361b0372dea60325711a4 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 00:55:26 +0800
-Subject: [PATCH 074/116] gpu: vulkan: pipelines linked from per-stage
+Subject: [PATCH 074/117] gpu: vulkan: pipelines linked from per-stage
  libraries, ahead-of-time pixel shader libraries
 
 On devices with VK_EXT_graphics_pipeline_library (fast linking), extended

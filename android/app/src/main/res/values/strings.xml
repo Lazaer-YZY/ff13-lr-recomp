@@ -2,29 +2,33 @@
 <resources>
     <string name="app_name">LR: FFXIII</string>
     <string name="touch_settings_title">Settings</string>
-    <!-- Section headers -->
-    <string name="touch_section_controls">Touch controls</string>
-    <string name="touch_frame_rate">Frame rate</string>
+    <!-- Sections of the CTRL dialog (collapsible, as in the DS2 port's) -->
+    <string name="touch_section_controls">Controls</string>
+    <string name="touch_section_performance">Frame rate and performance</string>
     <string name="touch_section_image">Image</string>
     <string name="touch_section_second_screen">Second screen</string>
+    <string name="touch_section_game">Game</string>
     <string name="touch_section_cheats">Cheats</string>
     <string name="touch_section_troubleshooting">Troubleshooting</string>
+    <string name="touch_advanced">Advanced (GPU compatibility)</string>
     <string name="touch_next_start_note">* Applies the next time the game starts.</string>
-    <!-- Touch controls -->
+    <!-- Controls -->
+    <string name="touch_group_on_screen">On-screen controls</string>
     <string name="touch_show_controls">Show touch controls</string>
     <string name="touch_controller_hint">A controller is connected, so touch controls hide on their own. Tick this to use both.</string>
-    <string name="touch_control_size">Size: %1$d%%</string>
-    <string name="touch_opacity">Opacity: %1$d%%</string>
-    <string name="touch_ctrl_auto_hide">Auto-hide the CTRL button</string>
-    <string name="touch_hide_all">Hide all touch controls</string>
-    <string name="touch_hide_all_help">To bring CTRL back for 4 s, swipe in the system bars or press Back.</string>
-    <!-- Frame rate -->
+    <string name="touch_control_size">Size of the touch controls and the CTRL button: %1$d%%</string>
+    <string name="touch_opacity">Opacity of the touch controls and the CTRL button: %1$d%%</string>
+    <string name="touch_ctrl_button">CTRL button</string>
+    <string name="touch_ctrl_always">Always shown</string>
+    <string name="touch_ctrl_tab">Slides into a small tab when not in use</string>
+    <string name="touch_ctrl_removed">Removed 30 s after the game starts (then Back opens these settings)</string>
+    <!-- Frame rate and performance -->
+    <string name="touch_frame_rate">Frame rate</string>
     <string name="touch_fps_30">30 fps (coolest, as on the Xbox 360)</string>
     <string name="touch_fps_40">40 fps *</string>
     <string name="touch_fps_60">60 fps</string>
-    <string name="touch_fps_help">Cutscenes stay at 30 fps.</string>
-    <string name="touch_panel120">Smoother 60 fps (120 Hz screen) *</string>
-    <string name="touch_panel120_help">A late frame shows after 25 ms instead of 33 ms. Runs a little hotter.</string>
+    <string name="touch_fps_60_smooth">60 fps, smoother (120 Hz screen) *</string>
+    <string name="touch_fps_help">Cutscenes stay at 30 fps. Smoother 60 uses the 120 Hz screen mode: a late frame shows after 25 ms instead of 33 ms.</string>
     <string name="touch_perf_overlay">Performance overlay</string>
     <string name="touch_perf_overlay_help">Frame rate and a frame time graph on screen.</string>
     <string name="touch_fps_40_fallback">The last start at 40 fps did not get going; back to 30 fps.</string>
@@ -33,6 +37,7 @@
     <string name="touch_aa_off">Off</string>
     <string name="touch_aa_fxaa">FXAA (smoother edges, a little softer)</string>
     <string name="touch_upscale">Upscaling to the screen *</string>
+    <string name="touch_stretch_na">(this screen is 16:9)</string>
     <string name="touch_upscale_bilinear">Bilinear</string>
     <string name="touch_upscale_fsr">AMD FSR 1 (sharper edges)</string>
     <string name="touch_upscale_cas">AMD CAS (sharpening)</string>
@@ -76,6 +81,15 @@
     <string name="touch_compat_tu_noubwc">Turnip image compression off * (Turnip drivers only)</string>
     <!-- Buttons -->
     <string name="touch_apply">Apply</string>
-    <string name="touch_edit_layout">Edit layout</string>
+    <string name="touch_edit_layout">Edit touch controls layout…</string>
     <string name="touch_cancel">Cancel</string>
+    <!-- Exit and restart (CTRL) -->
+    <string name="exit_game">Exit game</string>
+    <string name="exit_title">Exit the game?</string>
+    <string name="exit_message">Progress since the game last saved is lost. To be safe, save in the game\'s main menu first, then exit here.</string>
+    <string name="exit_confirm">Exit</string>
+    <string name="restart_title">Restart the game now?</string>
+    <string name="restart_message">Settings marked * apply when the game starts. Restarting now loses progress since the last save.</string>
+    <string name="restart_now">Restart</string>
+    <string name="restart_later">Later</string>
 </resources>

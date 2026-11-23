@@ -109,7 +109,7 @@ Newer releases install over the old one and keep your saves and game files.
 ### What you need
 - **The game**: *Lightning Returns: Final Fantasy XIII*, USA Xbox 360 disc, dumped to an ISO from your own copy (title ID `5351081B`, media ID `4A99274C`, XEX version 0.0.0.8, no title update). Other regions need their own manifest and are untested.
 - **A Windows 10/11 PC** with [Git for Windows](https://git-scm.com/download/win) and [Python 3](https://www.python.org/downloads/) (tick "Add to PATH"). No admin rights needed: everything else is downloaded portably into `C:\dev`. About **30 GB** free disk space.
-- **An Android phone or handheld with a Snapdragon chip** (Adreno 6xx, 7xx or 8xx GPU; Snapdragon 8 Gen 2 or newer recommended; tested on the AYN Thor, and since v1.2.3 on an Adreno 640), about 8 GB free. **A controller is optional:** without one the game shows on-screen touch buttons; built-in, Bluetooth and USB controllers work too. Devices with Mali GPUs (Dimensity, Exynos, Tensor) are untested: since v1.2.1 the renderer has fallbacks for the Vulkan features Mali drivers lack instead of refusing to start, but that is checked only by making the Thor's Adreno report a Mali's features. If the game can't start, the GPU driver page says why; please open an issue with the logs (**CTRL → Save logs for a bug report …**).
+- **An Android phone or handheld with a Snapdragon chip** (Adreno 6xx, 7xx or 8xx GPU; Snapdragon 8 Gen 2 or newer recommended; tested on the AYN Thor, and since v1.2.3 on an Adreno 640), about 8 GB free. **A controller is optional:** without one the game shows on-screen touch buttons; built-in, Bluetooth and USB controllers work too. Devices with Mali GPUs (Dimensity, Exynos, Tensor) are untested: since v1.2.1 the renderer has fallbacks for the Vulkan features Mali drivers lack instead of refusing to start, but that is checked only by making the Thor's Adreno report a Mali's features. Since v1.2.4 they start on Arm's own driver with the renderer settings that fixed Mali players' glitches in the Dark Souls II port, which shares this renderer. If the game can't start, the GPU driver page says why; please open an issue with the logs (**CTRL → Save logs for a bug report …**).
 - **Time**: the first build compiles the recompiled game, which takes **one to several hours** on a laptop.
 
 ### Build it yourself
@@ -130,18 +130,19 @@ Newer releases install over the old one and keep your saves and game files.
 **Game files without a USB copy:** install the APK on its own, put your ISO on the device, and on the first start (the *Game folder* page, also under CTRL) tap **Import from ISO…**. The app checks the disc's title ID and executable (it refuses any disc but the USA release) and extracts the game itself, in about 30 s on the Thor.
 
 ### Options (the CTRL button)
-The game's own Settings menu is the Xbox 360 release's, unchanged. The port's options are behind the **CTRL** button at the top of the screen:
+The game's own Settings menu is the Xbox 360 release's, unchanged. The port's options are behind the **CTRL** button at the top of the screen, in sections that open one at a time (Controls, Frame rate and performance, Image, Second screen, Game, Troubleshooting). **Exit game** at the top right closes the game (save in the game's menu first). After you change an option marked \*, the dialog offers to restart the game.
 
 | Option | Choices (default first) | Notes |
 |---|---|---|
-| Frame rate | 60 · 40 · 30 fps in gameplay | Cutscenes stay at 30. 40 uses the 120 Hz panel mode. Applies at the next start. See [Four frame-rate options](#four-frame-rate-options). |
-| Smoother 60 fps | off · on | 60 fps on the 120 Hz panel mode: a late frame shows after 25 ms instead of 33 ms. About the same power. |
+| Frame rate | 60 · 40 · 30 · 60 smoother, in gameplay | Cutscenes stay at 30. 40 uses the 120 Hz panel mode (next start). *60 smoother* runs 60 fps on the 120 Hz panel mode: a late frame shows after 25 ms instead of 33 ms, at about the same power. See [Four frame-rate options](#four-frame-rate-options). |
 | Upscaling | Bilinear · AMD FSR 1.0 · AMD CAS | FSR gives the sharpest edges. Restart required. |
 | Anti-aliasing | Off · FXAA | FXAA runs at 720p before upscaling, so it softens the picture. |
 | Performance overlay | off · on | fps and a frame-time graph. |
 | Exact Xbox shader math | off · on | Slower. Only if something renders wrong (black or flashing pixels, broken lighting). |
 | Touch controls | shown when no controller is connected | Size, opacity and layout are editable. |
-| GPU driver | Stable Turnip v2 (bundled) | Installed and selected automatically on first start (Adreno 6xx/7xx/8xx; sysmem mode on Adreno 710/720/722). Other Turnip builds can be downloaded on the GPU driver page but are untested with this game; Qualcomm's drivers are not supported. |
+| CTRL button | slides into a small tab · always shown · removed 30 s after the start | Removed: Android Back opens the settings instead. |
+| GPU driver | Stable Turnip v2 (bundled) | Installed and selected automatically on first start (Adreno 6xx/7xx/8xx; sysmem mode on Adreno 710/720/722 and 8xx). Other Turnip builds can be downloaded on the GPU driver page but are untested with this game; Qualcomm's drivers are not supported. Mali phones start on Arm's own driver. |
+| GPU compatibility (testing) | all off | Troubleshooting → Advanced: renderer paths to switch off one at a time on a phone whose picture is wrong. Next start. |
 | Second screen | on | The bottom-screen companion on dual-screen devices (see above). |
 | Cheats | all off | *Infinite EP* (EP stays at its maximum, so EP abilities cost nothing), *Infinite HP (in battle)* (Lightning's HP goes back to its maximum after every hit; a single hit larger than her maximum HP still knocks her out) and *Freeze the clock* (the days do not pass). Apply at once. A save made while a cheat is on keeps its effects (a frozen clock stays at its time). |
 | Debug logging | off | Writes frame and GPU statistics to the log, for reporting a problem. Costs ~4% CPU. |
