@@ -1,7 +1,7 @@
 From f7d44cd208bc63c4a6f6bf44bd5250a0670f8b1e Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:48:26 +0800
-Subject: [PATCH 030/115] xam: list saves under the user's full XUID as well,
+Subject: [PATCH 030/116] xam: list saves under the user's full XUID as well,
  without duplicates (behaviour informed by lr-ffxiii-port's Android patch,
  re-implemented)
 

@@ -1,7 +1,7 @@
 From 22b0dd563c7aebebe0294838f6ebee406133640e Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:42:53 +0800
-Subject: [PATCH 023/115] core(posix): multi-object waits sleep on a shared
+Subject: [PATCH 023/116] core(posix): multi-object waits sleep on a shared
  condition variable; optional Android spin (behaviour informed by
  lr-ffxiii-port's Android patch, re-implemented)
 

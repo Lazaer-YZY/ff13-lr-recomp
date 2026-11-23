@@ -1,7 +1,7 @@
 From 692da7dbd8db2ea9bd6dcbdede015a7f8842d8e8 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 16:37:40 +0800
-Subject: [PATCH 017/115] core: crash context for unresolved host faults
+Subject: [PATCH 017/116] core: crash context for unresolved host faults
 
 New rex::arch fault-report API (exception_handler.h, src/core/fault_context.cpp):
 SetFaultContextProvider, Begin/EndFaultDispatch and LogCurrentFaultContext,

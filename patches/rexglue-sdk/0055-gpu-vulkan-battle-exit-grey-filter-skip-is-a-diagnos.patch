@@ -1,7 +1,7 @@
 From efcc51546e28e14a24aa6efab89bbbe4f02ca9ba Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 09:38:56 +0800
-Subject: [PATCH 055/115] gpu: vulkan: battle-exit grey filter skip is a
+Subject: [PATCH 055/116] gpu: vulkan: battle-exit grey filter skip is a
  diagnostic switch, off by default
 
 Skipping the draw hides the Adreno noise without explaining it; keep the

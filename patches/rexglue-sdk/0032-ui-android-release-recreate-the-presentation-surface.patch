@@ -1,7 +1,7 @@
 From 0dc2f9ba76c10e17cf2c87d7861d88d06a2ca0bd Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:50:12 +0800
-Subject: [PATCH 032/115] ui(android): release/recreate the presentation
+Subject: [PATCH 032/116] ui(android): release/recreate the presentation
  surface across background (behaviour informed by lr-ffxiii-port's Android
  patch, re-implemented)
 

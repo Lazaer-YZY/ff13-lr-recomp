@@ -1,7 +1,7 @@
 From fa9d3e545ab64637ae3aea02bd735918be2f538c Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 01:04:51 +0800
-Subject: [PATCH 043/115] gpu: vulkan: optionally restrict render target cache
+Subject: [PATCH 043/116] gpu: vulkan: optionally restrict render target cache
  render areas (vulkan_render_area_restrict)
 
 Every render target cache render pass instance used the whole framebuffer

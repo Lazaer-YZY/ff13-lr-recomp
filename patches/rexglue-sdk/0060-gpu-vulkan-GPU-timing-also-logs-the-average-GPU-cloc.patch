@@ -1,7 +1,7 @@
 From 7981932d2539443d65f0e4f1650480ca1eedea4c Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 11:16:55 +0800
-Subject: [PATCH 060/115] gpu: vulkan: GPU timing also logs the average GPU
+Subject: [PATCH 060/116] gpu: vulkan: GPU timing also logs the average GPU
  clock and Mcycles per frame
 
 The governor scales the GPU clock with load, so GPU time per frame alone hides

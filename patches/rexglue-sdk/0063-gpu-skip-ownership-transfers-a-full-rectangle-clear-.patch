@@ -1,7 +1,7 @@
 From 70732251021529702cafa0268f36e9aadf444a45 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 13:53:17 +0800
-Subject: [PATCH 063/115] gpu: skip ownership transfers a full-rectangle clear
+Subject: [PATCH 063/116] gpu: skip ownership transfers a full-rectangle clear
  overwrites; feed fully-resolved textures; sync diagnostics
 
 - gpu_skip_overwritten_transfers (default 0 for now): when the draw that needs

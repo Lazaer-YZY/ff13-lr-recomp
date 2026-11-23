@@ -1,7 +1,7 @@
 From dbaee7a9ad2a9e860336891ce64a3b25be85392c Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 10:59:39 +0800
-Subject: [PATCH 080/115] ui: log the guest output paint effect at presenter
+Subject: [PATCH 080/116] ui: log the guest output paint effect at presenter
  initialization
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

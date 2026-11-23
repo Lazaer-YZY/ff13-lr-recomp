@@ -1,7 +1,7 @@
 From 605017b084db1c98af09f88fde5d04c3b69d4049 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:22:43 +0800
-Subject: [PATCH 006/115] core(android): reuse the Apple libc++ workarounds for
+Subject: [PATCH 006/116] core(android): reuse the Apple libc++ workarounds for
  the NDK libc++
 
 NDK r28 libc++ (LLVM 19) lacks floating-point std::from_chars and

@@ -1,7 +1,7 @@
 From 4e7dee649398affdf4a51757b4f057c86fc49dfd Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 13:43:54 +0800
-Subject: [PATCH 085/115] gpu: vulkan: no zero-timeout fence polling by default
+Subject: [PATCH 085/116] gpu: vulkan: no zero-timeout fence polling by default
  (vulkan_fence_poll)
 
 On Turnip over KGSL vkWaitForFences with a zero timeout blocks until the fence

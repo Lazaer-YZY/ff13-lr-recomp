@@ -1,7 +1,7 @@
 From d3749ea14a330602fd5e3a4a60afd1be3fd7c7aa Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:48:42 +0800
-Subject: [PATCH 031/115] system(linux/android): skip the /proc/self/maps
+Subject: [PATCH 031/116] system(linux/android): skip the /proc/self/maps
  recheck on write faults (behaviour informed by lr-ffxiii-port's Android
  patch, re-implemented)
 

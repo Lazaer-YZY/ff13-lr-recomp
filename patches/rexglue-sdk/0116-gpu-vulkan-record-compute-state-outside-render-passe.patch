@@ -1,0 +1,92 @@
+From 2223b0407c0252825df4eaa318f52db4231a380d Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Mon, 23 Nov 2026 08:10:15 +0800
+Subject: [PATCH 116/116] gpu/vulkan: record compute state outside render
+ passes (Adreno 6xx)
+
+Turnip on Adreno 6xx loses compute pipeline / descriptor / push-constant
+state recorded while a render pass is open: texture loads, EDRAM dumps
+and resolves bound theirs before SubmitBarriers ended the pass, so the
+dispatches wrote nothing or lost whole waves (found by the DS2 project
+with a frame capture on an Adreno 640; LR public #4 on an Adreno 650).
+New cvar vulkan_compute_state_outside_render_pass (default on):
+EndRenderPassForComputeState ends an open pass before compute state is
+recorded (BindExternalComputePipeline calls it; the FSI resolve clear,
+which binds its descriptors first, calls it directly), and EndRenderPass
+forgets the bound compute pipeline so it is bound again after every pass.
+Adreno 7xx/8xx are unaffected (DS2: no cost on the Adreno 740).
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 98efbe5..a2ce211 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -349,6 +349,10 @@ class VulkanCommandProcessor : public CommandProcessor {
+   void BindExternalGraphicsPipeline(VkPipeline pipeline, bool keep_dynamic_depth_bias = false,
+                                     bool keep_dynamic_blend_constants = false,
+                                     bool keep_dynamic_stencil_mask_ref = false);
++  // Both end an open render pass first (vulkan_compute_state_outside_render_pass): call
++  // EndRenderPassForComputeState before compute descriptors or push constants that are recorded
++  // ahead of BindExternalComputePipeline.
++  void EndRenderPassForComputeState();
+   void BindExternalComputePipeline(VkPipeline pipeline);
+   void SetViewport(const VkViewport& viewport);
+   void SetScissor(const VkRect2D& scissor);
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 755b383..9c22f84 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -66,6 +66,13 @@ REXCVAR_DEFINE_BOOL(vulkan_memexport_coalesce_barriers, true, "GPU/Vulkan",
+                     "previous ones exported share one barrier instead of one each (each ends the "
+                     "render pass on a tiler).")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
++REXCVAR_DEFINE_BOOL(vulkan_compute_state_outside_render_pass, true, "GPU/Vulkan",
++                    "Ends an open render pass before compute state (pipeline, descriptor sets, push "
++                    "constants) is recorded, and binds compute pipelines again after every render "
++                    "pass. Turnip on Adreno 6xx loses compute state recorded inside a render pass: "
++                    "texture loads, EDRAM dumps and resolves then write nothing or lose whole waves "
++                    "(found by the DS2 project on an Adreno 640; LR public #4).")
++    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ REXCVAR_DEFINE_BOOL(vulkan_vertex_memexport_compute, true, "GPU/Vulkan",
+                     "On a device without vertexPipelineStoresAndAtomics (Arm's Mali driver), run "
+                     "the memory export of vertex shaders as a compute dispatch before the draw. Off: "
+@@ -3964,6 +3971,10 @@ void VulkanCommandProcessor::EndRenderPass() {
+   current_render_pass_ = VK_NULL_HANDLE;
+   current_framebuffer_ = nullptr;
+   in_render_pass_ = false;
++  if (REXCVAR_GET(vulkan_compute_state_outside_render_pass)) {
++    // Bound again for the next dispatch after a render pass (see EndRenderPassForComputeState).
++    current_external_compute_pipeline_ = VK_NULL_HANDLE;
++  }
+   // Work after a render pass that isn't categorized is "other" (mostly
+   // barriers and layout transitions).
+   GpuTimingMark(GpuTimingCategory::kOther);
+@@ -4973,7 +4984,17 @@ void VulkanCommandProcessor::ApplyLibraryPipelineDynamicState(
+   current_library_dynamic_state_valid_ = true;
+ }
+ 
++void VulkanCommandProcessor::EndRenderPassForComputeState() {
++  // A dispatch needs the pass ended anyway, and Turnip on Adreno 6xx loses compute state recorded
++  // inside one (vulkan_compute_state_outside_render_pass).
++  if (REXCVAR_GET(vulkan_compute_state_outside_render_pass) && in_render_pass_) {
++    pass_end_reason_ = kPassEndForced;
++    EndRenderPass();
++  }
++}
++
+ void VulkanCommandProcessor::BindExternalComputePipeline(VkPipeline pipeline) {
++  EndRenderPassForComputeState();
+   if (current_external_compute_pipeline_ == pipeline) {
+     return;
+   }
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 333bcc3..a3f5bb1 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1910,6 +1910,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+         // copy, only to clear, for some reason, for instance), overlap of the
+         // depth and the color ranges is highly unlikely.
+         CommitEdramBufferShaderWrites();
++        command_processor_.EndRenderPassForComputeState();
+         command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                resolve_fsi_clear_pipeline_layout_, 0, 1,
+                                                &edram_storage_buffer_descriptor_set_, 0, nullptr);

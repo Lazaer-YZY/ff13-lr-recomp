@@ -162,6 +162,14 @@ public final class RuntimeActivity extends SDLActivity {
     protected void onCreate(Bundle savedInstanceState) {
         PlayerLogs.installCrashHandler(this);
         super.onCreate(savedInstanceState);
+        // Development launches on a test phone that locks between unattended runs (`--es LR_SHOW_WHEN_LOCKED 1`,
+        // as the DS2 project does on its Adreno 640 test phone): the game shows over the lock screen like an
+        // alarm app; it does not unlock the phone or show anything else.
+        if (BuildConfig.DEBUG && android.os.Build.VERSION.SDK_INT >= 27 && getIntent() != null
+                && "1".equals(getIntent().getStringExtra("LR_SHOW_WHEN_LOCKED"))) {
+            setShowWhenLocked(true);
+            setTurnScreenOn(true);
+        }
         applyDisplayModeForFrameRate();
         hideSystemBars();
         applySustainedPerformanceMode();

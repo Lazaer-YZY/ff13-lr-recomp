@@ -1,7 +1,7 @@
 From 13c03f2838de535c34a51be894ec069a751bdbb2 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 21 Nov 2026 11:16:51 +0800
-Subject: [PATCH 115/115] gpu/spirv: point coordinates at location 16 in pixel
+Subject: [PATCH 115/116] gpu/spirv: point coordinates at location 16 in pixel
  shaders with fixed interpolator locations
 
 The point-sprite VS expansion and the point geometry shader write the point coordinates after all

@@ -1,7 +1,7 @@
 From 25c7bdfabfd1799b8a3ea40288f82b5d96c249aa Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:40:27 +0800
-Subject: [PATCH 021/115] core(android): save/restore FPCR in the aarch64 fiber
+Subject: [PATCH 021/116] core(android): save/restore FPCR in the aarch64 fiber
  switch (behaviour informed by lr-ffxiii-port's Android patch, re-implemented)
 
 FPCR carries the guest rounding mode (and flush-to-zero), which is per guest

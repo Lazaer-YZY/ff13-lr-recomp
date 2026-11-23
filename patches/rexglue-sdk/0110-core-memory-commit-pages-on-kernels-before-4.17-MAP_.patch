@@ -1,7 +1,7 @@
 From 5c4dd128e0d91bb87d8146cb74ce955c35d73233 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 21 Nov 2026 08:10:34 +0800
-Subject: [PATCH 110/115] core/memory: commit pages on kernels before 4.17
+Subject: [PATCH 110/116] core/memory: commit pages on kernels before 4.17
  (MAP_FIXED_NOREPLACE taken as a hint)
 
 Kernels before 4.17 ignore MAP_FIXED_NOREPLACE and map an occupied range elsewhere, so a commit

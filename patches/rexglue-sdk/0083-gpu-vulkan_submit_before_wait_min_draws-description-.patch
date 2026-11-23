@@ -1,7 +1,7 @@
 From ea388d18cdfe766fbfc47fe267bb1f936c745695 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 13:02:13 +0800
-Subject: [PATCH 083/115] gpu: vulkan_submit_before_wait_min_draws description:
+Subject: [PATCH 083/116] gpu: vulkan_submit_before_wait_min_draws description:
  the wait is on a guest counter
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

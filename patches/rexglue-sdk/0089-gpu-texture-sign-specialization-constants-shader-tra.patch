@@ -1,7 +1,7 @@
 From d247e2c2066c7b82bddfc93b8115904a063a8984 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 19:23:56 +0800
-Subject: [PATCH 089/115] gpu: texture sign specialization constants; shader
+Subject: [PATCH 089/116] gpu: texture sign specialization constants; shader
  translation really on the creation threads
 
 Pixel shaders get one specialization constant per fetch constant they sample

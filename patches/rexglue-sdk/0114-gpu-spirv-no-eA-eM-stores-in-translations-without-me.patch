@@ -1,7 +1,7 @@
 From 3b35679d16ad39e5e4eb7d6cd5d3a1d39e3cab54 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 21 Nov 2026 09:52:34 +0800
-Subject: [PATCH 114/115] gpu/spirv: no eA/eM# stores in translations without
+Subject: [PATCH 114/116] gpu/spirv: no eA/eM# stores in translations without
  memory export
 
 A vertex shader's raster translation on a device without vertexPipelineStoresAndAtomics (the

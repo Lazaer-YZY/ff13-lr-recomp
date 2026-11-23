@@ -1,7 +1,7 @@
 From 3577e3db27a0c595af9f88962a9abb5f7f8b158d Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 16:55:04 +0800
-Subject: [PATCH 086/115] gpu: spirv: texture signs by selects, gamma
+Subject: [PATCH 086/116] gpu: spirv: texture signs by selects, gamma
  conversion in one uniform branch (default on); vertex-only multiply switch
 
 The per-component OpSwitch on the texture sign is lowered by Mesa to ifs that it

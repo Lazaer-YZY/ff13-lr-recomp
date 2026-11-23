@@ -1,7 +1,7 @@
 From dab2bd2b4f91f6728a71ea396fdb4982d0d2cc95 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 12:22:01 +0800
-Subject: [PATCH 081/115] gpu: vulkan_gpu_trace_frames_window cvar; optional
+Subject: [PATCH 081/116] gpu: vulkan_gpu_trace_frames_window cvar; optional
  eager guest-sampled texture transitions (off)
 
 

@@ -1,7 +1,7 @@
 From f9e2522c5cde8a73a50a5c6195063173578da702 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:46:40 +0800
-Subject: [PATCH 025/115] core(android): reserve the guest arena without
+Subject: [PATCH 025/116] core(android): reserve the guest arena without
  clobbering app mappings (behaviour informed by lr-ffxiii-port's Android
  patch, re-implemented)
 

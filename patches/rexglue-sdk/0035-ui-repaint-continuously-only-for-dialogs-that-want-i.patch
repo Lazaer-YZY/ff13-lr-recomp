@@ -1,7 +1,7 @@
 From 96bbc7254dac86f80e684b14b8ec90dcd3878a0f Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 21:16:43 +0800
-Subject: [PATCH 035/115] ui: repaint continuously only for dialogs that want
+Subject: [PATCH 035/116] ui: repaint continuously only for dialogs that want
  it
 
 The achievement toast dialog exists for the whole session, so ImGuiDrawer

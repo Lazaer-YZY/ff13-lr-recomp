@@ -1,7 +1,7 @@
 From 4c5d28fbe5b90f7165a0f249772ee55df645a4a1 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 21 Nov 2026 08:10:34 +0800
-Subject: [PATCH 111/115] ui: ReXApp::OnSetupFailed when runtime, GPU plugin or
+Subject: [PATCH 111/116] ui: ReXApp::OnSetupFailed when runtime, GPU plugin or
  presentation setup fails
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,7 +1,7 @@
 From 57b89dae293729ea8b9b02564cbe0ae80eb7d1c9 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Thu, 12 Nov 2026 18:38:03 +0800
-Subject: [PATCH 105/115] ui/android: surface holds a reference to its
+Subject: [PATCH 105/116] ui/android: surface holds a reference to its
  ANativeWindow (no crash reconnecting after a failed swapchain)
 
 
