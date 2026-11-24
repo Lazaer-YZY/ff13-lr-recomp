@@ -33,6 +33,13 @@
     <string name="touch_perf_overlay_help">Frame rate and a frame time graph on screen.</string>
     <string name="touch_fps_40_fallback">The last start at 40 fps did not get going; back to 30 fps.</string>
     <!-- Image -->
+    <string name="touch_resolution">Resolution *</string>
+    <string name="touch_resolution_540">540p (faster, softer)</string>
+    <string name="touch_resolution_720">720p (as on the Xbox 360)</string>
+    <string name="touch_resolution_1080">1080p (smoother edges; for faster GPUs)</string>
+    <string name="touch_resolution_help">The 3D world is drawn at this size; menus and HUD stay sharp at 720p. 1080p is scaled down to 720p, which smooths edges rather than adding detail.</string>
+    <string name="touch_wide">Wide screen *</string>
+    <string name="touch_wide_help">On screens wider than 16:9 the 3D world fills the whole screen, with more to see at the sides; menus and HUD stay in the middle, movies keep their 16:9. More pixels to draw: a little slower.</string>
     <string name="touch_aa">Anti-aliasing</string>
     <string name="touch_aa_off">Off</string>
     <string name="touch_aa_fxaa">FXAA (smoother edges, a little softer)</string>

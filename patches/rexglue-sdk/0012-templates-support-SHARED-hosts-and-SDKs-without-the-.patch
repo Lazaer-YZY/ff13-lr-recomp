@@ -1,7 +1,7 @@
 From 44552c3dfb99654779cf87f3886aaea90bfabd58 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:34:33 +0800
-Subject: [PATCH 012/117] templates: support SHARED hosts and SDKs without the
+Subject: [PATCH 012/119] templates: support SHARED hosts and SDKs without the
  rexglue CLI
 
 - rexglue_setup_target: the <target>_recomp OBJECT library is built PIC when

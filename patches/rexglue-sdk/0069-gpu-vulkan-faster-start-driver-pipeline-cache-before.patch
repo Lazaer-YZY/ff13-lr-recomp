@@ -1,7 +1,7 @@
 From 63ac88dfe16541ee5a4e470a07761d36735219a9 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 21:51:46 +0800
-Subject: [PATCH 069/117] gpu: vulkan: faster start - driver pipeline cache
+Subject: [PATCH 069/119] gpu: vulkan: faster start - driver pipeline cache
  before the built-in pipelines, stored shaders translated in parallel
 
 The driver pipeline cache file was merged only when the shader storage was

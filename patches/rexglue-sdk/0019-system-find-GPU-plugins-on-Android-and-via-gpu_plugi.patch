@@ -1,7 +1,7 @@
 From b251e53aa98b32bcbb40197f287dccea4f652b83 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:11:45 +0800
-Subject: [PATCH 019/117] system: find GPU plugins on Android and via
+Subject: [PATCH 019/119] system: find GPU plugins on Android and via
  gpu_plugin_dir
 
 On Android the executable is /system/bin/app_process, so the plugin was looked

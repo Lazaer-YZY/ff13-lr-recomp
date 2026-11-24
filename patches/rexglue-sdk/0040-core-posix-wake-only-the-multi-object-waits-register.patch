@@ -1,7 +1,7 @@
 From 6b1253d3aa20618b5d6555610fa323c89dfeb6c2 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 23:45:54 +0800
-Subject: [PATCH 040/117] core: posix: wake only the multi-object waits
+Subject: [PATCH 040/119] core: posix: wake only the multi-object waits
  registered on a handle
 
 Multi-object waits slept on one process-wide condition variable, and every

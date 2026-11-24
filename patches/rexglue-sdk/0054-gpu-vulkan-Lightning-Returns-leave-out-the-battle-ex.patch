@@ -1,7 +1,7 @@
 From ec570f5fa99ec161faa5a030e87b52905550fef4 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 09:27:30 +0800
-Subject: [PATCH 054/117] gpu: vulkan: Lightning Returns: leave out the
+Subject: [PATCH 054/119] gpu: vulkan: Lightning Returns: leave out the
  battle-exit grey filter on Android
 
 The battle-exit grey filter (pixel shader 8DA8D0C5199404FF, drawn after the

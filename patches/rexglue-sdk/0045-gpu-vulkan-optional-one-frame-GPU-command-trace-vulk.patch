@@ -1,7 +1,7 @@
 From 61368b663263cb1807e2a34f9ac282f9705d75c0 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 07:44:19 +0800
-Subject: [PATCH 045/117] gpu: vulkan: optional one-frame GPU command trace
+Subject: [PATCH 045/119] gpu: vulkan: optional one-frame GPU command trace
  (vulkan_gpu_trace_frame)
 
 With vulkan_gpu_timing, logs the command sequence of one frame every 10 s:

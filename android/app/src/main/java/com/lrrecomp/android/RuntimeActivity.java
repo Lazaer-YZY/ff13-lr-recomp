@@ -146,7 +146,78 @@ public final class RuntimeActivity extends SDLActivity {
             + "|" + render.getString("upscale", "bilinear")
             + "|" + render.getBoolean("debug_log", DEFAULT_DEBUG_LOG)
             + "|" + render.getBoolean("exact_shader_math", false)
-            + "|" + GpuCompat.Choices.from(render).summary();
+            + "|" + GpuCompat.Choices.from(render).summary()
+            + "|" + render.getString(KEY_RENDER_HEIGHT, DEFAULT_RENDER_HEIGHT)
+            + "|" + render.getBoolean(KEY_WIDE, false);
+    }
+
+    /** CTRL, Image: the game's 3D render height (src/lr_render_size.cpp), read when the game starts. */
+    static final String KEY_RENDER_HEIGHT = "render_height";
+    static final String[] RENDER_HEIGHTS = { "540", "720", "1080" };
+    static final String DEFAULT_RENDER_HEIGHT = "720";
+
+    /** CTRL, Image: "Wide screen" (the 3D world fills a screen wider than 16:9), read when the game starts. */
+    static final String KEY_WIDE = "wide";
+
+    /** The console's frame height: the game's final frame (3D scene + UI) keeps it at every render height. */
+    static final int FRAME_HEIGHT = 720;
+
+    /** The chosen render height as a number (720 for anything unknown). */
+    static int renderHeight(String height) {
+        return "540".equals(height) ? 540 : "1080".equals(height) ? 1080 : 720;
+    }
+
+    /**
+     * The game's screen width for "Wide screen" on a display of this aspect (long side / short side), or 0 when the
+     * option is off or the display is 16:9 or narrower: the render height times the aspect, a multiple of 16, at most
+     * what colour and depth side by side take of the doubled EDRAM (2400 at 1080p) and what the game was tried at.
+     */
+    static int wideWidth(boolean wide, int height, float displayAspect) {
+        if (!wide || displayAspect <= 16f / 9f + 0.01f) return 0;
+        int width = Math.round(height * displayAspect / 16f) * 16;
+        width = Math.min(width, height >= 1080 ? 2400 : 2560);
+        return width > (height * 16 / 9 + 15) / 16 * 16 ? width : 0;
+    }
+
+    /**
+     * The width of the game's final frame for a wide screen: 720 lines at the screen's aspect, the nearest multiple of
+     * 16 (WideFrame in lr_render_size.cpp).
+     */
+    static int wideFrameWidth(int width, int height) {
+        return (FRAME_HEIGHT * width / height + 8) & ~15;
+    }
+
+    /**
+     * The arguments of the chosen render height and, for "Wide screen", width (0 = 16:9). 540 and 1080 resize the 3D
+     * scene only: the game's final frame and its UI stay 720 lines (a 540p scene is scaled up into it, a 1080p one
+     * supersampled down), so the presenter keeps its 720-line swapchain. 1080 also doubles the emulated EDRAM (colour
+     * and depth of 1920x1080 are 3264 tiles of the console's 2048) and the game's graphics pool grows by itself
+     * (lr_render_size.cpp). A wide screen widens the 3D scene and the final frame; the UI keeps its 1280x720 canvas in
+     * the middle. As in the DS2 port the video mode gets the frame's shape, which the presenter letterboxes to, and
+     * the EDRAM is doubled.
+     */
+    static void addResolutionArguments(java.util.List<String> args, String height, int wideWidth) {
+        int lines = renderHeight(height);
+        if (wideWidth > 0) {
+            args.add("--lr_render_height=" + lines);
+            args.add("--lr_render_width=" + wideWidth);
+            args.add("--video_mode_width=" + wideFrameWidth(wideWidth, lines));
+            args.add("--video_mode_height=" + FRAME_HEIGHT);
+            args.add("--gpu_edram_tiles=4096");
+        } else if (lines == 540) {
+            args.add("--lr_render_height=540");
+        } else if (lines == 1080) {
+            args.add("--lr_render_height=1080");
+            args.add("--gpu_edram_tiles=4096");
+        }
+    }
+
+    /** The display's long side over its short side (the game runs in landscape). */
+    float displayAspect() {
+        android.graphics.Point size = new android.graphics.Point();
+        getWindowManager().getDefaultDisplay().getRealSize(size);
+        int longSide = Math.max(size.x, size.y), shortSide = Math.min(size.x, size.y);
+        return shortSide > 0 ? (float) longSide / shortSide : 16f / 9f;
     }
 
     /** After CTRL changed a next-start setting: restart now (progress since the last save is lost) or later. */
@@ -628,14 +699,32 @@ public final class RuntimeActivity extends SDLActivity {
             "--gpu_allow_invalid_fetch_constants",
             "--present_max_height=" + PRESENT_MAX_HEIGHT));
         // Debug launches can add runtime cvars: `am start ... --es cvars "--dump_shaders=/sdcard/... --log_level=debug"`.
+        // An option given twice stops the command line from parsing (the game then starts without its data folder), so
+        // a debug launch that sets the render size replaces the CTRL choice.
+        java.util.ArrayList<String> extraArgs = new java.util.ArrayList<>();
         if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
             String extra = getIntent().getStringExtra("cvars");
             if (extra != null) {
                 for (String token : extra.trim().split("\\s+")) {
-                    if (token.startsWith("--")) args.add(token);
+                    if (token.startsWith("--")) extraArgs.add(token);
                 }
             }
         }
+        boolean sizeGiven = false;
+        for (String token : extraArgs) {
+            sizeGiven |= token.startsWith("--lr_render_height") || token.startsWith("--lr_render_width")
+                || token.startsWith("--gpu_edram_tiles") || token.startsWith("--video_mode_width")
+                || token.startsWith("--video_mode_height");
+        }
+        if (!sizeGiven) {
+            SharedPreferences sizePrefs = renderPrefs(this);
+            String height = sizePrefs.getString(KEY_RENDER_HEIGHT, DEFAULT_RENDER_HEIGHT);
+            int wide = wideWidth(sizePrefs.getBoolean(KEY_WIDE, false), renderHeight(height), displayAspect());
+            addResolutionArguments(args, height, wide);
+            android.util.Log.i("lrrecomp", "display: render height " + height
+                + (wide > 0 ? ", wide screen " + wide + " (display aspect " + displayAspect() + ")" : ""));
+        }
+        args.addAll(extraArgs);
         return args.toArray(new String[0]);
     }
 }

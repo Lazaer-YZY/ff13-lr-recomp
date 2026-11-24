@@ -1,7 +1,7 @@
 From 30912596db946bdce7da5b74b32a60a8ea38053c Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:22:43 +0800
-Subject: [PATCH 007/117] core(android): add Android system glue and jthread
+Subject: [PATCH 007/119] core(android): add Android system glue and jthread
  flag
 
 - include/rex/main_android.h declares rex::GetAndroidApiLevel() (included by

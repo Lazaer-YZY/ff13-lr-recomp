@@ -1,7 +1,7 @@
 From db77cd1e2967d42a6fb842131be2689d7329411a Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 09:10:35 +0800
-Subject: [PATCH 051/117] gpu: optional cap on host render target height
+Subject: [PATCH 051/119] gpu: optional cap on host render target height
  (render_target_max_height)
 
 Experiment: host render targets cover the EDRAM down to the next addressing

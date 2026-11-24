@@ -1,7 +1,7 @@
 From 515b2d4e24cedce982f4715fac52c88c56747b42 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:16:53 +0800
-Subject: [PATCH 002/117] build(android): build SDL3 shared with no desktop
+Subject: [PATCH 002/119] build(android): build SDL3 shared with no desktop
  Linux backends
 
 SDLActivity loads libSDL3.so via System.loadLibrary, so Android builds

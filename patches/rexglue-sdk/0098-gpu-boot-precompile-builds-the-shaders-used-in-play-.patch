@@ -1,7 +1,7 @@
 From 552f39649eaa830c6a8e3680a10484fb225c0b57 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Wed, 11 Nov 2026 10:37:45 +0800
-Subject: [PATCH 098/117] gpu: boot precompile builds the shaders used in play
+Subject: [PATCH 098/119] gpu: boot precompile builds the shaders used in play
  first (stored pipelines), saves them at once; thread-count cvars
 
 

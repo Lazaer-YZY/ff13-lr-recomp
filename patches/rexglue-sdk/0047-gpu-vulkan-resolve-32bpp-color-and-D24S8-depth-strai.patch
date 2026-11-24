@@ -1,7 +1,7 @@
 From 6536c99922c26ada6330cd3447922bb4f2dd65a2 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 08:29:23 +0800
-Subject: [PATCH 047/117] gpu: vulkan: resolve 32bpp color and D24S8 depth
+Subject: [PATCH 047/119] gpu: vulkan: resolve 32bpp color and D24S8 depth
  straight from the host render target
 
 When one host render target owns the whole resolved EDRAM range, the fast

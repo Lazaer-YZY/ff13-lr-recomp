@@ -1,7 +1,7 @@
 From 49a7071de574a47ce50e1899fa98dc33b1ee4e8d Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 00:46:22 +0800
-Subject: [PATCH 042/117] gpu: vulkan: optional per-frame GPU timing breakdown
+Subject: [PATCH 042/119] gpu: vulkan: optional per-frame GPU timing breakdown
  (vulkan_gpu_timing)
 
 vulkan_gpu_timing (default off) splits each submission into segments with

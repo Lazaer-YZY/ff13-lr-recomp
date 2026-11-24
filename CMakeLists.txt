@@ -14,6 +14,7 @@ include(generated/rexglue.cmake)
 set(LR_SOURCES
     src/main.cpp
     src/lr_hooks.cpp   # guest hooks adapted from leftisthominid/lr-ffxiii-port (GPL-3.0)
+    src/lr_render_size.cpp   # render resolution / wide screens (after the DS2 port's ds2_render_size.cpp)
 )
 
 if(ANDROID)

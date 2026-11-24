@@ -6,15 +6,19 @@ Adapted from leftisthominid/lr-ffxiii-port (GPL-3.0), builder/patches.ps1:
      LR_GUEST_IRQ_LOCK v7). lr_hooks.cpp relies on the same per-thread state.
   2. lr_recomp.*.cpp: a memory fence after each guest lwsync / eieio / sync (codegen only
      leaves a comment). Required on ARM; on x86 they compile to compiler barriers.
+  3. sub_82C45608: the effect phase's election spins wait instead of spinning (src/lr_hooks.cpp).
+  4. Wide screens: UI code that reads the frame's size from the engine's singleton itself gets the
+     UI's 1280x720 canvas (lr_ui_canvas_size / lr_ui_canvas_ratio); see src/lr_render_size.cpp.
 
-Idempotent. Usage: python -I tools/patch_generated.py [C:/lr]
+Idempotent. Usage: python -I tools/patch_generated.py [C:/lr] [--report-ui-canvas]
 Never run while a build is compiling generated/.
 """
 import pathlib
 import re
 import sys
 
-root = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else r"C:/lr")
+paths = [a for a in sys.argv[1:] if not a.startswith("--")]
+root = pathlib.Path(paths[0] if paths else r"C:/lr")
 gen = root / "generated" / "default"
 inc = root / "src" / "lr_guest_irq.inc"
 
@@ -98,6 +102,117 @@ def patch_effect_spins() -> str:
     raise SystemExit("effect spins: sub_82C45608 not found")
 
 
+CANVAS_MARK = "// LR_UI_CANVAS v1"
+CANVAS_DECL = (CANVAS_MARK + "\n"
+               'extern "C" uint32_t lr_ui_canvas_size(uint32_t value, uint32_t offset);\n'
+               'extern "C" double lr_ui_canvas_ratio(double value);\n')
+# Wide screens (src/lr_render_size.cpp): UI code that reads the frame's size from the singleton
+# 0x83147A54 itself instead of through the getters. Their reads of +32 / +36 (width / height) and
+# +40 (height / width) go through lr_ui_canvas_size / lr_ui_canvas_ratio, which hand the UI its
+# 1280x720 canvas while the frame is wide and the value itself otherwise.
+# Function -> (how the singleton's pointer is loaded, the number of reads expected):
+#   "global": lwz rN,31316(rM), the pointer's global (markers' screen bounds and clamps, 3D item views);
+#   "layer":  lwz rN,244(rM), the pointer a UI layer keeps: the layer classes with their own inlined copy of
+#             sub_82323090, which copies the size to the layer's +256 / +260 (the minimap's layer among them).
+CANVAS_READERS = {
+    "sub_823FFF98": ("global", 2), "sub_82454AF0": ("global", 2), "sub_82454C60": ("global", 2),
+    "sub_82456068": ("global", 2), "sub_824587E0": ("global", 1), "sub_824A17D8": ("global", 2),
+    "sub_82552B80": ("global", 2), "sub_82553130": ("global", 2), "sub_825627A0": ("global", 2),
+    "sub_82736DA8": ("global", 2), "sub_8276C820": ("global", 1),
+    "sub_8275CCB8": ("layer", 2), "sub_8278DF98": ("layer", 2), "sub_827C3D38": ("layer", 2),
+    "sub_827E4E90": ("layer", 2), "sub_82823ED0": ("layer", 2), "sub_82836450": ("layer", 4),
+    "sub_82837578": ("layer", 4), "sub_8283D380": ("layer", 2), "sub_828418E0": ("layer", 6),
+}
+CANVAS_POINTER = {
+    "global": re.compile(r"^\t// lwz (r\d+),31316\(r\d+\)$"),
+    "layer": re.compile(r"^\t// lwz (r\d+),244\(r\d+\)$"),
+}
+CANVAS_SIZE = re.compile(r"^\t// lwz (r\d+),(32|36)\((r\d+)\)$")
+CANVAS_RATIO = re.compile(r"^\t// lfs (f\d+),40\((r\d+)\)$")
+CANVAS_WRITE = re.compile(r"^\t// (?:lwz|lwzx|mr|li|lis|addi|addis|ld|lbz|lhz|add|subf|or|ori) (r\d+),")
+
+
+def canvas_patch_function(body: str, name: str, kind: str) -> tuple[str, int]:
+    lines = body.split("\n")
+    out, pointer, found, i = [], None, 0, 0
+    while i < len(lines):
+        line = lines[i]
+        out.append(line)
+        i += 1
+        m = CANVAS_POINTER[kind].match(line)
+        if m:
+            pointer = m.group(1)
+            continue
+        if line.startswith("loc_"):
+            pointer = None  # a branch target: the register is not known to hold the pointer here
+            continue
+        size, ratio = CANVAS_SIZE.match(line), CANVAS_RATIO.match(line)
+        if pointer and ((size and size.group(3) == pointer) or (ratio and ratio.group(2) == pointer)):
+            # The instruction's own statements, up to the next instruction's comment or a label.
+            stmts = []
+            while i < len(lines) and not (lines[i].startswith("\t// ") or lines[i].startswith("loc_")
+                                          or lines[i] == "}"):
+                stmts.append(lines[i])
+                i += 1
+            out.extend(stmts)
+            # Registers are "ctx.rN" or plain locals "rN" (non_volatile_as_local).
+            if size:
+                pattern = rf"^\t((?:ctx\.)?{size.group(1)})\.u64 = REX_LOAD_U32\("
+            else:
+                pattern = rf"^\t((?:ctx\.)?{ratio.group(1)})\.f64 = double\(temp\.f32\);"
+            dst = [m2.group(1) for m2 in (re.match(pattern, x) for x in stmts) if m2]
+            if len(dst) != 1:
+                raise SystemExit(f"ui canvas: the statement of '{line.strip()}' in {name} was not recognised")
+            if size:
+                out.append(f"\t{dst[0]}.u64 = lr_ui_canvas_size({dst[0]}.u32, {size.group(2)});")
+                if size.group(1) == pointer:
+                    pointer = None
+            else:
+                out.append(f"\t{dst[0]}.f64 = lr_ui_canvas_ratio({dst[0]}.f64);")
+            found += 1
+            continue
+        w = CANVAS_WRITE.match(line)
+        if w and w.group(1) == pointer:
+            pointer = None
+    return "\n".join(out), found
+
+
+def patch_ui_canvas(report: bool = False) -> str:
+    left = dict(CANVAS_READERS)
+    reads = files = 0
+    for f in sorted(gen.glob("lr_recomp.*.cpp")):
+        s = f.read_bytes().decode("utf-8")
+        names = [n for n in left if f"DEFINE_REX_FUNC({n}) {{" in s]
+        if not names:
+            continue
+        changed = False
+        for name in names:
+            kind, expected = left.pop(name)
+            start = s.find(f"DEFINE_REX_FUNC({name}) {{")
+            end = s.find("\nDEFINE_REX_FUNC(", start + 10)
+            end = len(s) if end < 0 else end
+            if "lr_ui_canvas_" in s[start:end]:
+                continue  # this function is patched already
+            body, found = canvas_patch_function(s[start:end], name, kind)
+            if report:
+                print(f"  {name}: {found} reads ({kind}), expected {expected}")
+            elif found != expected:
+                raise SystemExit(f"ui canvas: {found} reads in {name}, expected {expected}")
+            s = s[:start] + body + s[end:]
+            reads += found
+            changed = True
+        if changed and not report:
+            if CANVAS_MARK not in s:
+                head = s.find("\n") + 1  # after the first #include line
+                s = s[:head] + CANVAS_DECL + s[head:]
+            f.write_bytes(s.encode("utf-8"))
+            files += 1
+    if left:
+        raise SystemExit(f"ui canvas: not found: {sorted(left)}")
+    return f"ui canvas: {reads} size reads patched in {files} files" if reads else "ui canvas: already patched"
+
+
 print(patch_pch(gen / "lr_pch.h"))
 print(add_barriers())
 print(patch_effect_spins())
+print(patch_ui_canvas("--report-ui-canvas" in sys.argv))

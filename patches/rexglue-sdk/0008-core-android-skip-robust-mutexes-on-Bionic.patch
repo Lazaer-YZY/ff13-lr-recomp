@@ -1,7 +1,7 @@
 From 65f1ae0ee9bc7e869af5ce25925d33c12526302f Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:22:44 +0800
-Subject: [PATCH 008/117] core(android): skip robust mutexes on Bionic
+Subject: [PATCH 008/119] core(android): skip robust mutexes on Bionic
 
 Bionic has no PTHREAD_MUTEX_ROBUST / pthread_mutex_consistent; Android
 uses the plain std::mutex path already used on macOS.

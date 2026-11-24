@@ -1,7 +1,7 @@
 From e4892ca4f8faf9c4d4512e826cf50e126db032e9 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 14:04:20 +0800
-Subject: [PATCH 064/117] gpu: new Android defaults: resolve feed on,
+Subject: [PATCH 064/119] gpu: new Android defaults: resolve feed on,
  dead-transfer skip mode 2, no mid-frame submits
 
 - vulkan_resolve_feed_textures = true.

@@ -1,7 +1,7 @@
 From 2a62147ddced53937f3e01e7a13bb0bc1b774bd7 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 21:30:56 +0800
-Subject: [PATCH 037/117] input: sdl: queue at most one controller-update pump
+Subject: [PATCH 037/119] input: sdl: queue at most one controller-update pump
  every 4 ms
 
 Every XInput poll queued an SDL_PumpEvents call on the UI thread, re-queued as

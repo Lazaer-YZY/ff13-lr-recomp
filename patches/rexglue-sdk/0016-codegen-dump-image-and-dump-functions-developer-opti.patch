@@ -1,7 +1,7 @@
 From d1fd5fa848edbfaff527469d7de78a396aab353b Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 15:46:02 +0800
-Subject: [PATCH 016/117] codegen: --dump-image and --dump-functions developer
+Subject: [PATCH 016/119] codegen: --dump-image and --dump-functions developer
  options
 
 --dump-image <path>: after the entrypoint XEX is loaded, write the guest image

@@ -1,7 +1,7 @@
 From df325f02eaa1f7ded8c7c5880536c02b4cf78488 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 17:47:57 +0800
-Subject: [PATCH 029/117] input(android): keep the first physical pad on guest
+Subject: [PATCH 029/119] input(android): keep the first physical pad on guest
  user 0 (behaviour informed by lr-ffxiii-port's Android patch, re-implemented)
 
 Android reports a USB pad twice at start (its own input device, then SDL's

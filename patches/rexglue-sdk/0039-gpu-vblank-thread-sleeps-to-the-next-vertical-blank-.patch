@@ -1,7 +1,7 @@
 From a5a66ce710986cf77571daeca08f97f76714744b Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 21:45:53 +0800
-Subject: [PATCH 039/117] gpu: vblank thread sleeps to the next vertical blank;
+Subject: [PATCH 039/119] gpu: vblank thread sleeps to the next vertical blank;
  optional timing stats
 
 The vertical blank thread woke every millisecond to check the time (~1000

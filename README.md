@@ -135,6 +135,8 @@ The game's own Settings menu is the Xbox 360 release's, unchanged. The port's op
 | Option | Choices (default first) | Notes |
 |---|---|---|
 | Frame rate | 60 · 40 · 30 · 60 smoother, in gameplay | Cutscenes stay at 30. 40 uses the 120 Hz panel mode (next start). *60 smoother* runs 60 fps on the 120 Hz panel mode: a late frame shows after 25 ms instead of 33 ms, at about the same power. See [Four frame-rate options](#four-frame-rate-options). |
+| Resolution | 720p · 540p · 1080p | The size the 3D world is drawn at (next start). Menus and HUD stay 720p: 540p is scaled up into the 720p frame (faster, softer), 1080p is scaled down into it (smoother edges, more GPU work: about 27 fps instead of 30 on a Galaxy S10). |
+| Wide screen | off · on | On screens wider than 16:9 (most phones) the 3D world fills the whole screen, with more to see at the sides; menus, HUD and minimap stay in the middle as on a 16:9 screen, movies keep 16:9. Next start. More pixels: about 24 fps instead of 28 on a Galaxy S10. Greyed out on 16:9 screens. |
 | Upscaling | Bilinear · AMD FSR 1.0 · AMD CAS | FSR gives the sharpest edges. Restart required. |
 | Anti-aliasing | Off · FXAA | FXAA runs at 720p before upscaling, so it softens the picture. |
 | Performance overlay | off · on | fps and a frame-time graph. |

@@ -1,7 +1,7 @@
 From e68424edd60080339984bf31edc55c28a1515ba1 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 09:41:23 +0800
-Subject: [PATCH 078/117] gpu: a never-passing depth test without stencil
+Subject: [PATCH 078/119] gpu: a never-passing depth test without stencil
  writes nothing - no rasterization
 
 Lightning Returns draws a full-screen triangle with depth test NEVER, no depth

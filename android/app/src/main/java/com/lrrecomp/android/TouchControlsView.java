@@ -669,7 +669,24 @@ final class TouchControlsView extends View {
         CheckBox perfOverlay = option(rateSec, strings.getString(R.string.touch_perf_overlay),
             strings.getString(R.string.touch_perf_overlay_help), render.getBoolean("overlay", false));
 
-        // --- Image: anti-aliasing at once; the upscaler and stretching from the next start.
+        // --- Image: the 3D resolution (next start, as DS2's), anti-aliasing at once; the upscaler and stretching from
+        // the next start.
+        int heightIndex = java.util.Arrays.asList(RuntimeActivity.RENDER_HEIGHTS).indexOf(
+            render.getString(RuntimeActivity.KEY_RENDER_HEIGHT, RuntimeActivity.DEFAULT_RENDER_HEIGHT));
+        RadioButton resolutionChoice = radio(imageSec, strings.getString(R.string.touch_resolution),
+            heightIndex < 0 ? 1 : heightIndex,
+            strings.getString(R.string.touch_resolution_540), strings.getString(R.string.touch_resolution_720),
+            strings.getString(R.string.touch_resolution_1080));
+        hint(imageSec, strings.getString(R.string.touch_resolution_help));
+        // Wide screen: the 3D world and the final frame take the display's aspect, the menus and HUD keep their 16:9
+        // canvas in the middle (lr_render_size.cpp). Greyed out and unticked on 16:9 screens, as DS2's Fill screen.
+        CheckBox wide = option(imageSec, strings.getString(R.string.touch_wide),
+            strings.getString(R.string.touch_wide_help), render.getBoolean(RuntimeActivity.KEY_WIDE, false));
+        if (!wideScreen()) {
+            wide.setText(strings.getString(R.string.touch_wide) + " " + strings.getString(R.string.touch_stretch_na));
+            wide.setChecked(false);
+            wide.setEnabled(false);
+        }
         header(imageSec, strings.getString(R.string.touch_aa));
         Spinner aaChoice = spinner(imageSec, "fxaa".equals(render.getString("aa", "off")) ? 1 : 0,
             strings.getString(R.string.touch_aa_off), strings.getString(R.string.touch_aa_fxaa));
@@ -787,6 +804,9 @@ final class TouchControlsView extends View {
                 prefs.edit().putBoolean("panel120", rate == 3)
                     .putBoolean("debug_log", debugLog.isChecked())
                     .putBoolean("exact_shader_math", exactMath.isChecked())
+                    .putString(RuntimeActivity.KEY_RENDER_HEIGHT,
+                        RuntimeActivity.RENDER_HEIGHTS[radioChoice(resolutionChoice)])
+                    .putBoolean(RuntimeActivity.KEY_WIDE, wide.isChecked())
                     .putBoolean(GpuCompat.KEY_STRETCH, stretch.isChecked())
                     .putBoolean(GpuCompat.KEY_SHORTCUTS, compatShortcuts.isChecked())
                     .putBoolean(GpuCompat.KEY_SHADERS, compatShaders.isChecked())

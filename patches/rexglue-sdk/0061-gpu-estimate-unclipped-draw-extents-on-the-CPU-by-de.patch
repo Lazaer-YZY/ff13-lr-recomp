@@ -1,7 +1,7 @@
 From d700bd78afcbde62122a11b146751168a8fd8f59 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 11:55:55 +0800
-Subject: [PATCH 061/117] gpu: estimate unclipped draw extents on the CPU by
+Subject: [PATCH 061/119] gpu: estimate unclipped draw extents on the CPU by
  default, as Xenia does
 
 execute_unclipped_draw_vs_on_cpu defaulted to false in ReXGlue (Xenia's

@@ -1,7 +1,7 @@
 From 83f1ef157a19a1c69218b579386354d74a9f7110 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 10:47:15 +0800
-Subject: [PATCH 079/117] gpu: vulkan: shader translation on the creation
+Subject: [PATCH 079/119] gpu: vulkan: shader translation on the creation
  threads; ui: FSR 1.0 / CAS without the FidelityFX SDK
 
 Pipeline creation was asynchronous (vulkan_pipeline_compile_never_blocks) but

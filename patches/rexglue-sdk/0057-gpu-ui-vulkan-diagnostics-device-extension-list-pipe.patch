@@ -1,7 +1,7 @@
 From 45fac1be8b6b1c074a11292d6f8511648cbcb1eb Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 10:55:17 +0800
-Subject: [PATCH 057/117] gpu/ui: vulkan: diagnostics: device extension list,
+Subject: [PATCH 057/119] gpu/ui: vulkan: diagnostics: device extension list,
  pipeline statistics, coarse shading
 
 - Log every device extension the driver offers at startup.

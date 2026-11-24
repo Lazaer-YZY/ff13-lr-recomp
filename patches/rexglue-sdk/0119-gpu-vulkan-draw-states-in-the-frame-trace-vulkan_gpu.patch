@@ -1,0 +1,112 @@
+From b540614f2397d0ae68721f4e05274458f8d9f61e Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Tue, 24 Nov 2026 12:53:40 +0800
+Subject: [PATCH 119/119] gpu/vulkan: draw states in the frame trace
+ (vulkan_gpu_trace_draw_state)
+
+With vulkan_gpu_trace_frame, each draw of the traced frame logs its state
+once per distinct state (D<n>[...], repeats print D<n>): shader hashes,
+PA_CL_VTE_CNTL, the viewport scale / offset, window offset and scissor, the
+surface and colour target words, and the float constants the vertex shader
+(first 12) and the pixel shader (first 8) use. Found how Lightning Returns
+projects its UI (wide screens, 2026-11-24).
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 2859918..8887a33 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -1154,6 +1154,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool gpu_trace_active_ = false;
+   uint32_t gpu_trace_pass_draws_ = 0;
+   std::string gpu_trace_;
++  // vulkan_gpu_trace_draw_state: the distinct draw states of the traced frame.
++  std::unordered_map<std::string, uint32_t> gpu_trace_draw_states_;
+   GpuTimingSubmission gpu_timing_current_;
+   std::vector<GpuTimingSubmission> gpu_timing_free_;
+   std::deque<std::pair<uint64_t, GpuTimingSubmission>> gpu_timing_submitted_;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index c47d8d9..f0ef039 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -214,6 +214,10 @@ struct CpScopedTimer {
+   }
+ };
+ }  // namespace
++REXCVAR_DEFINE_BOOL(vulkan_gpu_trace_draw_state, false, "GPU",
++                    "With vulkan_gpu_trace_frame, each draw of the traced frame logs its state once "
++                    "per distinct state: shaders, viewport transform, window offset, scissor, the "
++                    "render target and the vertex shader's float constants");
+ REXCVAR_DEFINE_BOOL(vulkan_gpu_trace_frame, false, "GPU",
+                     "With vulkan_gpu_timing, log the GPU command sequence of one frame (render "
+                     "passes with their draw counts and end reasons, resolves, texture loads, "
+@@ -4346,6 +4350,7 @@ void VulkanCommandProcessor::GpuTimingOnSwap() {
+     gpu_trace_active_ = true;
+     gpu_trace_pass_draws_ = 0;
+     gpu_trace_.clear();
++    gpu_trace_draw_states_.clear();
+     gpu_trace_draws_.clear();
+     gpu_trace_draw_ns_.clear();
+   }
+@@ -6173,6 +6178,60 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                           pixel_shader ? pixel_shader->ucode_data_hash() : 0, uint32_t(prim_type),
+                           index_count);
+   }
++  if (gpu_trace_active_ && REXCVAR_GET(vulkan_gpu_trace_draw_state)) {
++    // One line per distinct draw state of the traced frame (D<n> = the state's number, repeated
++    // states only print it).
++    std::string state = fmt::format(
++        "vs={:016X} ps={:016X} prim={} vte={:03X} vp=({:g},{:g},{:g},{:g}) mode={:08X} "
++        "win={:08X} scis={:08X}-{:08X} surf={:08X} c0={:08X} cm={:08X} C:",
++        vertex_shader->ucode_data_hash(), pixel_shader ? pixel_shader->ucode_data_hash() : 0,
++        uint32_t(prim_type), regs[XE_GPU_REG_PA_CL_VTE_CNTL],
++        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
++        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
++        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
++        regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET), regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL],
++        regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
++        regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], regs[XE_GPU_REG_RB_SURFACE_INFO],
++        regs[XE_GPU_REG_RB_COLOR_INFO], regs[XE_GPU_REG_RB_MODECONTROL]);
++    const Shader::ConstantRegisterMap& trace_constants = vertex_shader->constant_register_map();
++    uint32_t traced = 0;
++    for (uint32_t i = 0; i < 256 && traced < 12; ++i) {
++      if (!(trace_constants.float_bitmap[i >> 6] & (uint64_t(1) << (i & 63)))) {
++        continue;
++      }
++      ++traced;
++      fmt::format_to(std::back_inserter(state), "{}=({:g},{:g},{:g},{:g})", i,
++                     regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * i),
++                     regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * i + 1),
++                     regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * i + 2),
++                     regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * i + 3));
++    }
++    if (pixel_shader) {
++      // The pixel shader's float constants (registers 256 and up), the first eight used.
++      const Shader::ConstantRegisterMap& trace_pixel_constants = pixel_shader->constant_register_map();
++      uint32_t traced_pixel = 0;
++      state += " P:";
++      for (uint32_t i = 0; i < 256 && traced_pixel < 8; ++i) {
++        if (!(trace_pixel_constants.float_bitmap[i >> 6] & (uint64_t(1) << (i & 63)))) {
++          continue;
++        }
++        ++traced_pixel;
++        fmt::format_to(std::back_inserter(state), "{}=({:g},{:g},{:g},{:g})", i,
++                       regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * i),
++                       regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * i + 1),
++                       regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * i + 2),
++                       regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * i + 3));
++      }
++    }
++    auto found = gpu_trace_draw_states_.find(state);
++    if (found == gpu_trace_draw_states_.end()) {
++      const uint32_t number = uint32_t(gpu_trace_draw_states_.size());
++      gpu_trace_draw_states_.emplace(state, number);
++      GpuTrace(fmt::format("D{}[{} n={}]", number, state, index_count));
++    } else {
++      GpuTrace(fmt::format("D{}", found->second));
++    }
++  }
+ 
+   // Invalidate textures in memexported memory and watch for changes.
+   if (!memexport_ranges_.empty()) {
