@@ -156,7 +156,8 @@ final class ProblemReport {
             + ", wide screen " + (render.getBoolean(RuntimeActivity.KEY_WIDE, false) ? "on" : "off")
             + ", frame rate " + render.getString("fps", RuntimeActivity.DEFAULT_FPS)
             + "\nDebug logging this run: " + (activity.debugLoggingThisRun() ? "on" : "off")
-            + "\nGPU compatibility: " + GpuCompat.Choices.from(render).summary();
+            + "\nGPU compatibility: " + GpuCompat.Choices.from(render).summary()
+            + "\nSustained performance mode: " + RuntimeActivity.sustainedState;
         String settings = settingsText(head, render.getAll(), SETTINGS_MAX_CHARS);
         return buildIssueUri(REPOSITORY, version, device, gpu, settings,
             activity.getString(R.string.report_attach, zipName) + "\n\n");

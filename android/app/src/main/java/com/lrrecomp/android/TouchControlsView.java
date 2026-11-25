@@ -749,6 +749,13 @@ final class TouchControlsView extends View {
         // 2026-11-11 (-12% GPU in Luxerion, no visible difference seen); the fallback if a scene glitches.
         CheckBox exactMath = option(advanced, strings.getString(R.string.touch_exact_shader_math),
             strings.getString(R.string.touch_exact_shader_math_help), render.getBoolean("exact_shader_math", false));
+        // Sustained performance mode (off by default since 2026-11-26, as in DS2; RuntimeActivity.setSustainedPerformance):
+        // greyed out where the phone does not offer it. Applied at once.
+        boolean sustainedSupported = RuntimeActivity.sustainedSupported(activity);
+        CheckBox sustained = option(advanced, strings.getString(R.string.touch_sustained),
+            strings.getString(sustainedSupported ? R.string.touch_sustained_help : R.string.touch_sustained_unsupported),
+            sustainedSupported && render.getBoolean(RuntimeActivity.KEY_SUSTAINED, false));
+        sustained.setEnabled(sustainedSupported);
         // GPU compatibility (testing; public issue #4, Adreno 600 series): renderer paths to switch off
         // one at a time, read at the next start (GpuCompat).
         header(advanced, strings.getString(R.string.touch_section_compat));
@@ -824,7 +831,10 @@ final class TouchControlsView extends View {
                         : radioChoice(turnipMode) == 2 ? GpuCompat.MODE_GMEM : GpuCompat.MODE_AUTO)
                     .putBoolean(GpuCompat.KEY_TURNIP_NO_UBWC, compatNoUbwc == null
                         ? render.getBoolean(GpuCompat.KEY_TURNIP_NO_UBWC, false) : compatNoUbwc.isChecked())
+                    .putBoolean(RuntimeActivity.KEY_SUSTAINED, sustainedSupported
+                        ? sustained.isChecked() : render.getBoolean(RuntimeActivity.KEY_SUSTAINED, false))
                     .commit();  // on disk before a restart below
+                if (sustainedSupported) activity.setSustainedPerformance(sustained.isChecked());
                 activity.applyRenderSettings(rate == 1 ? "40" : rate >= 2 ? "60g" : "30",
                     aaChoice.getSelectedItemPosition() == 1 ? "fxaa" : "off",
                     upscales[upscaleChoice.getSelectedItemPosition()], perfOverlay.isChecked());

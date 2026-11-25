@@ -892,3 +892,22 @@ Also removed the `ep=` export: member+0x60 was the HP number's digit count (alwa
 
 ## 2026-11-25
 - **Report a problem on GitHub (CTRL → Troubleshooting; ported from DS2's 270fee6, which the owner asked for in DS2, LR and later ports on 2026-11-25).** One tap saves the log zip in Download (MediaStore on Android 10+, no permission; the system file picker on 9 and older) and opens the public repository's issue form `.github/ISSUE_TEMPLATE/report.yml` with `version`, `device`, `gpu`, `settings` and `logs` filled in through the fields' ids; GitHub has no way for an app to attach a file (neither the new-issue URL nor the REST API), so the player attaches the zip. Differences from DS2: LR has no frame captures, so there is no attachment budget (the zip is the Save logs zip: lr.log's last 32 MB came to 2.3 MB zipped on the Thor); the Debug logging check uses **this run's** state (CTRL's switch applies at the next start), and its "Turn on Debug logging" button offers LR's restart dialog instead of a toast; the settings field starts with the screen size, render height, wide screen and frame rate with their defaults (render_settings only holds what was changed), then GPU compatibility and the stored settings (bookkeeping keys left out, 1500 characters at most: GitHub answers 414 for very long URLs). device.txt in every zip now says whether debug logging was on for the run. Thor (dev APK): dialog, zip in Download, form URL 850 characters, Firefox opened GitHub's sign-in page (signed out), Back returned to the game. **The form only fills in once `report.yml` is on the public repository's default branch**: it goes out with the next public export, which waits for the owner's OK (as DS2's does); until then the link opens GitHub's plain new-issue page.
+- **Report form exported, no release yet (the owner: "Only export. Can wait for more changes before public release").** Public da49f1b carries `report.yml` (live for every version's players) and the README line, marked as coming after v1.2.6. The button ships with the next release.
+
+## 2026-11-26
+- **Sustained performance mode off by default (ported from DS2's 02fa14d at the DS2 session's suggestion).** RuntimeActivity
+  called Window.setSustainedPerformanceMode(true) wherever a phone supports it, and the state went to logcat only.
+  AOSP: vendors implement the hint by capping the CPU / GPU maximum clocks, how low is up to them (PPSSPP #9738: a GPU
+  held at 315 MHz; DS2's issue #34: an Adreno 720 at 510 MHz while other games reached ~980). It was never measured on a
+  device that honours it (the Thor reports "not supported"), and LR is GPU-bound on mid-range phones, so the risk
+  sits with exactly the players who report low fps. Now: off by default; CTRL -> Troubleshooting -> Advanced
+  "Sustained performance mode" (greyed out with "this phone does not offer it" where unsupported, applied at once
+  through the window flag); device.txt `sustained_performance_mode=` and the report form's settings carry the state;
+  debug launches `--es LR_SUSTAINED 1|0`. Nothing changes on the Thor. Device check with the next release's Thor
+  regression (the release waits for more changes, the owner 2026-11-25).
+- **Thor regression of the sustained-mode port (2698d9c, `out/regress/thor/sustained_20261126_20261126_072305/`):**
+  boot PASS (SSIM 0.999), field PASS (30.1 / 25.9, SSIM 0.88), battle PASS (30.0 / 26.7), bcheats PASS; cheats failed
+  once on the known 'no clock held line' (clock standing at 21:00) and PASSed on its re-run (`sustained_cheats`).
+  CPU 60.5 avg / 94.7 peak C, GPU 53.0 / 67.7 C, 3.77 W. CTRL -> Troubleshooting -> Advanced shows the switch greyed
+  out with "this phone does not offer it" (logcat: "sustained performance mode: not supported"). Exported to the
+  public repo (the owner: regression before publishing); no release.

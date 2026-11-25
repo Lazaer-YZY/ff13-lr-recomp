@@ -63,6 +63,9 @@
     <string name="touch_debug_log_help">Records statistics for bug reports. Slight extra load.</string>
     <string name="touch_exact_shader_math">Exact Xbox shader math *</string>
     <string name="touch_exact_shader_math_help">Only if something looks wrong. Slower; shaders rebuild once.</string>
+    <string name="touch_sustained">Sustained performance mode</string>
+    <string name="touch_sustained_help">Asks Android for clocks the phone can hold for hours. On some phones that caps the GPU well below its top speed, so it is off by default; try it only if your phone overheats.</string>
+    <string name="touch_sustained_unsupported">Sustained performance mode: this phone does not offer it.</string>
     <string name="touch_gpu_driver">GPU driver: %1$s …</string>
     <string name="touch_gpu_driver_system">System</string>
     <string name="touch_game_folder">Game folder …</string>
