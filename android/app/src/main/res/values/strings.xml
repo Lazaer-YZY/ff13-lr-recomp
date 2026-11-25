@@ -49,7 +49,7 @@
     <string name="touch_upscale_fsr">AMD FSR 1 (sharper edges)</string>
     <string name="touch_upscale_cas">AMD CAS (sharpening)</string>
     <string name="touch_stretch">Stretch to fill wide screens *</string>
-    <string name="touch_stretch_help">No black bars on phones wider than 16:9; the picture is stretched sideways.</string>
+    <string name="touch_stretch_help">No black bars on phones wider than 16:9; the picture is stretched sideways. Movies keep their shape.</string>
     <!-- Second screen -->
     <string name="touch_companion">Companion</string>
     <string name="touch_companion_help">Schemata in battle (tap to switch), the map in the field, artwork in cutscenes.</string>
@@ -99,4 +99,47 @@
     <string name="restart_message">Settings marked * apply when the game starts. Restarting now loses progress since the last save.</string>
     <string name="restart_now">Restart</string>
     <string name="restart_later">Later</string>
+    <!-- Save backups (SaveBackups.java, CTRL -> Game). -->
+    <string name="touch_save_backups">Save backups …</string>
+    <string name="backup_title">Save backups</string>
+    <string name="backup_explain">Copies of your saves (every slot) in a folder you choose, outside the app, so uninstalling the game does not delete them. A copy is made when the game has saved, at most every 10 minutes. The latest 10 and one for each of the last 7 days played are kept, up to 64 MB in all (the latest 3 always).</string>
+    <string name="backup_folder">Folder: %1$s</string>
+    <string name="backup_off">Off</string>
+    <string name="backup_pick_hint">Choose or create a folder, for example Documents/LR saves.</string>
+    <string name="backup_folder_lost">The app can no longer open this folder. Choose it again.</string>
+    <string name="backup_internal_storage">Internal storage</string>
+    <string name="backup_sd_card">SD card %1$s</string>
+    <string name="backup_choose">Choose folder …</string>
+    <string name="backup_turn_off">Turn off</string>
+    <string name="backup_now">Back up now</string>
+    <string name="backup_working">Backing up …</string>
+    <string name="backup_close">Close</string>
+    <string name="backup_list">Backups</string>
+    <string name="backup_reading">Reading the folder …</string>
+    <string name="backup_none">No backups in this folder yet.</string>
+    <string name="backup_restore">Restore</string>
+    <string name="backup_no_save">The game has no saves yet.</string>
+    <string name="backup_restore_latest">Restore your latest backup (%1$s)</string>
+    <string name="backup_no_picker">This device has no folder picker.</string>
+    <string name="backup_no_folder">No backup folder is set.</string>
+    <string name="backup_turned_off">Save backups are off. The backups stay in the folder.</string>
+    <string name="backup_done">Saves backed up.</string>
+    <string name="backup_nothing">Nothing to back up: the game has no saves yet.</string>
+    <string name="backup_raced">The game was saving. Try again in a moment.</string>
+    <string name="backup_failed">Backup failed: %1$s</string>
+    <string name="backup_empty">This backup holds no saves.</string>
+    <string name="backup_restoring">Copying the backup …</string>
+    <string name="backup_restore_failed">Could not restore this backup: %1$s</string>
+    <string name="backup_restore_title">Restore this backup?</string>
+    <string name="backup_restore_message">The game restarts with the saves from %1$s, all slots together. Your current saves are moved aside, not deleted. Progress since the last save is lost.</string>
+    <string name="backup_restart_now">Restart now</string>
+    <string name="backup_restore_later">The backup replaces your saves the next time the game starts.</string>
+    <string name="backup_pending">A backup replaces your saves the next time the game starts.</string>
+    <string name="backup_pending_cancel">Cancel restore</string>
+    <string name="backup_found_title">This folder has backups</string>
+    <string name="backup_found_message">The newest is from %1$s. Restore it?</string>
+    <string name="backup_found_message_has_save">The newest is from %1$s. Restore it? If not, your current saves stay as they are and are backed up here too.</string>
+    <string name="backup_not_now">Not now</string>
+    <string name="backup_restored">Saves restored from the backup of %1$s.</string>
+    <string name="backup_restore_start_failed">The save backup could not be restored (details in the log).</string>
 </resources>

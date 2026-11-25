@@ -1,7 +1,7 @@
 From a9832e0dd0c70a5d5dfaa55391cf81bee1318986 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 16:03:45 +0800
-Subject: [PATCH 065/119] gpu: the command thread waits for new commands
+Subject: [PATCH 065/120] gpu: the command thread waits for new commands
  without spinning or a timeout
 
 Battle CPU profile on the Thor: the 'GPU Commands' thread spent 4.3% of all

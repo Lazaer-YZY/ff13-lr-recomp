@@ -1,7 +1,7 @@
 From fb04046c52733c5b0fb555cbc3eb6ffb331ecc7e Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 17:21:10 +0800
-Subject: [PATCH 067/119] gpu: depth transfers from a recorded clear constant
+Subject: [PATCH 067/120] gpu: depth transfers from a recorded clear constant
  become clears (battle GPU work -2%)
 
 gpu_constant_transfers_as_clears (default true): a depth-only draw that is a

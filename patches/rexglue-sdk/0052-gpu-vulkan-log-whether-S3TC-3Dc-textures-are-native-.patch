@@ -1,7 +1,7 @@
 From 7eea4f79d36b73fb58e82311229a321ba8d05bba Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 09:27:30 +0800
-Subject: [PATCH 052/119] gpu: vulkan: log whether S3TC / 3Dc textures are
+Subject: [PATCH 052/120] gpu: vulkan: log whether S3TC / 3Dc textures are
  native or decompressed
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

@@ -1,7 +1,7 @@
 From a49a1c334e1cbfbf6d92818990eb6971f7a14a22 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Wed, 11 Nov 2026 11:56:05 +0800
-Subject: [PATCH 099/119] gpu: command-thread timers only with
+Subject: [PATCH 099/120] gpu: command-thread timers only with
  vulkan_slow_frame_ms (the app's debug logging switch)
 
 

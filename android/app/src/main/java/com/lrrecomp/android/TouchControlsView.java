@@ -711,8 +711,11 @@ final class TouchControlsView extends View {
             strings.getString(R.string.touch_companion_help), CompanionScreen.enabled(render));
         final CheckBox companionBox = companion;
 
-        // --- Game: the game folder, then the cheats (public issue #1): one switch each, applied at once (Cheats.java).
+        // --- Game: the game folder, save backups, then the cheats (public issue #1): one switch each, applied at once
+        // (Cheats.java).
         Button folderButton = pageButton(gameSec, strings.getString(R.string.touch_game_folder));
+        // Copies of the saves in a folder the player picks, outside the app (SaveBackups; off until a folder is chosen).
+        Button backupsButton = pageButton(gameSec, strings.getString(R.string.touch_save_backups));
         header(gameSec, strings.getString(R.string.touch_section_cheats));
         int cheatBits = Cheats.saved(render);
         CheckBox[] cheatBoxes = new CheckBox[Cheats.ALL.length];
@@ -848,6 +851,10 @@ final class TouchControlsView extends View {
         folderButton.setOnClickListener(v -> {
             settingsDialog.dismiss();
             activity.openGameFolderPage();
+        });
+        backupsButton.setOnClickListener(v -> {
+            settingsDialog.dismiss();
+            activity.openSaveBackupsPage();
         });
         logsButton.setOnClickListener(v -> {
             settingsDialog.dismiss();

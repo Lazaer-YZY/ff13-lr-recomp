@@ -1,7 +1,7 @@
 From 00005055b66f323a0349820e1e66b9138deb1b6a Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:16:53 +0800
-Subject: [PATCH 005/119] scripts: add configure_android.sh for the NDK arm64
+Subject: [PATCH 005/120] scripts: add configure_android.sh for the NDK arm64
  configure
 
 Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>

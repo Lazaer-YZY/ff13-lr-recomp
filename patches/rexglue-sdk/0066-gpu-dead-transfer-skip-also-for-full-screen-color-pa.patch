@@ -1,7 +1,7 @@
 From bc6c1600df5a8ef824917059c24e267561f7e5c7 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 17:06:21 +0800
-Subject: [PATCH 066/119] gpu: dead-transfer skip also for full-screen color
+Subject: [PATCH 066/120] gpu: dead-transfer skip also for full-screen color
  passes (battle transfers 3.5 -> 2.5 ms)
 
 - gpu_skip_overwritten_transfers now also cuts the covered area out of

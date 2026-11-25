@@ -1,7 +1,7 @@
 From c9ea4ce730e5113e55b02ec3a3f644b3fe4ba115 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Wed, 11 Nov 2026 02:31:56 +0800
-Subject: [PATCH 095/119] gpu: vulkan_pipeline_creation_little_cores option
+Subject: [PATCH 095/120] gpu: vulkan_pipeline_creation_little_cores option
  (creation threads on the slowest cluster)
 
 Off by default: on the cold-cache warp bench it made no difference (1% low 30.0 /

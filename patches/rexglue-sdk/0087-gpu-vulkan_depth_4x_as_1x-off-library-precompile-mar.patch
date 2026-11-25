@@ -1,7 +1,7 @@
 From b8d91bec753eaf2616ee44d7c23720830e45a344 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 17:32:03 +0800
-Subject: [PATCH 087/119] gpu: vulkan_depth_4x_as_1x (off); library precompile
+Subject: [PATCH 087/120] gpu: vulkan_depth_4x_as_1x (off); library precompile
  marker covers the translation switches
 
 vulkan_depth_4x_as_1x draws a 4x depth-only draw into a depth surface never drawn

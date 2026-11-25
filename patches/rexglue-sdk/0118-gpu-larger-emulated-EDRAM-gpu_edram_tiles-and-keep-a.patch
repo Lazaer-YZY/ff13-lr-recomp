@@ -1,7 +1,7 @@
 From 81fe59fab71aa40a1d9ae4946dec5a96d405e10d Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Tue, 24 Nov 2026 07:42:21 +0800
-Subject: [PATCH 118/119] gpu: larger emulated EDRAM (gpu_edram_tiles) and
+Subject: [PATCH 118/120] gpu: larger emulated EDRAM (gpu_edram_tiles) and
  keep-aspect pixel shaders from the DS2 port
 
 Engine-independent renderer pieces of the Dark Souls II port's SDK (its commits 60975d3,

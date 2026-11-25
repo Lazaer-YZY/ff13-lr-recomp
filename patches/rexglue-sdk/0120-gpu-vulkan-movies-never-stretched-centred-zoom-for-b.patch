@@ -1,0 +1,267 @@
+From 3aa36f030b23b61d19352ff7c09a7dce3e49a9b5 Mon Sep 17 00:00:00 2001
+From: LR Recomp <noreply@lr-recomp.invalid>
+Date: Tue, 24 Nov 2026 17:47:51 +0800
+Subject: [PATCH 120/120] gpu/vulkan: movies never stretched; centred zoom for
+ bars on all four sides
+
+gpu_keep_aspect_pixel_shaders' pillarbox now tells full-screen movies (largest plane at least
+960x540) from movies placed in menus. A full-screen movie stays 16:9 on the screen also when
+the presenter stretches the frame (gpu_keep_aspect_display_aspect), and one whose own picture
+has black bars at the top and bottom as well (bars on all four sides) is zoomed, centred,
+until the side or the top and bottom bars are gone, nothing of the picture cut off
+(gpu_keep_aspect_zoom_letterbox, default on; bars measured from the luma plane in guest
+memory and steadied over 15 frames; include/rex/graphics/util/letterbox.h).
+gpu_keep_aspect_test_bars forces the bars for testing.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+diff --git a/include/rex/graphics/util/letterbox.h b/include/rex/graphics/util/letterbox.h
+new file mode 100644
+index 0000000..79e866e
+--- /dev/null
++++ b/include/rex/graphics/util/letterbox.h
+@@ -0,0 +1,87 @@
++/**
++ * Letterbox bars of a movie frame, for gpu_keep_aspect_pixel_shaders' zoom (LR port, 2026-11-24).
++ *
++ * A movie kept 16:9 on a wider screen gets bars at the sides. When the movie's own picture also has black bars at the
++ * top and bottom (a wider film inside a 16:9 frame), it has bars on all four sides; then it is zoomed, centred, until
++ * either the side bars or the top and bottom bars are gone, so nothing of the picture is cut off. Pure logic (a luma
++ * reader callback), so host tests can include it.
++ */
++
++#pragma once
++
++#include <algorithm>
++#include <cstdint>
++
++namespace rex::graphics::letterbox {
++
++// Luma at or below this counts as black (video black is 16; compression noise stays a few steps above it).
++constexpr uint32_t kBlack = 24;
++// Samples across each row.
++constexpr uint32_t kSamples = 40;
++// Bars thinner than this (rows of the movie) are not worth a zoom.
++constexpr uint32_t kMinBars = 12;
++// A measurement has to repeat (within kTolerance rows) for this many frames before the zoom follows it.
++constexpr uint32_t kStableFrames = 15;
++constexpr uint32_t kTolerance = 2;
++
++// Rows of black at the top and the bottom of a movie frame when they match (a letterbox), 0 when the picture reaches
++// an edge or the dark rows differ between the top and the bottom (a dark sky, a dark floor), or -1 when the frame is
++// dark throughout (a fade: no information). luma(x, y) returns the luma (0-255) at a pixel of the frame;
++// visible_height is the movie's own height (a decoder's plane may be taller, padded).
++template <typename Luma>
++int32_t MeasureBars(uint32_t width, uint32_t visible_height, Luma&& luma) {
++  if (width < 64 || visible_height < 64) return 0;
++  auto dark_row = [&](uint32_t y) {
++    for (uint32_t i = 0; i < kSamples; ++i) {
++      const uint32_t x = 8 + i * (width - 16) / (kSamples - 1);
++      if (uint32_t(luma(x, y)) > kBlack) return false;
++    }
++    return true;
++  };
++  const uint32_t half = visible_height / 2;
++  uint32_t top = 0;
++  while (top < half && dark_row(top)) top += 2;
++  if (top >= half) return -1;
++  uint32_t bottom = 0;
++  while (bottom < half && dark_row(visible_height - 1 - bottom)) bottom += 2;
++  if (bottom >= half) return -1;
++  const uint32_t low = std::min(top, bottom), high = std::max(top, bottom);
++  if (high - low > 4) return 0;
++  return int32_t(low);
++}
++
++// The centred zoom for a movie with `bars` rows of black at the top and the bottom of its visible_height rows, shown
++// pillarboxed where at most max_zoom (the frame's width / the movie's width on screen) fills the width: the smaller of
++// "the side bars gone" and "the top and bottom bars gone". 1 = no zoom (no letterbox, or no side bars).
++inline float Zoom(float max_zoom, uint32_t visible_height, uint32_t bars) {
++  if (bars < kMinBars || max_zoom <= 1.0f || 4 * bars >= visible_height) return 1.0f;
++  const float fill_height = float(visible_height) / float(visible_height - 2 * bars);
++  return std::max(1.0f, std::min(max_zoom, fill_height));
++}
++
++// Steadies the measurements of one movie: the bars in use change only after a new measurement has repeated for
++// kStableFrames frames, so dark scenes and fades don't make the picture jump.
++class BarTracker {
++ public:
++  // One frame's MeasureBars result; returns the bars in use.
++  uint32_t Update(int32_t measured) {
++    if (measured < 0) return applied_;
++    const uint32_t bars = uint32_t(measured);
++    if (frames_ && Near(bars, candidate_)) {
++      ++frames_;
++    } else {
++      candidate_ = bars;
++      frames_ = 1;
++    }
++    if (frames_ >= kStableFrames && !Near(candidate_, applied_)) applied_ = candidate_;
++    return applied_;
++  }
++  void Reset() { candidate_ = applied_ = frames_ = 0; }
++  uint32_t applied() const { return applied_; }
++
++ private:
++  static bool Near(uint32_t a, uint32_t b) { return (a > b ? a - b : b - a) <= kTolerance; }
++  uint32_t candidate_ = 0, applied_ = 0, frames_ = 0;
++};
++
++}  // namespace rex::graphics::letterbox
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index f0ef039..724425e 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -35,7 +35,9 @@
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
++#include <rex/graphics/pipeline/texture/util.h>
+ #include <rex/graphics/util/draw.h>
++#include <rex/graphics/util/letterbox.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/shader/shader.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+@@ -150,6 +152,14 @@ REXCVAR_DEFINE_STRING(gpu_keep_aspect_pixel_shaders, "", "GPU/Vulkan",
+                       "with a pixel shader.");
+ REXCVAR_DEFINE_BOOL(gpu_keep_aspect_pillarbox, false, "GPU/Vulkan",
+                     "gpu_keep_aspect_pixel_shaders: a centred 16:9 viewport instead of filling the width");
++REXCVAR_DEFINE_DOUBLE(gpu_keep_aspect_display_aspect, 0.0, "GPU/Vulkan",
++                      "gpu_keep_aspect_pixel_shaders: the aspect the frame is shown at when the presenter stretches it "
++                      "(0 = the frame's own). Full-screen movies then stay 16:9 on the screen, not in the frame.");
++REXCVAR_DEFINE_BOOL(gpu_keep_aspect_zoom_letterbox, true, "GPU/Vulkan",
++                    "gpu_keep_aspect_pillarbox: a full-screen movie whose picture has black bars at the top and bottom "
++                    "(bars on all four sides) is zoomed, centred, until the side or the top and bottom bars are gone");
++REXCVAR_DEFINE_INT32(gpu_keep_aspect_test_bars, -1, "GPU/Vulkan",
++                     "Testing gpu_keep_aspect_zoom_letterbox: use these letterbox rows instead of measuring them");
+ 
+ REXCVAR_DEFINE_BOOL(vulkan_gpu_timing, false, "GPU",
+                     "Log a per-frame GPU time breakdown (Vulkan timestamp queries between render "
+@@ -5242,6 +5252,67 @@ Shader* VulkanCommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32
+   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
+ }
+ 
++// gpu_keep_aspect_zoom_letterbox: the centred zoom of a pillarboxed full-screen movie whose own picture has black bars
++// at the top and bottom (bars on all four sides), from its luma plane in guest memory (8 bits per pixel, linear or
++// tiled; read as whole 32-bit words, so the endian swap does not matter). max_zoom = the frame's width / the movie's
++// width on screen. The bars are steadied per movie (letterbox::BarTracker); a movie ends after 1 s without a frame.
++static float KeepAspectLetterboxZoom(const memory::Memory& memory, const xenos::xe_gpu_texture_fetch_t& fetch,
++                                     uint32_t width, uint32_t height, float max_zoom) {
++  static letterbox::BarTracker tracker;
++  static std::chrono::steady_clock::time_point last_frame;
++  static uint32_t logged_bars = 0;
++  static bool movie_logged = false;
++  const auto now = std::chrono::steady_clock::now();
++  if (now - last_frame > std::chrono::seconds(1)) {
++    tracker.Reset();
++    logged_bars = 0;
++    movie_logged = false;
++  }
++  last_frame = now;
++  // A decoder's plane is padded (1280x736 for a 1280x720 movie): the movie's own rows, at most 16:9.
++  const uint32_t visible_height = std::min(height, (width * 9 + 8) / 16);
++  uint32_t bars;
++  const int32_t test_bars = REXCVAR_GET(gpu_keep_aspect_test_bars);
++  if (test_bars >= 0) {
++    bars = uint32_t(test_bars);
++  } else {
++    if (fetch.format != xenos::TextureFormat::k_8) {
++      if (!movie_logged) {
++        movie_logged = true;
++        REXLOG_INFO("gpu keep aspect: full-screen movie {}x{} in format {}: its bars are not measured", width,
++                    height, uint32_t(fetch.format));
++      }
++      return 1.0f;
++    }
++    const uint32_t base = fetch.base_address << 12;
++    const uint32_t pitch = fetch.pitch << 5;
++    const bool tiled = fetch.tiled;
++    auto luma = [&](uint32_t x, uint32_t y) -> uint32_t {
++      x &= ~3u;
++      const uint32_t offset = tiled ? uint32_t(texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), pitch, 0))
++                                    : y * pitch + x;
++      const uint8_t* p = memory.TranslatePhysical<const uint8_t*>(base + offset);
++      return std::max(std::max(p[0], p[1]), std::max(p[2], p[3]));
++    };
++    const int32_t measured = letterbox::MeasureBars(width, visible_height, luma);
++    bars = tracker.Update(measured);
++    if (!movie_logged && measured >= 0) {
++      movie_logged = true;
++      REXLOG_INFO("gpu keep aspect: full-screen movie {}x{} ({} rows shown, {}, pitch {}), first picture: {} rows of "
++                  "black at the top and bottom, luma {} / {} / {} at the left / centre / right of the middle row",
++                  width, height, visible_height, tiled ? "tiled" : "linear", pitch, measured,
++                  luma(width / 8, visible_height / 2), luma(width / 2, visible_height / 2),
++                  luma(width * 7 / 8, visible_height / 2));
++    }
++  }
++  if (bars != logged_bars) {
++    logged_bars = bars;
++    REXLOG_INFO("gpu keep aspect: movie {}x{} has {} rows of black at the top and bottom; zoom {:.3f}", width,
++                visible_height, bars, letterbox::Zoom(max_zoom, visible_height, bars));
++  }
++  return letterbox::Zoom(max_zoom, visible_height, bars);
++}
++
+ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
+                                        IndexBufferInfo* index_buffer_info,
+                                        bool major_mode_explicit) {
+@@ -5787,6 +5858,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // their viewport is wider, so a movie is not stretched across a wide screen: by default the picture is scaled up to
+   // the full width (clip-space Y scaled about the centre, the top and bottom cropped: a movie's letterbox bars), with
+   // gpu_keep_aspect_pillarbox a centred 16:9 viewport. From the Dark Souls II port (2026-11-21).
++  // LR (2026-11-24): a full-screen movie (its largest plane at least 960x540) stays 16:9 on the screen also when the
++  // presenter stretches the frame (gpu_keep_aspect_display_aspect), and a pillarboxed one whose picture has bars at
++  // the top and bottom too is zoomed until one pair of bars is gone (gpu_keep_aspect_zoom_letterbox). Smaller movies
++  // placed in menus (a title banner, a tutorial clip) follow the frame, as the menus do.
+   if (pixel_shader) {
+     static const std::vector<uint64_t> keep_aspect_shaders = [] {
+       std::vector<uint64_t> hashes;
+@@ -5804,13 +5879,43 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+         std::find(keep_aspect_shaders.begin(), keep_aspect_shaders.end(),
+                   pixel_shader->ucode_data_hash()) != keep_aspect_shaders.end()) {
+       const uint32_t width = viewport_info.xy_extent[0], height = viewport_info.xy_extent[1];
+-      const uint32_t wanted = (height * 16 + 8) / 9;
+-      if (height && width > wanted + 1) {
++      // The movie's luma plane: the binding with the largest texture.
++      xenos::xe_gpu_texture_fetch_t luma_fetch = {};
++      uint32_t luma_width = 0, luma_height = 0;
++      for (const Shader::TextureBinding& binding : pixel_shader->texture_bindings()) {
++        const xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
++        if (fetch.dimension != xenos::DataDimension::k2DOrStacked) continue;
++        const uint32_t w = fetch.size_2d.width + 1, h = fetch.size_2d.height + 1;
++        if (w * h > luma_width * luma_height) {
++          luma_fetch = fetch;
++          luma_width = w;
++          luma_height = h;
++        }
++      }
++      const bool full_screen_movie = luma_width >= 960 && luma_height >= 540;
++      // The frame's pixels are square on the screen unless the presenter stretches the frame.
++      const double display_aspect = REXCVAR_GET(gpu_keep_aspect_display_aspect);
++      const float shown_aspect = full_screen_movie && display_aspect > 0.0
++                                     ? float(display_aspect)
++                                     : (height ? float(width) / float(height) : 0.0f);
++      // The width (in frame pixels) that shows 16:9 on the screen.
++      const float wanted = shown_aspect > 0.0f ? float(width) * (16.0f / 9.0f) / shown_aspect : float(width);
++      if (height && float(width) > wanted + 1.5f) {
+         if (REXCVAR_GET(gpu_keep_aspect_pillarbox)) {
+-          viewport_info.xy_offset[0] += (width - wanted) / 2;
+-          viewport_info.xy_extent[0] = wanted;
++          float zoom = 1.0f;
++          if (full_screen_movie && REXCVAR_GET(gpu_keep_aspect_zoom_letterbox)) {
++            zoom = KeepAspectLetterboxZoom(*memory_, luma_fetch, luma_width, luma_height, float(width) / wanted);
++          }
++          const uint32_t shown = std::min(width, uint32_t(wanted * zoom + 0.5f));
++          viewport_info.xy_offset[0] += (width - shown) / 2;
++          viewport_info.xy_extent[0] = shown;
++          if (zoom > 1.0f) {
++            // The zoomed movie is taller than the frame: its own black bars beyond the top and bottom are cropped.
++            viewport_info.ndc_scale[1] *= zoom;
++            viewport_info.ndc_offset[1] *= zoom;
++          }
+         } else {
+-          const float zoom = float(width) * 9.0f / (16.0f * float(height));
++          const float zoom = float(width) / wanted;
+           viewport_info.ndc_scale[1] *= zoom;
+           viewport_info.ndc_offset[1] *= zoom;
+         }

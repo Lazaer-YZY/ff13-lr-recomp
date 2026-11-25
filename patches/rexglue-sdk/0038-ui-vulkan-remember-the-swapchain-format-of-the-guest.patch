@@ -1,7 +1,7 @@
 From a0e62656e1b22f32318832ebf52cc1fdfe02d7d3 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 21:36:06 +0800
-Subject: [PATCH 038/119] ui: vulkan: remember the swapchain format of the
+Subject: [PATCH 038/120] ui: vulkan: remember the swapchain format of the
  guest output pipeline
 
 VulkanPresenter compared the cached final-effect pipeline's swapchain_format

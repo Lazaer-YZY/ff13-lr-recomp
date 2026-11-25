@@ -154,23 +154,34 @@ bool WideScreen() {
 }
 
 
+// Movies (Bink 2: 1280x720 full-screen ones for the opening and cutscenes, 1280x384 / 640x384 ones placed in menus)
+// are drawn with this pixel shader (three planes, Y / Cb / Cr, and a colour matrix). The SDK keeps a full-screen movie
+// 16:9 and centred, never stretched: on a wide frame (Wide screen) and on a frame the presenter stretches (Stretch to
+// fill; the app passes gpu_keep_aspect_display_aspect). A movie whose own picture has black bars at the top and bottom
+// as well (bars on all four sides) is zoomed, centred, until one pair of bars is gone (gpu_keep_aspect_zoom_letterbox).
+// Movies placed in menus follow the menus. From the DS2 port (the owner, 2026-11-24: "Videos should not be stretched.
+// Just centered zoom if there are bars on 4 sides but nothing otherwise").
+void KeepMoviesAspect(bool wide) {
+  const double shown = std::strtod(rex::cvar::GetFlagByName("gpu_keep_aspect_display_aspect").c_str(), nullptr);
+  if (!wide && !(shown > 16.0 / 9.0 + 0.01)) return;
+  if (rex::cvar::GetFlagByName("gpu_keep_aspect_pixel_shaders").empty()) {
+    rex::cvar::SetFlagByName("gpu_keep_aspect_pixel_shaders", "E77131FAC1E0DAC3");
+    rex::cvar::SetFlagByName("gpu_keep_aspect_pillarbox", "true");
+  }
+  REXLOG_INFO("lr render size: movies kept 16:9 ({})", wide ? "wide frame" : fmt::format("stretched to {:.3f}", shown));
+}
+
 // The final frame (scene + UI) of a wide screen: the console's 720 lines at the screen's aspect (width a multiple of
 // 16), or 0x0 when the screen is not wide (the frame then stays 1280x720). The UI keeps its 1280x720 canvas, centred.
 void WideFrame(uint32_t& width, uint32_t& height) {
   static const std::pair<uint32_t, uint32_t> frame = [] {
+    KeepMoviesAspect(WideScreen());
     if (!WideScreen()) return std::pair<uint32_t, uint32_t>(0, 0);
     uint32_t w, h;
     WantedScreen(w, h);
     const uint32_t frame_width = (uint32_t(uint64_t(kConsoleHeight) * w / h) + 8) & ~15u;
     REXLOG_INFO("lr render size: wide screen, the final frame is {}x{}, the UI's 1280x720 canvas {} pixels in",
                 frame_width, kConsoleHeight, (frame_width - kConsoleWidth) / 2);
-    // Movies (Bink: the opening, cutscenes) are one full-screen quad with this pixel shader (three planes, Y / Cb /
-    // Cr, and a colour matrix): the SDK keeps it 16:9, centred, instead of stretching it across the wide frame (from
-    // the DS2 port).
-    if (rex::cvar::GetFlagByName("gpu_keep_aspect_pixel_shaders").empty()) {
-      rex::cvar::SetFlagByName("gpu_keep_aspect_pixel_shaders", "E77131FAC1E0DAC3");
-      rex::cvar::SetFlagByName("gpu_keep_aspect_pillarbox", "true");
-    }
     return std::pair<uint32_t, uint32_t>(frame_width, kConsoleHeight);
   }();
   width = frame.first;
@@ -413,7 +424,7 @@ REX_HOOK_RAW(sub_82731488) {
 // What the 3D camera projects for the UI (name tags, markers) is stretched about the canvas's centre, the UI's
 // scissor rectangles move with the canvas, the effects camera gets the same Hor+ as the others, and widgets that work
 // in clip space (the minimap) are drawn in a viewport that is the canvas. Movies keep 16:9 through the SDK's
-// gpu_keep_aspect_pixel_shaders (set in WideFrame). The frame's own readers (its targets sub_82AF3C80 /
+// gpu_keep_aspect_pixel_shaders (set in KeepMoviesAspect). The frame's own readers (its targets sub_82AF3C80 /
 // sub_82AF9DF0, the scene's composite sub_82AC1AF8, the resolve) read the singleton and stay wide.
 // lr_ui_canvas_mask switches the pieces off one by one (diagnostic).
 

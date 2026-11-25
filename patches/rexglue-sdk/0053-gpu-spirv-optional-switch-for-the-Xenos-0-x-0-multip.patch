@@ -1,7 +1,7 @@
 From 2b3b0447bd0a8800567d4874795b46d6adc0fe0a Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 09:27:30 +0800
-Subject: [PATCH 053/119] gpu: spirv: optional switch for the Xenos 0 * x = 0
+Subject: [PATCH 053/120] gpu: spirv: optional switch for the Xenos 0 * x = 0
  multiplication emulation
 
 vulkan_shader_xenos_multiply (default on, unchanged behaviour). Off saves the

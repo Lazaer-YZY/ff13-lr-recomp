@@ -1,7 +1,7 @@
 From 0817ee83f33298f8c77a7e03d1a19ac624832bef Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Tue, 24 Nov 2026 00:42:56 +0800
-Subject: [PATCH 117/119] gpu/vulkan, core: device fixes from the DS2 port
+Subject: [PATCH 117/120] gpu/vulkan, core: device fixes from the DS2 port
  (Mali defaults, closing crash, stall log, memory cuts)
 
 - vulkan_arm_driver_defaults: on Arm's proprietary Mali driver, render passes instead of dynamic

@@ -1,7 +1,7 @@
 From 454afa87afe40ba723c4df29fb2ca6cea81e7249 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Thu, 12 Nov 2026 18:47:16 +0800
-Subject: [PATCH 106/119] ui/sdl: forward Android lifecycle events from the
+Subject: [PATCH 106/120] ui/sdl: forward Android lifecycle events from the
  event watcher to the UI thread (SDL3 never queues them; the surface was never
  released/recreated)
 

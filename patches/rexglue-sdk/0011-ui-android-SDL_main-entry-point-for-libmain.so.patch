@@ -1,7 +1,7 @@
 From 217b52d5a978c46058a4d1898b74ed97e56b7424 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:34:33 +0800
-Subject: [PATCH 011/119] ui(android): SDL_main entry point for libmain.so
+Subject: [PATCH 011/120] ui(android): SDL_main entry point for libmain.so
 
 On Android the game target is a SHARED library named libmain.so; SDLActivity
 dlsym()s SDL_main from it. The new REX_PLATFORM_ANDROID branch exports

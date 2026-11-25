@@ -1,7 +1,7 @@
 From b540614f2397d0ae68721f4e05274458f8d9f61e Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Tue, 24 Nov 2026 12:53:40 +0800
-Subject: [PATCH 119/119] gpu/vulkan: draw states in the frame trace
+Subject: [PATCH 119/120] gpu/vulkan: draw states in the frame trace
  (vulkan_gpu_trace_draw_state)
 
 With vulkan_gpu_trace_frame, each draw of the traced frame logs its state

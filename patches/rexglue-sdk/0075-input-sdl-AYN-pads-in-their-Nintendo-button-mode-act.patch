@@ -1,7 +1,7 @@
 From 72c8c4d90cea4c320989f9ba9e0df30946098593 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 07:50:40 +0800
-Subject: [PATCH 075/119] input: sdl: AYN pads in their Nintendo button mode
+Subject: [PATCH 075/120] input: sdl: AYN pads in their Nintendo button mode
  act by position (gamepad_face_buttons_by_position)
 
 AYN handhelds (Odin 2, Thor; vendor 0x2020) report product 0x0111 in

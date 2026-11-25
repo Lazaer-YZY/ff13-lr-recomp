@@ -70,13 +70,15 @@ check_shell() {
 }
 
 host_cpp_tests() {
-  local bin=$OUT/bin bad=0
+  local bin=$OUT/bin bad=0 sdk_inc=()
   mkdir -p "$bin"
+  # Tests of SDK headers (test_letterbox) build against the SDK checkout when there is one.
+  [ -d sdk/rexglue-sdk/include ] && sdk_inc=(-Isdk/rexglue-sdk/include)
   for t in tests/host/test_*.cpp; do
     local name exe
     name=$(basename "$t" .cpp)
     exe="$bin/$name.exe"
-    clang++ -std=c++20 -O1 -Wall -Werror -fuse-ld=lld -Isrc "$t" -o "$exe" || { echo "build failed: $t"; bad=1; continue; }
+    clang++ -std=c++20 -O1 -Wall -Werror -fuse-ld=lld -Isrc "${sdk_inc[@]}" "$t" -o "$exe" || { echo "build failed: $t"; bad=1; continue; }
     "$exe" || bad=1
   done
   [ "$bad" = 0 ]

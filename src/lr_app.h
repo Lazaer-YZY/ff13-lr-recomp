@@ -13,6 +13,8 @@
 #include <rex/filesystem/devices/stfs_container_device.h>
 #include <rex/filesystem/entry.h>
 #include <rex/filesystem/file.h>
+#include <rex/input/device_assignment.h>
+#include <rex/input/input_system.h>
 #include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/ui/imgui_dialog.h>
@@ -1239,6 +1241,16 @@ class LrApp : public rex::ReXApp {
 
   // Runs in ReXApp::SetupPresentation() before LoadGpuPlugin() and
   // graphics->SetupPresentation(), i.e. before any Vulkan instance exists.
+  // LR is single-player: every controller is the guest's player 1. The SDK's default SlotAssignment makes each pad
+  // the player of its connection order, and the game reads player 1 only, so with two pads (the Thor's own and an
+  // external one, or a phone listing an input device as a pad first) the second pad's buttons were ignored; in the
+  // DS2 port the same made a second pad's START give "not signed in" (DS2's public #28; its fix, 2026-11-25).
+  static std::unique_ptr<rex::input::InputSystem> LrCreateInputSystem(bool tool_mode) {
+    auto input = rex::input::CreateDefaultInputSystem(tool_mode);
+    if (input) input->SetDeviceAssignment(std::make_unique<rex::input::SharedAssignment>());
+    return input;
+  }
+
   void OnPreSetup(rex::RuntimeConfig& config) override {
 #if defined(__ANDROID__)
     lr::android::InstallGraphicsFailureSaver();
@@ -1246,6 +1258,7 @@ class LrApp : public rex::ReXApp {
     REXLOG_INFO("LR Android: game threads on {}", lr::android::PinnedCoresNote());
 #endif
     config.audio_factory = REX_AUDIO_BACKEND(LrAudioSystem);
+    config.input_factory = REX_INPUT_BACKEND(LrCreateInputSystem);
     // Render resolution (Settings > Resolution, LR_Play.ps1 -Resolution): read by the renderer
     // plugin when it is loaded, right after this.
     LrResolutionStartup(user_data_root());

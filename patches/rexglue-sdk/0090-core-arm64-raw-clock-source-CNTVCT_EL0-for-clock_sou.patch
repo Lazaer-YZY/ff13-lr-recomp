@@ -1,7 +1,7 @@
 From 610f4dca22f813c6fc4c5d3708dff90a70dd8985 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Mon, 9 Nov 2026 21:48:10 +0800
-Subject: [PATCH 090/119] core: arm64 raw clock source (CNTVCT_EL0) for
+Subject: [PATCH 090/120] core: arm64 raw clock source (CNTVCT_EL0) for
  clock_source_raw
 
 Guest mftb reads went through clock_gettime (vdso) plus a mutex. On arm64 the

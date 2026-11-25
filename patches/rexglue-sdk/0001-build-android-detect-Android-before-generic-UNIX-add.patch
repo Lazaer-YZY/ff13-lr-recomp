@@ -1,7 +1,7 @@
 From 0cf3e037c88677cc6d4225d8656bbf0c7694b8ca Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 14:16:52 +0800
-Subject: [PATCH 001/119] build(android): detect Android before generic UNIX,
+Subject: [PATCH 001/120] build(android): detect Android before generic UNIX,
  add REXGLUE_BUILD_TOOLS
 
 Android sets REX_PLATFORM=android-<arch> and defines REX_PLATFORM_ANDROID +

@@ -136,7 +136,7 @@ The game's own Settings menu is the Xbox 360 release's, unchanged. The port's op
 |---|---|---|
 | Frame rate | 60 · 40 · 30 · 60 smoother, in gameplay | Cutscenes stay at 30. 40 uses the 120 Hz panel mode (next start). *60 smoother* runs 60 fps on the 120 Hz panel mode: a late frame shows after 25 ms instead of 33 ms, at about the same power. See [Four frame-rate options](#four-frame-rate-options). |
 | Resolution | 720p · 540p · 1080p | The size the 3D world is drawn at (next start). Menus and HUD stay 720p: 540p is scaled up into the 720p frame (faster, softer), 1080p is scaled down into it (smoother edges, more GPU work: about 27 fps instead of 30 on a Galaxy S10). |
-| Wide screen | off · on | On screens wider than 16:9 (most phones) the 3D world fills the whole screen, with more to see at the sides; menus, HUD and minimap stay in the middle as on a 16:9 screen, movies keep 16:9. Next start. More pixels: about 24 fps instead of 28 on a Galaxy S10. Greyed out on 16:9 screens. |
+| Wide screen | off · on | On screens wider than 16:9 (most phones) the 3D world fills the whole screen, with more to see at the sides; menus, HUD and minimap stay in the middle as on a 16:9 screen. Movies are never stretched: they keep 16:9 with bars at the sides, and one with black bars of its own at the top and bottom is zoomed, centred, until a pair of bars is gone. Next start. More pixels: about 24 fps instead of 28 on a Galaxy S10. Greyed out on 16:9 screens. |
 | Upscaling | Bilinear · AMD FSR 1.0 · AMD CAS | FSR gives the sharpest edges. Restart required. |
 | Anti-aliasing | Off · FXAA | FXAA runs at 720p before upscaling, so it softens the picture. |
 | Performance overlay | off · on | fps and a frame-time graph. |
@@ -146,6 +146,7 @@ The game's own Settings menu is the Xbox 360 release's, unchanged. The port's op
 | GPU driver | Stable Turnip v2 (bundled) | Installed and selected automatically on first start (Adreno 6xx/7xx/8xx; sysmem mode on Adreno 710/720/722 and 8xx). Other Turnip builds can be downloaded on the GPU driver page but are untested with this game; Qualcomm's drivers are not supported. Mali phones start on Arm's own driver. |
 | GPU compatibility (testing) | all off | Troubleshooting → Advanced: renderer paths to switch off one at a time on a phone whose picture is wrong. Next start. |
 | Second screen | on | The bottom-screen companion on dual-screen devices (see above). |
+| Save backups | off | *Game → Save backups …*: copies of all save slots in a folder you choose (outside the app, so uninstalling keeps them), made after the game saves, at most every 10 minutes. The latest 10 and one per day for the last 7 days played are kept, up to 64 MB. Restoring one takes effect at the next start; the replaced saves are kept aside. |
 | Cheats | all off | *Infinite EP* (EP stays at its maximum, so EP abilities cost nothing), *Infinite HP (in battle)* (Lightning's HP goes back to its maximum after every hit; a single hit larger than her maximum HP still knocks her out) and *Freeze the clock* (the days do not pass). Apply at once. A save made while a cheat is on keeps its effects (a frozen clock stays at its time). |
 | Debug logging | off | Writes frame and GPU statistics to the log, for reporting a problem. Costs ~4% CPU. |
 

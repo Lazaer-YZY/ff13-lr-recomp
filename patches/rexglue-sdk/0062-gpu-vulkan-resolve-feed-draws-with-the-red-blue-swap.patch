@@ -1,7 +1,7 @@
 From c0e25abe4e3d48bac78c10b44d14ae547919f7f1 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sun, 8 Nov 2026 12:54:24 +0800
-Subject: [PATCH 062/119] gpu: vulkan: resolve feed draws with the red/blue
+Subject: [PATCH 062/120] gpu: vulkan: resolve feed draws with the red/blue
  swap; Adreno-safe RT and shared memory barriers
 
 - Resolve feed (vulkan_resolve_feed_textures, init-time, default off): a 1x

@@ -1,7 +1,7 @@
 From 0a4c9b55da6a86de35ffc1fee51219ea494bfd66 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 21 Nov 2026 08:10:34 +0800
-Subject: [PATCH 112/119] gpu/vulkan: Mali fallbacks, failure reasons and GPU
+Subject: [PATCH 112/120] gpu/vulkan: Mali fallbacks, failure reasons and GPU
  emulation (from DS2)
 
 - rex_vulkan_failure_reason: '<GPU>: <reason>' for every device rejection and a failed SetupContext.

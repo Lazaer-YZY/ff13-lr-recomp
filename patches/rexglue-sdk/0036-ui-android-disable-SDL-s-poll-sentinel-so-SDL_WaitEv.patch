@@ -1,7 +1,7 @@
 From 5370e4ff71d5be8993006068539c0db6b02ad73f Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Sat, 7 Nov 2026 21:30:56 +0800
-Subject: [PATCH 036/119] ui: android: disable SDL's poll sentinel so
+Subject: [PATCH 036/120] ui: android: disable SDL's poll sentinel so
  SDL_WaitEvent blocks
 
 SDL 3.4's Android SDL_WaitEventTimeoutNS loop pumps with a poll sentinel on

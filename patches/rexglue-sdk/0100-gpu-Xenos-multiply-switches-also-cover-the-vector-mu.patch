@@ -1,7 +1,7 @@
 From cee507835ba24b94c96ea8f03bebda08235cfe20 Mon Sep 17 00:00:00 2001
 From: LR Recomp <noreply@lr-recomp.invalid>
 Date: Wed, 11 Nov 2026 13:12:36 +0800
-Subject: [PATCH 100/119] gpu: Xenos multiply switches also cover the vector
+Subject: [PATCH 100/120] gpu: Xenos multiply switches also cover the vector
  mul/mad path; special functions clamp infinities when off
 
 

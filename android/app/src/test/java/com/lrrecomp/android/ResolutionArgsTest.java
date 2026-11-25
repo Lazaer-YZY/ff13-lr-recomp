@@ -105,4 +105,12 @@ public class ResolutionArgsTest {
         assertEquals(Arrays.asList("--lr_render_height=1080", "--lr_render_width=2400", "--video_mode_width=1600",
             "--video_mode_height=720", "--gpu_edram_tiles=4096"), argsFor("1080", 2400));
     }
+
+    @Test
+    public void stretchedMoviesKeepTheirShape() {
+        assertEquals(null, RuntimeActivity.stretchedMovieAspect(false, 20f / 9f));
+        assertEquals(null, RuntimeActivity.stretchedMovieAspect(true, 16f / 9f));
+        assertEquals(null, RuntimeActivity.stretchedMovieAspect(true, 16f / 10f));
+        assertEquals("2.2222", RuntimeActivity.stretchedMovieAspect(true, 20f / 9f));
+    }
 }
