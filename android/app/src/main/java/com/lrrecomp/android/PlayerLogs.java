@@ -72,6 +72,13 @@ final class PlayerLogs {
             + " sdk=" + Build.VERSION.SDK_INT + " soc=" + soc + " abi=" + abi;
     }
 
+    /** The chip for a bug report: SM8550 (Android 12+), else the board name (kalama, qcom, ...). */
+    static String socModel() {
+        if (Build.VERSION.SDK_INT >= 31 && Build.SOC_MODEL != null && !Build.SOC_MODEL.isEmpty()
+                && !Build.UNKNOWN.equals(Build.SOC_MODEL)) return Build.SOC_MODEL;
+        return Build.HARDWARE;
+    }
+
     /** The log files in {@code directory}, by name; other files and folders are left alone. */
     static List<File> scannable(File directory) {
         File[] files = directory.listFiles();

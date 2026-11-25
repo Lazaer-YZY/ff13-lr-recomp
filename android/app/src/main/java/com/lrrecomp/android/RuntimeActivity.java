@@ -412,6 +412,13 @@ public final class RuntimeActivity extends SDLActivity {
         startActivity(intent);
     }
 
+    /** Debug logging as this run started with it (CTRL's switch applies at the next start). */
+    private boolean debugLoggingThisRun = DEFAULT_DEBUG_LOG;
+
+    boolean debugLoggingThisRun() {
+        return debugLoggingThisRun;
+    }
+
     private static final int REQUEST_EXPORT_LOGS = 0x4c52;  // 'LR'
     private static final int REQUEST_SAVE_BACKUP_FOLDER = 0x4c42;  // 'LB'
 
@@ -454,6 +461,15 @@ public final class RuntimeActivity extends SDLActivity {
 
     /** CTRL dialog's "Save logs": the system file picker, then a zip of lr.log there. */
     void startLogExport() {
+        startLogExport(false);
+    }
+
+    /** True while the file picker is open for "Report a problem" (Android 9 and older): the issue form opens next. */
+    private boolean reportAfterLogExport;
+
+    /** thenReport: open the GitHub issue form after the zip is saved (ProblemReport, Android 9 and older). */
+    void startLogExport(boolean thenReport) {
+        reportAfterLogExport = thenReport;
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
             .addCategory(Intent.CATEGORY_OPENABLE)
             .setType("application/zip")
@@ -468,7 +484,9 @@ public final class RuntimeActivity extends SDLActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         if (requestCode == REQUEST_EXPORT_LOGS) {
-            if (resultCode == RESULT_OK && data != null && data.getData() != null) exportLogs(data.getData());
+            boolean report = reportAfterLogExport;
+            reportAfterLogExport = false;
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) exportLogs(data.getData(), report);
             return;
         }
         if (requestCode == REQUEST_SAVE_BACKUP_FOLDER) {
@@ -488,8 +506,8 @@ public final class RuntimeActivity extends SDLActivity {
         super.onActivityResult(requestCode, resultCode, data);
     }
 
-    private void exportLogs(android.net.Uri uri) {
-        java.util.List<File> files = PlayerLogs.exportable(PlayerLogs.directory(this));
+    /** device.txt of a log zip: the phone, the app, the GPU, its driver and the settings that change rendering. */
+    String logDeviceText() {
         String version;
         try {
             version = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
@@ -500,10 +518,19 @@ public final class RuntimeActivity extends SDLActivity {
         String device = PlayerLogs.deviceDescription() + "\napp=" + version
             + "\ngpu=" + GpuDriverStore.gpuModel()
             + "\ndriver=" + (driver != null ? driver.metadata.name : GpuDriverStore.SYSTEM_DRIVER_NAME)
-            + "\ndebug_logging=" + (renderPrefs(this).getBoolean("debug_log", false) ? "on" : "off")
+            + "\ndebug_logging=" + (debugLoggingThisRun ? "on" : "off")
+            + (renderPrefs(this).getBoolean("debug_log", DEFAULT_DEBUG_LOG) != debugLoggingThisRun
+                ? " (" + (debugLoggingThisRun ? "off" : "on") + " from the next start)" : "")
             + "\ngpu_compat=" + GpuCompat.Choices.from(renderPrefs(this)).summary();
+        return device;
+    }
+
+    private void exportLogs(android.net.Uri uri, boolean thenReport) {
+        java.util.List<File> files = PlayerLogs.exportable(PlayerLogs.directory(this));
+        String device = logDeviceText();
         new Thread(() -> {
             String message;
+            String savedName = null;
             try (java.io.OutputStream output = getContentResolver().openOutputStream(uri, "w")) {
                 if (output == null) throw new java.io.IOException("the file could not be opened");
                 PlayerLogs.exportZip(files, device, output);
@@ -515,11 +542,16 @@ public final class RuntimeActivity extends SDLActivity {
                     // The name is only for the message.
                 }
                 message = getString(R.string.logs_saved, name != null ? name : "a zip");
+                savedName = name != null ? name : PlayerLogs.exportName(new java.util.Date());
             } catch (java.io.IOException | RuntimeException e) {
                 message = getString(R.string.logs_save_failed, String.valueOf(e.getMessage()));
             }
             final String shown = message;
-            runOnUiThread(() -> Toast.makeText(this, shown, Toast.LENGTH_LONG).show());
+            final String reportName = thenReport ? savedName : null;
+            runOnUiThread(() -> {
+                Toast.makeText(this, shown, Toast.LENGTH_LONG).show();
+                if (reportName != null) ProblemReport.openIssue(this, reportName);
+            });
         }, "LR log export").start();
     }
 
@@ -722,6 +754,7 @@ public final class RuntimeActivity extends SDLActivity {
             diag = !"0".equals(getIntent().getStringExtra("LR_DIAG"));
         }
         nativeSetenv("LR_DIAG", diag ? "1" : "0");
+        debugLoggingThisRun = diag;
         // "Exact Xbox shader math" (CTRL, off by default since 2026-11-11): the Xenos multiply rule
         // (0 x anything = 0, also infinity / NaN) in every translated shader. Off: host multiplies
         // with special-function infinities clamped (SDK patch 100); Luxerion plaza GPU 18.3 -> 16.0 ms,

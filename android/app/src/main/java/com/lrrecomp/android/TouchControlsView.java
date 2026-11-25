@@ -736,6 +736,9 @@ final class TouchControlsView extends View {
         CheckBox debugLog = option(toolsSec, strings.getString(R.string.touch_debug_log),
             strings.getString(R.string.touch_debug_log_help),
             render.getBoolean("debug_log", RuntimeActivity.DEFAULT_DEBUG_LOG));
+        // The log zip in Download plus the public repository's issue form, filled in (ProblemReport; the owner,
+        // 2026-11-25, as in DS2).
+        Button reportButton = pageButton(toolsSec, strings.getString(R.string.touch_report_problem));
         // A zip of lr.log through the system file picker, so a player can attach it to a bug report
         // from the phone (Android 11+ hides Android/data from file managers; public issue #4).
         Button logsButton = pageButton(toolsSec, strings.getString(R.string.touch_save_logs));
@@ -859,6 +862,10 @@ final class TouchControlsView extends View {
         logsButton.setOnClickListener(v -> {
             settingsDialog.dismiss();
             activity.startLogExport();
+        });
+        reportButton.setOnClickListener(v -> {
+            settingsDialog.dismiss();
+            ProblemReport.show(activity);
         });
         // As the old dialog button did: the touch settings applied (so the editor shows them), then the editor.
         editLayoutButton.setOnClickListener(v -> {

@@ -66,6 +66,15 @@
     <string name="touch_gpu_driver">GPU driver: %1$s …</string>
     <string name="touch_gpu_driver_system">System</string>
     <string name="touch_game_folder">Game folder …</string>
+    <string name="touch_report_problem">Report a problem on GitHub …</string>
+    <string name="report_title">Report a problem on GitHub</string>
+    <string name="report_message">This saves the game logs in your Download folder and opens a GitHub issue form with the game version, your phone, GPU and settings filled in. Describe the problem there and attach the logs file. You need a GitHub account; the game keeps running in the background.</string>
+    <string name="report_debug_off">Debug logging is off for this run, so the logs say little. For a better report, turn it on, restart the game, make the problem happen, then report it.</string>
+    <string name="report_continue">Save logs and open GitHub</string>
+    <string name="report_debug_on">Turn on Debug logging</string>
+    <string name="report_saved">Logs saved in Download as %1$s. Attach that file to the issue.</string>
+    <string name="report_no_browser">No web browser found. Open %1$s on another device and attach %2$s.</string>
+    <string name="report_attach">Attach %1$s (the logs file the game just saved) here:</string>
     <string name="touch_save_logs">Save logs for a bug report …</string>
     <string name="logs_saved">Logs saved as %1$s. Attach that file to your bug report.</string>
     <string name="logs_save_failed">Could not save the logs: %1$s</string>

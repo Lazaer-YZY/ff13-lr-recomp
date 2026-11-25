@@ -238,6 +238,7 @@ bash tools/shader_cache.sh push friend.zip
 ```
 
 ## Troubleshooting
+- **Reporting a problem** (versions after v1.2.6; on older ones, use *Save logs* below and open an issue): on the phone, tap **CTRL → Troubleshooting → Report a problem on GitHub …**. It saves the logs in Download and opens this repository's issue form with the version, phone, GPU and settings filled in; describe the problem and attach the zip (GitHub doesn't let an app attach it for you). Turn on *Debug logging* first and restart the game for a more useful log.
 - **Logs** for a bug report: on the phone, tap **CTRL**, then *Save logs for a bug report …*, and attach the zip it saves (usually in Downloads). They are in `Android/data/com.lrrecomp.android/files/logs/lr.log`; from a PC: `adb pull /sdcard/Android/data/com.lrrecomp.android/files/logs`
 - **Hitches in new areas right after installing:** the shader screen was skipped (START + BACK). It continues at the title on the next start; let it finish once.
 - **Wrong colours, black or flashing pixels:** turn on CTRL > Exact Xbox shader math (shaders rebuild once).
